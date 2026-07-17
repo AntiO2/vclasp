@@ -1,0 +1,13 @@
+[package]
+name = "vclasp-object-store"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "vclasp_object_store"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+futures-util = "0.3"
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

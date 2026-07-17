@@ -1,0 +1,37 @@
+[package]
+name = "vclasp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "vclasp"
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py39"] }
+flatbuffers = "24.3"
+parquet = { version = "54", features = ["snap"] }
+arrow = "54"
+memmap2 = "0.9"
+bytemuck = "1.19"
+thiserror = "2"
+fastrand = "2.4.1"
+rand = "0.10.2"
+bytes = "1.12.0"
+vclasp-object-store = { path = "object-store-transport" }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "query", "rustls"] }
+serde_json = "1"
+tar = "0.4"
+ffmpeg-next = { version = "6.1", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
+
+[features]
+default = []
+ffmpeg = ["dep:ffmpeg-next"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

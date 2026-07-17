@@ -1,0 +1,18 @@
+namespace hvs;
+
+table ChunkHeader {
+  magic:string;
+  format_version:ushort;
+  codec:string;
+  width:ushort;
+  height:ushort;
+  fps_num:ushort;
+  fps_den:ushort;
+  sps_pps_length:ulong;
+  payload_length:ulong;
+  index_length:ulong;
+  created_at:ulong;
+}
+
+root_type ChunkHeader;
+file_identifier "HVS1";
