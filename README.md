@@ -1,27 +1,31 @@
 # VClasp Core
 
-VClasp Core is the reusable Rust implementation of codec-closure construction,
-object-store span planning, range retrieval, and libavcodec execution. The
-paper artifact, baseline ports, deployment recipes, and result corpus live in
-the separate
-[`vclasp-artifact`](https://github.com/AntiO2/vclasp-artifact) repository.
+VClasp is a Rust library for reading predictive video from object storage at
+ML-sample granularity. It resolves codec dependencies, turns the required
+access units into byte ranges, coalesces those ranges for the storage backend,
+and decodes only the required records.
 
-## Responsibilities
+This repository contains the reusable library and Python bindings. Benchmark
+drivers, baseline ports, deployment recipes, and released result tables live in
+[`vclasp-artifact`](https://github.com/AntiO2/vclasp-artifact).
 
-- ingest controlled H.264 video and parse access-unit metadata;
-- write one-copy payloads and embedded target-to-closure indexes;
-- union and deduplicate closures over a bounded request window;
-- enumerate exact minimum-byte span candidates and select a calibrated plan;
-- issue bounded-concurrency local or S3-compatible range reads;
-- keep transfer-only gap records out of decoder submission;
-- decode required access units through libavcodec and restore logical order;
-- expose orchestration bindings through PyO3.
+> **Release status:** `0.1.0` is the first public format and API. The repository
+> remains private until the release license is selected.
 
-Python must not reimplement dependency resolution, byte-range planning, or
-decode. It supplies immutable catalogs, logical requests, and experiment
-configuration.
+## What VClasp provides
 
-## System dependencies
+- a self-describing chunk with H.264 payloads and a Parquet record index;
+- dependency-closure resolution for logical frame and clip requests;
+- exact byte-range planning and configurable range coalescing;
+- local, S3-compatible, and AIStore transports with bounded concurrency;
+- libavcodec-backed selective decode and logical-order restoration;
+- Rust APIs for data-plane integration and PyO3 bindings for ML loaders.
+
+## Quick start
+
+### 1. Install native dependencies
+
+Ubuntu 22.04/24.04:
 
 ```bash
 sudo apt-get update
@@ -29,53 +33,112 @@ sudo apt-get install -y \
   build-essential pkg-config clang libclang-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
   libx264-dev flatbuffers-compiler ffmpeg
-
-pkg-config --modversion libavcodec libavformat libavutil libswscale
-flatc --version
 ```
 
-The currently verified FFmpeg development ABI is 6.x. A non-standard install
-must expose its `.pc` files through `PKG_CONFIG_PATH`.
-
-## Build
+### 2. Run the Rust planner example
 
 ```bash
-cargo test --release --features ffmpeg
-cargo build --release --features ffmpeg
-cp target/release/libvclasp.so ../vclasp.so
+cargo run --example plan_ranges
 ```
 
-The extension is imported as:
+The public planner accepts physical record extents and returns the contiguous
+ranges to fetch plus each requested record's location inside its range:
+
+```rust
+use vclasp::{plan_byte_ranges, RecordRange};
+
+let records = vec![
+    RecordRange { record_id: 1, offset: 0, length: 1024 },
+    RecordRange { record_id: 2, offset: 4096, length: 1024 },
+];
+let ranges = plan_byte_ranges(&records, Some(4096), None)?;
+# Ok::<(), String>(())
+```
+
+### 3. Install the Python extension
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip maturin
+maturin develop --release --features ffmpeg
+python -c 'import vclasp; print(vclasp.__version__)'
+```
+
+Then plan ranges without moving dependency or planning logic into Python:
 
 ```python
 import vclasp
 
-chunk = vclasp.VClaspChunk("/path/to/layout.chunk")
-print(chunk.format_version(), chunk.record_count())
+ranges = vclasp.plan_byte_ranges(
+    [(1, 0, 1024), (2, 4096, 1024)],
+    merge_threshold_bytes=4096,
+)
+print(ranges)
 ```
 
-Current ingestion and execution are exposed through the
-`build_hierarchical_*` functions and `PyLocalHierarchicalBatchExecutor` /
-`PyS3HierarchicalBatchExecutor`. See [the API guide](docs/API.md) and
-`examples/plan_ranges.rs` for stable entry points.
+See [Public API](docs/API.md) for chunk ingestion, local execution, S3
+execution, return schemas, and configuration fields.
 
-## On-disk compatibility
+## Repository layout
 
-The existing FlatBuffer schema identifier and magic are `HVS1` and `HVS`.
-They remain unchanged so registered chunks and raw results stay readable.
-Likewise, historical manifest keys such as `hvs_rs_sha256` are provenance
-fields, not current product names.
+```text
+src/
+  format/       chunk header, Parquet index, generated FlatBuffer bindings
+  codec/        x264 ingestion adapter and libavcodec decode
+  ingest/       source-video ingestion and closure-index construction
+  planning/     closure representations, span planning, cost policies
+  execution/    batch schedulers, deduplication, ordering, caches
+  storage/      local, S3-compatible, and AIStore backends
+native/         small C bridge for controlled x264 reference behavior
+schemas/        VClasp on-disk FlatBuffer schema
+object-store-transport/  standalone Rust/C Range GET transport crate
+examples/       minimal Rust and Python examples
+```
 
-## Tests requiring fixtures
+The filesystem is grouped by responsibility while the Rust facade keeps the
+short public paths `vclasp::chunk`, `vclasp::index`, and the crate-root planner
+types.
 
-Most tests are self-contained. Fixture-backed decode tests are ignored unless
-`VCLASP_TEST_CHUNK` is set to a private chunk. The ignored real-video Anchor-P
-test accepts `VCLASP_ANCHOR_P_TEST_CHUNK`.
+## Chunk format
 
-Core-only setup and tests are documented in `docs/SETUP_AND_RUNBOOK.md`.
+VClasp `0.1.0` writes format version 1 with FlatBuffer identifier `VCL1` and
+header magic `VCLASP`:
 
-## License status
+```text
+[u32 header length]
+[FlatBuffer header]
+[codec configuration bytes]
+[encoded access-unit payload]
+[Parquet record and closure index]
+```
 
-This worktree is a public-release staging candidate. The author must replace
-the staging notice in `LICENSE` with the selected open-source license before
-the repository is made public.
+This is the first public format. Pre-release research chunks are not accepted;
+regenerate them with the public VClasp builder. No compatibility code or schema
+is shipped for internal prototype formats.
+
+## Build and test
+
+```bash
+cargo fmt --check
+cargo test --release --no-default-features
+cargo test --release --features ffmpeg
+cargo test --manifest-path object-store-transport/Cargo.toml
+```
+
+Fixture-backed codec tests are ignored unless `VCLASP_TEST_CHUNK` points to a
+format-v1 VClasp chunk. Full setup and troubleshooting are in
+[Setup and development](docs/SETUP_AND_RUNBOOK.md).
+
+## Scope and stability
+
+The supported `0.1` surface is the chunk reader/writer, range planner,
+object-store transport, `build_chunk`, and the Local/S3/AIStore batch
+executors. Research policy classes remain available for artifact reproduction
+but are explicitly marked experimental in the API guide.
+
+## License
+
+The current `LICENSE` is a release-staging notice and grants no redistribution
+rights. It must be replaced with the selected open-source license before the
+repository is made public.

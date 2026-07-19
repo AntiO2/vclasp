@@ -529,9 +529,7 @@ fn prefix_stream_key(sps_pps: &[u8], record: &[u8]) -> u64 {
 /// SPS/PPS + record bytes
 /// ```
 ///
-/// This is intended for legacy Tier 0 / Tier 1-IDR records first. Tier 1-GOP and
-/// Tier 2 decode groups can use the same function when the record contains all
-/// bytes needed by a standard decoder.
+/// The record must contain every byte required by a standard decoder.
 pub fn decode_h264_annex_b_rgb24(
     data: &[u8],
     pool: &mut DecoderPool,
@@ -1295,7 +1293,7 @@ mod tests {
 
     /// Stage-level decode microbenchmark.
     ///
-    /// Times each phase of the legacy GOP batch decode pipeline to identify where
+    /// Times each phase of the GOP batch decode pipeline to identify where
     /// the ~4.8× performance gap vs. decord originates:
     ///   1. NAL splitting + SPS/PPS prepend
     ///   2. decoder flush (pool get_or_create)
@@ -1900,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "legacy fixture predates the corrected monotonic-PTS Anchor-P encoder"]
+    #[ignore = "fixture predates the corrected monotonic-PTS Anchor-P encoder"]
     fn test_anchor_p_target_decodes_without_intermediate_p_frames() {
         let fixture = std::env::var("VCLASP_ANCHOR_P_TEST_CHUNK")
             .expect("VCLASP_ANCHOR_P_TEST_CHUNK is required");

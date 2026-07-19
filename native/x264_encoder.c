@@ -32,7 +32,7 @@ static void setup_picture(x264_picture_t *pic, const uint8_t *yuv,
     pic->img.plane[2] = (uint8_t*)yuv + (size_t)width * height * 5 / 4;
     pic->i_type = is_idr ? X264_TYPE_IDR : X264_TYPE_P;
     pic->i_pts  = pts;
-#ifdef VTIMEWALK_PATCHED_X264
+#ifdef VCLASP_PATCHED_X264
     /* Private input marker consumed by the pinned x264 patch. The emitted
      * slice remains an ordinary H.264 P slice with nal_ref_idc=0. */
     pic->opaque = non_reference_p ? (void*)(intptr_t)0x5654574c : NULL;
@@ -206,7 +206,7 @@ int vclasp_encoder_encode_frame(VClaspX264Encoder* enc, const uint8_t* yuv,
             /* A target may use the root and current page checkpoint, but no
              * previous target. This bounds every target closure to at most
              * root + checkpoint + target. */
-#ifndef VTIMEWALK_PATCHED_X264
+#ifndef VCLASP_PATCHED_X264
             if (x264_encoder_invalidate_reference(enc->h, pts) < 0)
                 return -1;
 #endif

@@ -1,6 +1,6 @@
 //! VClasp: dependency-aware video access for object stores
 //!
-//! Reads legacy v1 chunks: flatbuffers header + raw payload + Parquet columnar index.
+//! Reads VClasp v1 chunks: FlatBuffer header + raw payload + Parquet columnar index.
 //! Supports local mmap/pread and authenticated S3/MinIO Range GET in Rust.
 //!
 //! Chunk layout:
@@ -11,38 +11,61 @@ use pyo3::types::PyBytes;
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "ffmpeg")]
+#[path = "planning/adaptive_planner.rs"]
 mod adaptive_planner;
+#[path = "storage/backend.rs"]
 mod backend;
+#[path = "ingest/builder.rs"]
 mod builder;
+#[path = "format/chunk.rs"]
 pub mod chunk;
+#[path = "format/chunk_schema.rs"]
+mod chunk_schema;
+#[path = "planning/cost_selector.rs"]
 mod cost_selector;
 #[cfg(feature = "ffmpeg")]
+#[path = "codec/decoder.rs"]
 mod decoder;
 #[cfg(feature = "ffmpeg")]
+#[path = "execution/dependency_sampler.rs"]
 mod dependency_sampler;
+#[path = "codec/encoder.rs"]
 mod encoder;
 #[cfg(feature = "ffmpeg")]
+#[path = "execution/fragment_scheduler.rs"]
 mod fragment_scheduler;
 #[cfg(feature = "ffmpeg")]
+#[path = "ingest/hierarchical_ingest.rs"]
 mod hierarchical_ingest;
+#[path = "planning/hierarchical_layout.rs"]
 mod hierarchical_layout;
 #[cfg(feature = "ffmpeg")]
+#[path = "execution/hierarchical_scheduler.rs"]
 mod hierarchical_scheduler;
-mod legacy_chunk_schema;
+#[path = "format/index.rs"]
 pub mod index;
+#[path = "planning/materialization.rs"]
 mod materialization;
 #[cfg(feature = "ffmpeg")]
+#[path = "execution/normalized_scheduler.rs"]
 mod normalized_scheduler;
 #[cfg(feature = "ffmpeg")]
+#[path = "execution/pair_scheduler.rs"]
 mod pair_scheduler;
+#[path = "planning/planner.rs"]
 mod planner;
 #[cfg(feature = "ffmpeg")]
+#[path = "execution/portfolio_scheduler.rs"]
 mod portfolio_scheduler;
+#[path = "planning/representation.rs"]
 pub mod representation;
 #[cfg(feature = "ffmpeg")]
+#[path = "storage/saturation.rs"]
 mod saturation;
 #[cfg(feature = "ffmpeg")]
+#[path = "execution/scheduler.rs"]
 mod scheduler;
+#[path = "execution/simd.rs"]
 mod simd;
 
 pub use planner::{plan_byte_ranges, unique_covered_bytes, PlannedRecord, RangePlan, RecordRange};
@@ -51,6 +74,7 @@ pub use planner::{plan_byte_ranges, unique_covered_bytes, PlannedRecord, RangePl
 #[pyclass]
 pub struct VClaspChunk {
     inner: chunk::ChunkReader,
+    #[cfg(feature = "ffmpeg")]
     path: String,
     #[cfg(feature = "ffmpeg")]
     decoder_pool: decoder::DecoderPool,
@@ -62,55 +86,55 @@ pub struct VClaspChunk {
 
 /// Decoder adapter for closed H.264 Annex-B records independent of a chunk.
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "H264Decoder")]
 pub struct PyH264Decoder {
     decoder_pool: decoder::DecoderPool,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "AnchorDeltaBatchExecutor")]
 pub struct PyNormalizedBatchExecutor {
     inner: normalized_scheduler::NormalizedBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "AIStoreAnchorDeltaBatchExecutor")]
 pub struct PyAIStoreNormalizedBatchExecutor {
     inner: normalized_scheduler::NormalizedBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "LocalAnchorDeltaBatchExecutor")]
 pub struct PyLocalNormalizedBatchExecutor {
     inner: normalized_scheduler::NormalizedBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "AdaptiveBatchExecutor")]
 pub struct PyAdaptiveBatchExecutor {
     inner: adaptive_planner::AdaptiveBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "S3BatchExecutor")]
 pub struct PyS3HierarchicalBatchExecutor {
     inner: hierarchical_scheduler::HierarchicalBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "LocalBatchExecutor")]
 pub struct PyLocalHierarchicalBatchExecutor {
     inner: hierarchical_scheduler::HierarchicalBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "AIStoreBatchExecutor")]
 pub struct PyAIStoreHierarchicalBatchExecutor {
     inner: hierarchical_scheduler::HierarchicalBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "S3ExecutorPool")]
 pub struct PyS3HierarchicalExecutorPool {
     workers: Vec<std::sync::Mutex<hierarchical_scheduler::HierarchicalBatchExecutor>>,
 }
@@ -185,49 +209,49 @@ fn normalized_decode_schedule_from_python(
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "PairBatchExecutor")]
 pub struct PyPairBatchExecutor {
     inner: pair_scheduler::ClosedRecordBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "AIStorePairBatchExecutor")]
 pub struct PyAIStorePairBatchExecutor {
     inner: pair_scheduler::ClosedRecordBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "PrefixBatchExecutor")]
 pub struct PyPrefixBatchExecutor {
     inner: pair_scheduler::ClosedRecordBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "AIStorePrefixBatchExecutor")]
 pub struct PyAIStorePrefixBatchExecutor {
     inner: pair_scheduler::ClosedRecordBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "LocalClosedRecordBatchExecutor")]
 pub struct PyLocalClosedRecordBatchExecutor {
     inner: pair_scheduler::ClosedRecordBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "AIStoreFragmentBatchExecutor")]
 pub struct PyAIStoreFragmentBatchExecutor {
     inner: fragment_scheduler::FragmentBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "S3FragmentBatchExecutor")]
 pub struct PyS3FragmentBatchExecutor {
     inner: fragment_scheduler::FragmentBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "BudgetedPairBatchExecutor")]
 pub struct PyBudgetedPairBatchExecutor {
     inner: portfolio_scheduler::BudgetedPairBatchExecutor,
 }
@@ -446,32 +470,32 @@ fn adaptive_estimate_dict(
     .collect()
 }
 
-#[pyclass]
+#[pyclass(name = "ByteCache")]
 pub struct PyByteCache {
     inner: planner::ByteCache,
 }
 
 /// Python adapter for authenticated, bounded-concurrency S3 Range GETs.
-#[pyclass]
+#[pyclass(name = "S3RangeReader")]
 pub struct PyS3RangeReader {
     inner: backend::S3Backend,
 }
 
 /// Thin Python batch adapter over the same multi-object Rust transport exposed
 /// to C/C++. Planning and per-range I/O remain in native code.
-#[pyclass]
+#[pyclass(name = "S3ObjectStoreReader")]
 pub struct PyS3ObjectStoreReader {
     inner: backend::S3ObjectStoreClient,
 }
 
 /// Thin Python adapter over the Rust mmap backend for label-free storage probes.
-#[pyclass]
+#[pyclass(name = "LocalRangeReader")]
 pub struct PyLocalRangeReader {
     inner: backend::LocalBackend,
 }
 
 /// Python adapter for one-request AIStore MOSS/GetBatch range retrieval.
-#[pyclass]
+#[pyclass(name = "AIStoreGetBatchReader")]
 pub struct PyAIStoreGetBatchReader {
     inner: backend::AIStoreGetBatchBackend,
 }
@@ -2846,14 +2870,14 @@ impl PyLocalClosedRecordBatchExecutor {
 
 /// Python-facing logical batch decoder (auto-configured from chunk).
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "LogicalBatchDecoder")]
 pub struct PyLogicalBatchDecoder {
     inner: scheduler::LogicalBatchDecoder,
 }
 
 /// Python-facing logical scheduler (epoch-level coalescing).
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
+#[pyclass(name = "LogicalScheduler")]
 pub struct PyLogicalScheduler {
     inner: scheduler::LogicalScheduler,
 }
@@ -2883,6 +2907,7 @@ impl VClaspChunk {
         .ok();
         Ok(VClaspChunk {
             inner: reader,
+            #[cfg(feature = "ffmpeg")]
             path: path.to_string(),
             #[cfg(feature = "ffmpeg")]
             decoder_pool: decoder::DecoderPool::new(decoder::DecoderConfig::default()),
@@ -3341,7 +3366,7 @@ impl PyLogicalBatchDecoder {
         range_priority: String,
     ) -> PyResult<PyLogicalScheduler> {
         let threshold = merge_threshold_kb.map(|kb| kb * 1024);
-        let mut reader = chunk::ChunkReader::open(Path::new(self.inner.path()))
+        let reader = chunk::ChunkReader::open(Path::new(self.inner.path()))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
         let payload_start = reader.layout.payload_start;
         let dec = scheduler::LogicalBatchDecoder::new(reader, self.inner.path().to_string())
@@ -3441,10 +3466,6 @@ impl PyLogicalScheduler {
         stats_dict.insert("decode_batches".into(), stats.decode_batches);
         stats_dict.insert("total_frames".into(), stats.total_frames);
         stats_dict.insert("max_fetch_records".into(), stats.max_fetch_records);
-        stats_dict.insert("coalesced_gets".into(), stats.coalesced_gets);
-        stats_dict.insert("uncoalesced_gets".into(), stats.uncoalesced_gets);
-        stats_dict.insert("bytes_read".into(), stats.bytes_read as usize);
-        stats_dict.insert("uncoalesced_bytes".into(), stats.uncoalesced_bytes as usize);
         stats_dict.insert("resolve_ns".into(), stats.resolve_ns as usize);
         stats_dict.insert("plan_ns".into(), stats.plan_ns as usize);
         stats_dict.insert("fetch_wall_ns".into(), stats.fetch_wall_ns as usize);
@@ -3516,10 +3537,6 @@ impl PyLogicalScheduler {
         stats_dict.insert("decode_batches".into(), stats.decode_batches);
         stats_dict.insert("total_frames".into(), stats.total_frames);
         stats_dict.insert("max_fetch_records".into(), stats.max_fetch_records);
-        stats_dict.insert("coalesced_gets".into(), stats.coalesced_gets);
-        stats_dict.insert("uncoalesced_gets".into(), stats.uncoalesced_gets);
-        stats_dict.insert("bytes_read".into(), stats.bytes_read as usize);
-        stats_dict.insert("uncoalesced_bytes".into(), stats.uncoalesced_bytes as usize);
         stats_dict.insert("resolve_ns".into(), stats.resolve_ns as usize);
         stats_dict.insert("plan_ns".into(), stats.plan_ns as usize);
         stats_dict.insert("fetch_wall_ns".into(), stats.fetch_wall_ns as usize);
@@ -3581,7 +3598,7 @@ fn write_chunk_from_files(
 ///
 /// Python passes only metadata and paths. Rust performs encode, tier selection,
 /// Annex-B parsing, Parquet index construction, and final chunk assembly.
-#[pyfunction]
+#[pyfunction(name = "build_tiered_chunk")]
 #[pyo3(signature = (
      videos,
      output_path,
@@ -3662,7 +3679,7 @@ fn build_chunk_from_videos(
 /// controlled encoding, packet extraction, dependency indexing, and chunk
 /// assembly.
 #[cfg(feature = "ffmpeg")]
-#[pyfunction]
+#[pyfunction(name = "build_chunk")]
 #[pyo3(signature = (
     videos,
     output_path,
@@ -3734,7 +3751,7 @@ fn build_hierarchical_chunk(
 /// Build the bounded experimental Anchor/Delta layout used by the closure-
 /// fusion gate. Rust owns decode, encode, NAL parsing, data writing and index
 /// construction; Python supplies paths and immutable build parameters only.
-#[pyfunction]
+#[pyfunction(name = "build_anchor_delta_layout")]
 #[pyo3(signature = (
     videos,
     data_path,
@@ -3801,7 +3818,7 @@ fn build_fused_normalized_layout(
 /// per-target libavcodec verification. Python supplies only paths and immutable
 /// build parameters.
 #[cfg(feature = "ffmpeg")]
-#[pyfunction]
+#[pyfunction(name = "build_reference_page_layout")]
 #[pyo3(signature = (
     videos,
     data_path,
@@ -5370,6 +5387,7 @@ impl PyS3HierarchicalExecutorPool {
 /// Python module entry point.
 #[pymodule]
 fn vclasp(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add(
         "TWO_LEVEL_LAYOUT_MODE",
         if cfg!(vclasp_patched_x264) {

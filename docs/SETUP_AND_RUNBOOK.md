@@ -1,9 +1,9 @@
-# VClasp Core setup
+# Setup and development
 
-## Host dependencies
+## Supported host
 
-The verified development environment is Ubuntu x86-64, Rust stable, Python
-3.12, and FFmpeg/libavcodec 6.x.
+The verified environment is Linux x86-64, Rust stable, Python 3.9+, and
+FFmpeg/libavcodec 6.x.
 
 ```bash
 sudo apt-get update
@@ -18,42 +18,75 @@ pkg-config --modversion libavcodec libavformat libavutil libswscale
 flatc --version
 ```
 
-## Build and test
+For a non-standard FFmpeg install, expose its `.pc` files through
+`PKG_CONFIG_PATH` before invoking Cargo.
+
+## Rust build
 
 ```bash
+cargo fmt --check
 cargo test --release --no-default-features
 cargo test --release --features ffmpeg
 cargo build --release --features ffmpeg
 ```
 
-The no-default-features suite validates chunk, index, closure, and planner
-logic. The FFmpeg feature adds libavcodec-backed decode tests. Tests that need a
-real video fixture are ignored unless `VCLASP_TEST_CHUNK` is set.
+The default suite validates format, index, closure, and span-planning logic.
+The `ffmpeg` feature adds libavcodec-backed decode and execution.
 
-## Python extension
+## Python development install
 
 ```bash
-python3.12 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-cargo build --release --features ffmpeg
-cp target/release/libvclasp.so ./vclasp.so
-PYTHONPATH="$PWD" python -c 'import vclasp; print(vclasp.__file__)'
+python -m pip install -r requirements-dev.txt
+maturin develop --release --features ffmpeg
+python -c 'import vclasp; print(vclasp.__version__)'
+pytest -q tests/test_logical_scheduler.py
 ```
 
-Local paths, endpoints, and credentials belong in an ignored `.env`. Copy
-`.env.example` and supply values locally. Never commit `.env`.
+Do not copy or rename the compiled shared library manually; `maturin` installs
+the correctly named extension into the active environment.
+
+## Format schema
+
+The source schema is `schemas/vclasp_chunk.fbs`. The checked-in Rust binding is
+`src/format/chunk_schema.rs`. Both must use file identifier `VCL1`. The runtime
+header also validates magic `VCLASP` and format version 1.
+
+This first public release intentionally has no reader for pre-release research
+chunks. Any schema change after `0.1.0` must increment the format version and
+include an explicit migration decision.
+
+## Patched x264 option
+
+The normal build uses the system x264 API. If a locally patched x264 exports the
+reference-control hooks used by the optional reference-page encoder, build with:
+
+```bash
+VCLASP_PATCHED_X264=1 cargo build --release --features ffmpeg
+```
 
 ## Object-store transport
-
-The standalone `object-store-transport` crate provides the common Rust and C
-Range GET data plane used by VClasp and the source-grounded baseline ports.
 
 ```bash
 cargo test --manifest-path object-store-transport/Cargo.toml
 cargo build --release --manifest-path object-store-transport/Cargo.toml
 ```
 
-Deployment, datasets, formal benchmark configs, and paper reproduction belong
-to `vclasp-artifact`, not this reusable core repository.
+Copy `.env.example` to `.env` for local endpoints and credentials. `.env` is
+ignored and must never be committed.
+
+## Fixture-backed tests
+
+Most tests generate their own data. Tests requiring a real encoded chunk are
+ignored unless `VCLASP_TEST_CHUNK` points to a VClasp format-v1 chunk. The
+Anchor-P fixture test uses `VCLASP_ANCHOR_P_TEST_CHUNK`.
+
+## Release checklist
+
+1. `cargo fmt --check` and both Rust test configurations pass.
+2. The Python wheel builds with `maturin build --release --features ffmpeg`.
+3. Examples run from a clean clone.
+4. No prototype format identifier or compatibility schema is present.
+5. The selected open-source license replaces the staging notice.

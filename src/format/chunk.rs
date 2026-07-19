@@ -4,10 +4,10 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::legacy_chunk_schema;
+use crate::chunk_schema;
 use crate::index::IndexReader;
 
-pub const FORMAT_MAGIC: &str = "HVS";
+pub const FORMAT_MAGIC: &str = "VCLASP";
 pub const FORMAT_VERSION: u16 = 1;
 pub const DEFAULT_CODEC: &str = "h264";
 pub const DEFAULT_WIDTH: u16 = 320;
@@ -97,10 +97,10 @@ impl ChunkReader {
         }
 
         let fb = &mmap[4..4 + fb_len];
-        if !flatbuffers::buffer_has_identifier(fb, legacy_chunk_schema::FILE_IDENTIFIER, false) {
+        if !flatbuffers::buffer_has_identifier(fb, chunk_schema::FILE_IDENTIFIER, false) {
             return Err("chunk FlatBuffer header has an invalid file identifier".into());
         }
-        let meta = legacy_chunk_schema::root_as_chunk_header(fb);
+        let meta = chunk_schema::root_as_chunk_header(fb);
         validate_header(&meta)?;
 
         let sps_pps_start = 4 + fb_len;
@@ -318,9 +318,9 @@ pub fn write_chunk_from_parts<R: Read>(
     let mut builder = flatbuffers::FlatBufferBuilder::new();
     let magic = builder.create_string(FORMAT_MAGIC);
     let codec = builder.create_string(&config.codec);
-    let header = legacy_chunk_schema::create_chunk_header(
+    let header = chunk_schema::create_chunk_header(
         &mut builder,
-        &legacy_chunk_schema::ChunkHeaderArgs {
+        &chunk_schema::ChunkHeaderArgs {
             magic,
             format_version: FORMAT_VERSION,
             codec,
@@ -334,7 +334,7 @@ pub fn write_chunk_from_parts<R: Read>(
             created_at: config.created_at,
         },
     );
-    builder.finish(header, Some(legacy_chunk_schema::FILE_IDENTIFIER));
+    builder.finish(header, Some(chunk_schema::FILE_IDENTIFIER));
     let fb = builder.finished_data();
 
     let mut output = File::create(output_path)?;
@@ -347,7 +347,9 @@ pub fn write_chunk_from_parts<R: Read>(
     Ok(())
 }
 
-fn validate_header(header: &legacy_chunk_schema::ChunkHeader<'_>) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_header(
+    header: &chunk_schema::ChunkHeader<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if header.magic() != Some(FORMAT_MAGIC) {
         return Err(format!(
             "unsupported chunk magic: expected {}, got {}",
@@ -381,4 +383,56 @@ fn validate_header(header: &legacy_chunk_schema::ChunkHeader<'_>) -> Result<(), 
         return Err("header.index_length must be non-zero".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_header(magic_value: &str, version: u16) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let magic = builder.create_string(magic_value);
+        let codec = builder.create_string(DEFAULT_CODEC);
+        let header = chunk_schema::create_chunk_header(
+            &mut builder,
+            &chunk_schema::ChunkHeaderArgs {
+                magic,
+                format_version: version,
+                codec,
+                width: DEFAULT_WIDTH,
+                height: DEFAULT_HEIGHT,
+                fps_num: DEFAULT_FPS_NUM,
+                fps_den: DEFAULT_FPS_DEN,
+                sps_pps_length: 1,
+                payload_length: 1,
+                index_length: 1,
+                created_at: 0,
+            },
+        );
+        builder.finish(header, Some(chunk_schema::FILE_IDENTIFIER));
+        builder.finished_data().to_vec()
+    }
+
+    #[test]
+    fn public_v1_header_has_vclasp_identity() {
+        let bytes = build_header(FORMAT_MAGIC, FORMAT_VERSION);
+        assert!(flatbuffers::buffer_has_identifier(
+            &bytes,
+            chunk_schema::FILE_IDENTIFIER,
+            false
+        ));
+        let header = chunk_schema::root_as_chunk_header(&bytes);
+        validate_header(&header).unwrap();
+        assert_eq!(header.magic(), Some("VCLASP"));
+        assert_eq!(header.format_version(), 1);
+    }
+
+    #[test]
+    fn public_v1_header_rejects_wrong_magic_or_version() {
+        let wrong_magic = build_header("INVALID", FORMAT_VERSION);
+        assert!(validate_header(&chunk_schema::root_as_chunk_header(&wrong_magic)).is_err());
+
+        let wrong_version = build_header(FORMAT_MAGIC, FORMAT_VERSION + 1);
+        assert!(validate_header(&chunk_schema::root_as_chunk_header(&wrong_version)).is_err());
+    }
 }

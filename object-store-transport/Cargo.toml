@@ -2,6 +2,11 @@
 name = "vclasp-object-store"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
+description = "Shared object-store Range GET transport for VClasp"
+repository = "https://github.com/AntiO2/vclasp"
+readme = "README.md"
+publish = false
 
 [lib]
 name = "vclasp_object_store"

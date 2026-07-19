@@ -1,47 +1,22 @@
-# Local environments and caches
-.conda-baselines/
-.venv/
-.env
-.pytest_cache/
-**/__pycache__/
-*.py[cod]
-
-# Generated experiment data and artifacts
-data/
-layouts/
-results/
-logs/
-aistore_read.log
-tmp/
-sidecars/
-iceberg_tables/
-lance_catalog/
-lance_catalog_p1/
-lance_mp4_native/
-lance_native_jpeg/
-
-# Downloaded toolchains
-tools/
-
-# Rust/PyO3 build outputs
-target/
+# Rust and Python build outputs
+/target/
+/object-store-transport/target/
 *.so
 *.dylib
 *.dll
-*.orig
 
-# LaTeX build outputs; keep source, bibliography, and build script
-paper/*.aux
-paper/*.bbl
-paper/*.blg
-paper/*.log
-paper/*.out
-paper/*.pdf
-paper/*.fls
-paper/*.fdb_latexmk
-paper/_minted-*/
+# Local Python environments and caches
+/.venv/
+/.pytest_cache/
+**/__pycache__/
+*.py[cod]
 
-# Editor and OS files
+# Local configuration and fixtures
+.env
+/tmp/
+/fixtures/
+
+# Editors and OS files
 .DS_Store
 .idea/
 .vscode/

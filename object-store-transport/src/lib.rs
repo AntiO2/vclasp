@@ -205,7 +205,9 @@ impl S3ObjectStoreClient {
             let mut requests = JoinSet::new();
             let mut pending = requested.into_iter().enumerate();
             let spawn_next = |requests: &mut JoinSet<_>,
-                              pending: &mut std::iter::Enumerate<std::vec::IntoIter<ObjectRange>>| {
+                              pending: &mut std::iter::Enumerate<
+                std::vec::IntoIter<ObjectRange>,
+            >| {
                 let Some((index, range)) = pending.next() else {
                     return false;
                 };

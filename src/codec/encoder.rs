@@ -68,7 +68,8 @@ impl X264Encoder {
         let h = height as i32;
         let yuv_sz = (w as usize) * (h as usize) * 3 / 2;
 
-        let inner = unsafe { vclasp_encoder_open(w, h, crf as i32, gop_size as i32, anchor_p as i32) };
+        let inner =
+            unsafe { vclasp_encoder_open(w, h, crf as i32, gop_size as i32, anchor_p as i32) };
         let inner = NonNull::new(inner).expect("vclasp_encoder_open failed");
 
         Self {
@@ -163,8 +164,9 @@ impl X264Encoder {
 
     pub fn try_flush(&mut self) -> Result<Vec<u8>, String> {
         let mut out = vec![0u8; self.out_buf_size as usize];
-        let written =
-            unsafe { vclasp_encoder_flush(self.inner.as_ptr(), out.as_mut_ptr(), self.out_buf_size) };
+        let written = unsafe {
+            vclasp_encoder_flush(self.inner.as_ptr(), out.as_mut_ptr(), self.out_buf_size)
+        };
 
         if written < 0 {
             return Err("x264 flush returned an error".to_string());

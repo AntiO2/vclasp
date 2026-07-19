@@ -14,7 +14,7 @@ use crate::normalized_scheduler;
 use crate::pair_scheduler;
 use crate::representation;
 
-#[pyclass]
+#[pyclass(name = "SharedS3ObjectStream")]
 pub struct PySharedS3ObjectStream {
     inner: backend::S3ObjectStream,
 }
@@ -33,7 +33,7 @@ impl PySharedS3ObjectStream {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "SharedS3ExecutionResources")]
 pub struct PySharedS3ExecutionResources {
     client: backend::S3ObjectStoreClient,
     decoder_slots: decoder::SharedDecoderSlots,
@@ -43,7 +43,7 @@ pub struct PySharedS3ExecutionResources {
     decode_concurrency: usize,
 }
 
-#[pyclass]
+#[pyclass(name = "SharedAIStoreExecutionResources")]
 pub struct PySharedAIStoreExecutionResources {
     client: backend::SharedAIStoreGetBatchClient,
     decoder_slots: decoder::SharedDecoderSlots,
@@ -239,13 +239,13 @@ impl PySharedS3ExecutionResources {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "SharedAnchorDeltaBatchExecutor")]
 pub struct PySharedNormalizedBatchExecutor {
     inner: normalized_scheduler::NormalizedBatchExecutor,
     dependency_group_spans: bool,
 }
 
-#[pyclass]
+#[pyclass(name = "SharedAIStoreAnchorDeltaBatchExecutor")]
 pub struct PySharedAIStoreNormalizedBatchExecutor {
     inner: normalized_scheduler::NormalizedBatchExecutor,
     dependency_group_spans: bool,
@@ -514,7 +514,7 @@ impl PySharedNormalizedBatchExecutor {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "SharedPrefixBatchExecutor")]
 pub struct PySharedPrefixBatchExecutor {
     inner: pair_scheduler::ClosedRecordBatchExecutor,
 }
@@ -598,7 +598,7 @@ impl PySharedPrefixBatchExecutor {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "SharedS3FragmentBatchExecutor")]
 pub struct PySharedS3FragmentBatchExecutor {
     inner: fragment_scheduler::FragmentBatchExecutor,
 }
@@ -795,7 +795,7 @@ impl PySharedS3FragmentBatchExecutor {
     }
 }
 
-#[pyclass]
+#[pyclass(name = "SharedAIStoreFragmentBatchExecutor")]
 pub struct PySharedAIStoreFragmentBatchExecutor {
     inner: fragment_scheduler::FragmentBatchExecutor,
 }

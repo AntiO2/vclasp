@@ -15,7 +15,7 @@ Interfaces:
 - Rust: `S3ObjectStoreClient::fetch_object_ranges`.
 - C/C++: `include/vclasp_object_store.h`; returned buffers must be released
   with `vclasp_buffers_free` and errors with `vclasp_error_free`.
-- Python harness: `vclasp.PyS3ObjectStoreReader`, a single-call batch adapter
+- Python harness: `vclasp.S3ObjectStoreReader`, a single-call batch adapter
   over the same Rust client.
 
 The transport preserves input order, validates every `(key, offset, length)`,

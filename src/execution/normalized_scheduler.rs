@@ -2037,23 +2037,20 @@ mod tests {
         assert_eq!(plans[0].records.len(), 2);
         assert!(NormalizedBatchExecutor::bind_explicit_ranges(&[(0, 10)], &missing).is_err());
 
-        let raced = NormalizedBatchExecutor::bind_explicit_ranges(
-            &[(0, 10), (100, 10)],
-            &missing[1..],
-        )
-        .unwrap();
+        let raced =
+            NormalizedBatchExecutor::bind_explicit_ranges(&[(0, 10), (100, 10)], &missing[1..])
+                .unwrap();
         assert_eq!(raced.len(), 1);
         assert_eq!(raced[0].records[0].record_id, 2);
-        assert!(NormalizedBatchExecutor::bind_explicit_ranges(&[(0, 10)], &[])
-            .unwrap()
-            .is_empty());
+        assert!(
+            NormalizedBatchExecutor::bind_explicit_ranges(&[(0, 10)], &[])
+                .unwrap()
+                .is_empty()
+        );
 
         let (fallback, count) =
-            NormalizedBatchExecutor::bind_explicit_ranges_with_cache_fallback(
-                &[(0, 10)],
-                &missing,
-            )
-            .unwrap();
+            NormalizedBatchExecutor::bind_explicit_ranges_with_cache_fallback(&[(0, 10)], &missing)
+                .unwrap();
         assert_eq!(count, 1);
         assert_eq!(fallback.len(), 2);
         assert_eq!(fallback[1].records[0].record_id, 2);
@@ -2063,38 +2060,36 @@ mod tests {
     fn shared_anchor_cache_survives_across_executors_and_delta_churn() {
         let shared = planner::shared_byte_cache(8);
         let slots = decoder::shared_decoder_slots(1);
-        let mut first =
-            NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
-                Vec::new(),
-                Box::new(crate::backend::NoopBackend),
-                None,
-                None,
-                shared.clone(),
-                4,
-                0,
-                1,
-                DecodeSchedule::Repeated,
-                slots.clone(),
-                1,
-                1,
-            )
-            .unwrap();
-        let mut second =
-            NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
-                Vec::new(),
-                Box::new(crate::backend::NoopBackend),
-                None,
-                None,
-                shared,
-                4,
-                0,
-                1,
-                DecodeSchedule::Repeated,
-                slots,
-                1,
-                1,
-            )
-            .unwrap();
+        let first = NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
+            Vec::new(),
+            Box::new(crate::backend::NoopBackend),
+            None,
+            None,
+            shared.clone(),
+            4,
+            0,
+            1,
+            DecodeSchedule::Repeated,
+            slots.clone(),
+            1,
+            1,
+        )
+        .unwrap();
+        let second = NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
+            Vec::new(),
+            Box::new(crate::backend::NoopBackend),
+            None,
+            None,
+            shared,
+            4,
+            0,
+            1,
+            DecodeSchedule::Repeated,
+            slots,
+            1,
+            1,
+        )
+        .unwrap();
 
         first.anchor_cache.lock().unwrap().put(99, vec![1; 8]);
         first.delta_cache.lock().unwrap().put(1, vec![2; 4]);

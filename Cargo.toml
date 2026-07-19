@@ -2,6 +2,10 @@
 name = "vclasp"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.82"
+description = "Codec-closure planning and selective video decode for object storage"
+repository = "https://github.com/AntiO2/vclasp"
+readme = "README.md"
 publish = false
 
 [lib]

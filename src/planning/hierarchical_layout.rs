@@ -56,7 +56,7 @@ pub struct HierarchicalCostModel {
     pub io_concurrency: usize,
     /// Optional calibrated fixed overhead for a wave containing 1..N Range
     /// GETs. Values exclude transfer time and must be monotone. An empty
-    /// vector retains the legacy max-per-range screening model.
+    /// vector falls back to the max-per-range screening model.
     pub wave_request_overhead_ns: Vec<f64>,
     /// Outcome-free uncertainty band for plan selection. Candidates inside
     /// the band are tie-broken by request count, fetched bytes, and decode
