@@ -1,4 +1,4 @@
-use vclasp::planner::{plan_byte_ranges, RecordRange};
+use vclasp::{plan_byte_ranges, RecordRange};
 
 fn main() -> Result<(), String> {
     let records = vec![

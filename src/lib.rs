@@ -45,6 +45,8 @@ mod saturation;
 mod scheduler;
 mod simd;
 
+pub use planner::{plan_byte_ranges, unique_covered_bytes, PlannedRecord, RangePlan, RecordRange};
+
 /// Python-facing VClasp chunk reader.
 #[pyclass]
 pub struct VClaspChunk {
@@ -1294,9 +1296,9 @@ impl PyByteCache {
     }
 }
 
-#[pyfunction]
+#[pyfunction(name = "plan_byte_ranges")]
 #[pyo3(signature = (records, merge_threshold_bytes=None, max_range_bytes=None))]
-fn plan_byte_ranges(
+fn plan_byte_ranges_py(
     records: Vec<(u64, u64, u64)>,
     merge_threshold_bytes: Option<u64>,
     max_range_bytes: Option<u64>,
@@ -5429,7 +5431,7 @@ fn vclasp(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_fused_normalized_layout, m)?)?;
     #[cfg(feature = "ffmpeg")]
     m.add_function(wrap_pyfunction!(build_two_level_page_layout, m)?)?;
-    m.add_function(wrap_pyfunction!(plan_byte_ranges, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_byte_ranges_py, m)?)?;
     m.add_function(wrap_pyfunction!(select_pair_materialization, m)?)?;
     m.add_function(wrap_pyfunction!(materialize_pair_records, m)?)?;
     m.add_function(wrap_pyfunction!(select_portfolio_candidate, m)?)?;
