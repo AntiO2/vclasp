@@ -5395,14 +5395,23 @@ fn vclasp(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAIStoreHierarchicalBatchExecutor>()?;
     #[cfg(feature = "ffmpeg")]
     m.add_class::<PyS3HierarchicalExecutorPool>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyAIStoreNormalizedBatchExecutor>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyPairBatchExecutor>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyAIStorePairBatchExecutor>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyPrefixBatchExecutor>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyAIStorePrefixBatchExecutor>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyAIStoreFragmentBatchExecutor>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyS3FragmentBatchExecutor>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyLocalClosedRecordBatchExecutor>()?;
+    #[cfg(feature = "ffmpeg")]
     m.add_class::<PyBudgetedPairBatchExecutor>()?;
     #[cfg(feature = "ffmpeg")]
     m.add_class::<PyLogicalBatchDecoder>()?;

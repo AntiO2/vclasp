@@ -1,7 +1,10 @@
-# VClasp Rust core
+# VClasp Core
 
-This crate contains the execution path used by VClasp and the shared
-object-store transport used by its systems baselines.
+VClasp Core is the reusable Rust implementation of codec-closure construction,
+object-store span planning, range retrieval, and libavcodec execution. The
+paper artifact, baseline ports, deployment recipes, and result corpus live in
+the separate
+[`vclasp-artifact`](https://github.com/AntiO2/vclasp-artifact) repository.
 
 ## Responsibilities
 
@@ -51,10 +54,10 @@ chunk = vclasp.VClaspChunk("/path/to/layout.chunk")
 print(chunk.format_version(), chunk.record_count())
 ```
 
-Current hierarchical ingestion and execution are exposed through the
+Current ingestion and execution are exposed through the
 `build_hierarchical_*` functions and `PyLocalHierarchicalBatchExecutor` /
-`PyS3HierarchicalBatchExecutor`. The exact function signatures are defined in
-`src/lib.rs`; benchmark scripts are the executable examples.
+`PyS3HierarchicalBatchExecutor`. See [the API guide](docs/API.md) and
+`examples/plan_ranges.rs` for stable entry points.
 
 ## On-disk compatibility
 
@@ -69,5 +72,10 @@ Most tests are self-contained. Fixture-backed decode tests are ignored unless
 `VCLASP_TEST_CHUNK` is set to a private chunk. The ignored real-video Anchor-P
 test accepts `VCLASP_ANCHOR_P_TEST_CHUNK`.
 
-Full environment, backend service, and formal-run instructions are in
-`docs/SETUP_AND_RUNBOOK.md`.
+Core-only setup and tests are documented in `docs/SETUP_AND_RUNBOOK.md`.
+
+## License status
+
+This worktree is a public-release staging candidate. The author must replace
+the staging notice in `LICENSE` with the selected open-source license before
+the repository is made public.
