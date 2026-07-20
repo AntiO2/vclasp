@@ -19,6 +19,7 @@ drivers, baseline ports, deployment recipes, and released result tables live in
 - exact byte-range planning and configurable range coalescing;
 - local, S3-compatible, and AIStore transports with bounded concurrency;
 - libavcodec-backed selective decode and logical-order restoration;
+- deterministic parallel ingestion with profiled closure-index construction;
 - Rust APIs for data-plane integration and PyO3 bindings for ML loaders.
 
 ## Quick start

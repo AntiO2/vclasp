@@ -85,12 +85,20 @@ stats = vclasp.build_chunk(
     fps=25,
     crf=23,
     preset="veryfast",
+    workers=8,
 )
 ```
 
 Each input tuple is `(video_id, class_name, source_path)`. Video IDs must be
 unique. The returned tuple reports videos, records, logical targets, payload
 bytes, index bytes, total chunk bytes, and maximum closure size.
+
+`workers` bounds independent source-video encode and probe tasks. Chunk
+assembly remains deterministic and follows input order. Artifact runners that
+need non-overlapping ingestion-stage timers use
+`build_hierarchical_chunk_profiled` with the same arguments; its result also
+reports encode, access-unit parsing, closure construction/validation, index
+serialization, and chunk-writing wall times.
 
 ## Inspect a chunk
 

@@ -3679,23 +3679,61 @@ fn build_chunk_from_videos(
 /// controlled encoding, packet extraction, dependency indexing, and chunk
 /// assembly.
 #[cfg(feature = "ffmpeg")]
-#[pyfunction(name = "build_chunk")]
-#[pyo3(signature = (
-    videos,
-    output_path,
-    baseline_mp4_dir=None,
-    ffmpeg_path="ffmpeg".to_string(),
-    ffprobe_path="ffprobe".to_string(),
-    gop_size=64,
-    max_frames=512,
-    width=320,
-    height=240,
-    fps=25,
-    crf=23,
-    preset="veryfast".to_string()
-))]
+#[pyclass(get_all)]
+struct PyHierarchicalBuildStats {
+    workers: usize,
+    videos: usize,
+    records: usize,
+    targets: usize,
+    payload_bytes: u64,
+    index_bytes: u64,
+    chunk_bytes: u64,
+    max_closure_records: usize,
+    mean_closure_records: f64,
+    median_closure_records: f64,
+    p95_closure_records: f64,
+    gops: usize,
+    total_seconds: f64,
+    encode_seconds: f64,
+    au_parse_seconds: f64,
+    closure_construction_seconds: f64,
+    closure_validation_seconds: f64,
+    payload_copy_seconds: f64,
+    index_serialization_seconds: f64,
+    chunk_write_seconds: f64,
+}
+
+#[cfg(feature = "ffmpeg")]
+impl From<hierarchical_ingest::HierarchicalBuildStats> for PyHierarchicalBuildStats {
+    fn from(stats: hierarchical_ingest::HierarchicalBuildStats) -> Self {
+        Self {
+            workers: stats.workers,
+            videos: stats.videos,
+            records: stats.records,
+            targets: stats.targets,
+            payload_bytes: stats.payload_bytes,
+            index_bytes: stats.index_bytes,
+            chunk_bytes: stats.chunk_bytes,
+            max_closure_records: stats.max_closure_records,
+            mean_closure_records: stats.mean_closure_records,
+            median_closure_records: stats.median_closure_records,
+            p95_closure_records: stats.p95_closure_records,
+            gops: stats.gops,
+            total_seconds: stats.total_seconds,
+            encode_seconds: stats.encode_seconds,
+            au_parse_seconds: stats.au_parse_seconds,
+            closure_construction_seconds: stats.closure_construction_seconds,
+            closure_validation_seconds: stats.closure_validation_seconds,
+            payload_copy_seconds: stats.payload_copy_seconds,
+            index_serialization_seconds: stats.index_serialization_seconds,
+            chunk_write_seconds: stats.chunk_write_seconds,
+        }
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
 #[allow(clippy::too_many_arguments)]
-fn build_hierarchical_chunk(
+fn run_hierarchical_build(
     py: Python<'_>,
     videos: Vec<(String, String, String)>,
     output_path: &str,
@@ -3709,7 +3747,8 @@ fn build_hierarchical_chunk(
     fps: u16,
     crf: u8,
     preset: String,
-) -> PyResult<(usize, usize, usize, u64, u64, u64, usize)> {
+    workers: usize,
+) -> PyResult<hierarchical_ingest::HierarchicalBuildStats> {
     let inputs = videos
         .into_iter()
         .map(|(video_id, class_name, source_path)| builder::VideoInput {
@@ -3730,13 +3769,65 @@ fn build_hierarchical_chunk(
         fps,
         crf,
         preset,
+        workers,
     };
-    let stats = py
-        .allow_threads(|| {
-            hierarchical_ingest::build_hierarchical_chunk(&inputs, &options)
-                .map_err(|error| error.to_string())
-        })
-        .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string()))?;
+    py.allow_threads(|| {
+        hierarchical_ingest::build_hierarchical_chunk(&inputs, &options)
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string()))
+}
+
+#[cfg(feature = "ffmpeg")]
+#[pyfunction(name = "build_chunk")]
+#[pyo3(signature = (
+    videos,
+    output_path,
+    baseline_mp4_dir=None,
+    ffmpeg_path="ffmpeg".to_string(),
+    ffprobe_path="ffprobe".to_string(),
+    gop_size=64,
+    max_frames=512,
+    width=320,
+    height=240,
+    fps=25,
+    crf=23,
+    preset="veryfast".to_string(),
+    workers=1
+))]
+#[allow(clippy::too_many_arguments)]
+fn build_hierarchical_chunk(
+    py: Python<'_>,
+    videos: Vec<(String, String, String)>,
+    output_path: &str,
+    baseline_mp4_dir: Option<String>,
+    ffmpeg_path: String,
+    ffprobe_path: String,
+    gop_size: u32,
+    max_frames: u32,
+    width: u16,
+    height: u16,
+    fps: u16,
+    crf: u8,
+    preset: String,
+    workers: usize,
+) -> PyResult<(usize, usize, usize, u64, u64, u64, usize)> {
+    let stats = run_hierarchical_build(
+        py,
+        videos,
+        output_path,
+        baseline_mp4_dir,
+        ffmpeg_path,
+        ffprobe_path,
+        gop_size,
+        max_frames,
+        width,
+        height,
+        fps,
+        crf,
+        preset,
+        workers,
+    )?;
     Ok((
         stats.videos,
         stats.records,
@@ -3746,6 +3837,50 @@ fn build_hierarchical_chunk(
         stats.chunk_bytes,
         stats.max_closure_records,
     ))
+}
+
+#[cfg(feature = "ffmpeg")]
+#[pyfunction]
+#[pyo3(signature = (
+    videos, output_path, baseline_mp4_dir=None,
+    ffmpeg_path="ffmpeg".to_string(), ffprobe_path="ffprobe".to_string(),
+    gop_size=64, max_frames=512, width=320, height=240, fps=25, crf=23,
+    preset="veryfast".to_string(), workers=1
+))]
+#[allow(clippy::too_many_arguments)]
+fn build_hierarchical_chunk_profiled(
+    py: Python<'_>,
+    videos: Vec<(String, String, String)>,
+    output_path: &str,
+    baseline_mp4_dir: Option<String>,
+    ffmpeg_path: String,
+    ffprobe_path: String,
+    gop_size: u32,
+    max_frames: u32,
+    width: u16,
+    height: u16,
+    fps: u16,
+    crf: u8,
+    preset: String,
+    workers: usize,
+) -> PyResult<PyHierarchicalBuildStats> {
+    run_hierarchical_build(
+        py,
+        videos,
+        output_path,
+        baseline_mp4_dir,
+        ffmpeg_path,
+        ffprobe_path,
+        gop_size,
+        max_frames,
+        width,
+        height,
+        fps,
+        crf,
+        preset,
+        workers,
+    )
+    .map(Into::into)
 }
 
 /// Build the bounded experimental Anchor/Delta layout used by the closure-
@@ -5442,10 +5577,14 @@ fn vclasp(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyS3ObjectStoreReader>()?;
     m.add_class::<PyLocalRangeReader>()?;
     m.add_class::<PyAIStoreGetBatchReader>()?;
+    #[cfg(feature = "ffmpeg")]
+    m.add_class::<PyHierarchicalBuildStats>()?;
     m.add_function(wrap_pyfunction!(write_chunk_from_files, m)?)?;
     m.add_function(wrap_pyfunction!(build_chunk_from_videos, m)?)?;
     #[cfg(feature = "ffmpeg")]
     m.add_function(wrap_pyfunction!(build_hierarchical_chunk, m)?)?;
+    #[cfg(feature = "ffmpeg")]
+    m.add_function(wrap_pyfunction!(build_hierarchical_chunk_profiled, m)?)?;
     m.add_function(wrap_pyfunction!(build_fused_normalized_layout, m)?)?;
     #[cfg(feature = "ffmpeg")]
     m.add_function(wrap_pyfunction!(build_two_level_page_layout, m)?)?;
