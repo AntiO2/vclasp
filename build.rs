@@ -1,7 +1,7 @@
 fn main() {
-    println!("cargo:rerun-if-changed=x264_encoder.c");
-    println!("cargo:rerun-if-changed=x264_encoder.h");
-    println!("cargo:rerun-if-env-changed=VTIMEWALK_PATCHED_X264");
+    println!("cargo:rerun-if-changed=native/x264_encoder.c");
+    println!("cargo:rerun-if-changed=native/x264_encoder.h");
+    println!("cargo:rerun-if-env-changed=VCLASP_PATCHED_X264");
     println!("cargo:rustc-check-cfg=cfg(vclasp_patched_x264)");
 
     // Use pkg-config CLI to get x264 include path.
@@ -13,9 +13,9 @@ fn main() {
     let cflags = String::from_utf8_lossy(&cflags).trim().to_string();
 
     let mut build = cc::Build::new();
-    build.file("x264_encoder.c");
-    if std::env::var_os("VTIMEWALK_PATCHED_X264").is_some() {
-        build.define("VTIMEWALK_PATCHED_X264", None);
+    build.file("native/x264_encoder.c");
+    if std::env::var_os("VCLASP_PATCHED_X264").is_some() {
+        build.define("VCLASP_PATCHED_X264", None);
         println!("cargo:rustc-cfg=vclasp_patched_x264");
     }
 

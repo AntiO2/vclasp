@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::adaptive_planner::{self, PlanCandidate, PlanMode};
 use crate::backend::{CompletedRange, StorageBackend};
+use crate::controls::adaptive::{self, PlanCandidate, PlanMode};
 use crate::decoder;
 use crate::hierarchical_layout::{
     AccessUnitRecord, DependencyLookaheadDecision, GopRegion, HierarchicalCostModel,
@@ -2037,23 +2037,20 @@ mod tests {
         assert_eq!(plans[0].records.len(), 2);
         assert!(NormalizedBatchExecutor::bind_explicit_ranges(&[(0, 10)], &missing).is_err());
 
-        let raced = NormalizedBatchExecutor::bind_explicit_ranges(
-            &[(0, 10), (100, 10)],
-            &missing[1..],
-        )
-        .unwrap();
+        let raced =
+            NormalizedBatchExecutor::bind_explicit_ranges(&[(0, 10), (100, 10)], &missing[1..])
+                .unwrap();
         assert_eq!(raced.len(), 1);
         assert_eq!(raced[0].records[0].record_id, 2);
-        assert!(NormalizedBatchExecutor::bind_explicit_ranges(&[(0, 10)], &[])
-            .unwrap()
-            .is_empty());
+        assert!(
+            NormalizedBatchExecutor::bind_explicit_ranges(&[(0, 10)], &[])
+                .unwrap()
+                .is_empty()
+        );
 
         let (fallback, count) =
-            NormalizedBatchExecutor::bind_explicit_ranges_with_cache_fallback(
-                &[(0, 10)],
-                &missing,
-            )
-            .unwrap();
+            NormalizedBatchExecutor::bind_explicit_ranges_with_cache_fallback(&[(0, 10)], &missing)
+                .unwrap();
         assert_eq!(count, 1);
         assert_eq!(fallback.len(), 2);
         assert_eq!(fallback[1].records[0].record_id, 2);
@@ -2255,23 +2252,22 @@ impl NormalizedBatchExecutor {
             .map(|(_, record)| record.clone())
             .collect::<Vec<_>>();
         let useful_bytes = planner::unique_covered_bytes(&records)?;
-        let mut candidates =
-            adaptive_planner::plans_for_thresholds(&records, self.max_range_bytes)?
-                .into_iter()
-                .map(|(threshold, plans)| {
-                    Ok(PlanCandidate {
-                        mode: PlanMode::Normalized {
-                            merge_threshold_bytes: threshold,
-                        },
-                        range_lengths: plans.iter().map(|plan| plan.length).collect(),
-                        useful_bytes,
-                        anchor_decodes,
-                        delta_decodes,
-                        prefix_frames: 0,
-                        prefix_resets: 0,
-                    })
+        let mut candidates = adaptive::plans_for_thresholds(&records, self.max_range_bytes)?
+            .into_iter()
+            .map(|(threshold, plans)| {
+                Ok(PlanCandidate {
+                    mode: PlanMode::Normalized {
+                        merge_threshold_bytes: threshold,
+                    },
+                    range_lengths: plans.iter().map(|plan| plan.length).collect(),
+                    useful_bytes,
+                    anchor_decodes,
+                    delta_decodes,
+                    prefix_frames: 0,
+                    prefix_resets: 0,
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let group_plans = planner::plan_group_spans(&grouped_records, self.max_range_bytes)?;
         candidates.push(PlanCandidate {
             mode: PlanMode::NormalizedGroupSpan,

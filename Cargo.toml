@@ -30,6 +30,7 @@ ffmpeg-next = { version = "6.1", default-features = false, features = ["codec", 
 [features]
 default = []
 ffmpeg = ["dep:ffmpeg-next"]
+experiment-controls = ["ffmpeg"]
 
 [profile.release]
 opt-level = 3

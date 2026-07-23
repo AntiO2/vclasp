@@ -4,10 +4,10 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::legacy_chunk_schema;
+use crate::chunk_schema;
 use crate::index::IndexReader;
 
-pub const FORMAT_MAGIC: &str = "HVS";
+pub const FORMAT_MAGIC: &str = "VCL";
 pub const FORMAT_VERSION: u16 = 1;
 pub const DEFAULT_CODEC: &str = "h264";
 pub const DEFAULT_WIDTH: u16 = 320;
@@ -97,10 +97,10 @@ impl ChunkReader {
         }
 
         let fb = &mmap[4..4 + fb_len];
-        if !flatbuffers::buffer_has_identifier(fb, legacy_chunk_schema::FILE_IDENTIFIER, false) {
+        if !flatbuffers::buffer_has_identifier(fb, chunk_schema::FILE_IDENTIFIER, false) {
             return Err("chunk FlatBuffer header has an invalid file identifier".into());
         }
-        let meta = legacy_chunk_schema::root_as_chunk_header(fb);
+        let meta = chunk_schema::root_as_chunk_header(fb);
         validate_header(&meta)?;
 
         let sps_pps_start = 4 + fb_len;
@@ -318,9 +318,9 @@ pub fn write_chunk_from_parts<R: Read>(
     let mut builder = flatbuffers::FlatBufferBuilder::new();
     let magic = builder.create_string(FORMAT_MAGIC);
     let codec = builder.create_string(&config.codec);
-    let header = legacy_chunk_schema::create_chunk_header(
+    let header = chunk_schema::create_chunk_header(
         &mut builder,
-        &legacy_chunk_schema::ChunkHeaderArgs {
+        &chunk_schema::ChunkHeaderArgs {
             magic,
             format_version: FORMAT_VERSION,
             codec,
@@ -334,7 +334,7 @@ pub fn write_chunk_from_parts<R: Read>(
             created_at: config.created_at,
         },
     );
-    builder.finish(header, Some(legacy_chunk_schema::FILE_IDENTIFIER));
+    builder.finish(header, Some(chunk_schema::FILE_IDENTIFIER));
     let fb = builder.finished_data();
 
     let mut output = File::create(output_path)?;
@@ -347,7 +347,9 @@ pub fn write_chunk_from_parts<R: Read>(
     Ok(())
 }
 
-fn validate_header(header: &legacy_chunk_schema::ChunkHeader<'_>) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_header(
+    header: &chunk_schema::ChunkHeader<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if header.magic() != Some(FORMAT_MAGIC) {
         return Err(format!(
             "unsupported chunk magic: expected {}, got {}",

@@ -8,10 +8,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::backend;
+use crate::controls::closed_record;
+use crate::controls::normalized;
 use crate::decoder;
 use crate::fragment_scheduler;
-use crate::normalized_scheduler;
-use crate::pair_scheduler;
 use crate::representation;
 
 #[pyclass]
@@ -241,13 +241,13 @@ impl PySharedS3ExecutionResources {
 
 #[pyclass]
 pub struct PySharedNormalizedBatchExecutor {
-    inner: normalized_scheduler::NormalizedBatchExecutor,
+    inner: normalized::NormalizedBatchExecutor,
     dependency_group_spans: bool,
 }
 
 #[pyclass]
 pub struct PySharedAIStoreNormalizedBatchExecutor {
-    inner: normalized_scheduler::NormalizedBatchExecutor,
+    inner: normalized::NormalizedBatchExecutor,
     dependency_group_spans: bool,
 }
 
@@ -294,7 +294,7 @@ impl PySharedAIStoreNormalizedBatchExecutor {
                 .map_err(|error| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
                 })?;
-        let mut inner = normalized_scheduler::NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
+        let mut inner = normalized::NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
             descriptors,
             Box::new(backend),
             merge_threshold_bytes,
@@ -424,7 +424,7 @@ impl PySharedNormalizedBatchExecutor {
             .map_err(|error| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
             })?;
-        let mut inner = normalized_scheduler::NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
+        let mut inner = normalized::NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
             descriptors,
             Box::new(backend),
             merge_threshold_bytes,
@@ -516,7 +516,7 @@ impl PySharedNormalizedBatchExecutor {
 
 #[pyclass]
 pub struct PySharedPrefixBatchExecutor {
-    inner: pair_scheduler::ClosedRecordBatchExecutor,
+    inner: closed_record::ClosedRecordBatchExecutor,
 }
 
 #[pymethods]
@@ -541,7 +541,7 @@ impl PySharedPrefixBatchExecutor {
         let descriptors = descriptors
             .into_iter()
             .map(|(sample_id, video_id, target_ordinal, offset, length)| {
-                pair_scheduler::ClosedRecordDescriptor {
+                closed_record::ClosedRecordDescriptor {
                     sample_id,
                     video_id,
                     offset,
@@ -554,7 +554,7 @@ impl PySharedPrefixBatchExecutor {
             .map_err(|error| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
             })?;
-        let inner = pair_scheduler::ClosedRecordBatchExecutor::new_with_decoder_slots(
+        let inner = closed_record::ClosedRecordBatchExecutor::new_with_decoder_slots(
             descriptors,
             representation::Representation::Prefix,
             Box::new(backend),

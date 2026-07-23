@@ -7,9 +7,7 @@
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-pub use vclasp_object_store::{
-    CompletedRange, ObjectRange, S3ObjectStoreClient, S3ObjectStream,
-};
+pub use vclasp_object_store::{CompletedRange, ObjectRange, S3ObjectStoreClient, S3ObjectStream};
 
 /// Abstract byte-range read from a storage backend.
 pub trait StorageBackend: Send {

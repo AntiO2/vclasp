@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,9 +122,9 @@ pub fn plan_byte_ranges(
 /// Coalesce missing records only within the same codec dependency group.
 ///
 /// This is intentionally different from a global byte-gap threshold. Once an
-/// Anchor is cached, same-video requests often leave several Delta records
-/// from each Anchor group. One range per group preserves that reuse without
-/// accidentally joining physically adjacent records from unrelated groups.
+/// When an Anchor is cached, the remaining Delta records form independent
+/// dependency groups. One range per group preserves that reuse without joining
+/// physically adjacent records from unrelated groups.
 pub fn plan_group_spans(
     grouped_records: &[(u64, RecordRange)],
     max_range_bytes: Option<u64>,
@@ -202,6 +202,39 @@ impl ByteCache {
     /// Inspect residency without changing hit counters or LRU order.
     pub fn contains(&self, record_id: u64) -> bool {
         self.entries.contains_key(&record_id)
+    }
+
+    pub fn resident_ids(&self) -> HashSet<u64> {
+        self.entries.keys().copied().collect()
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    pub fn remove(&mut self, record_id: u64) -> Option<Vec<u8>> {
+        let value = self.entries.remove(&record_id)?;
+        self.resident_bytes -= value.len();
+        if let Some(position) = self.lru.iter().position(|key| *key == record_id) {
+            self.lru.remove(position);
+        }
+        Some(value)
+    }
+
+    pub fn resize(&mut self, capacity_bytes: usize) {
+        self.capacity_bytes = capacity_bytes;
+        while self.resident_bytes > self.capacity_bytes {
+            let victim = self
+                .lru
+                .pop_front()
+                .expect("cache accounting lost LRU entry during resize");
+            let removed = self
+                .entries
+                .remove(&victim)
+                .expect("cache accounting lost resident entry during resize");
+            self.resident_bytes -= removed.len();
+            self.evictions += 1;
+        }
     }
 
     pub fn put(&mut self, record_id: u64, value: Vec<u8>) -> bool {
@@ -415,5 +448,21 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats["resident_bytes"], 6);
         assert_eq!(stats["evictions"], 1);
+    }
+
+    #[test]
+    fn byte_cache_resize_and_remove_preserve_accounting() {
+        let mut cache = ByteCache::new(8);
+        assert!(cache.put(1, vec![1; 4]));
+        assert!(cache.put(2, vec![2; 4]));
+        assert_eq!(cache.resident_ids(), HashSet::from([1, 2]));
+
+        cache.resize(4);
+        assert_eq!(cache.resident_ids(), HashSet::from([2]));
+        assert_eq!(cache.resident_bytes(), 4);
+
+        assert_eq!(cache.remove(2), Some(vec![2; 4]));
+        assert_eq!(cache.resident_bytes(), 0);
+        assert!(cache.resident_ids().is_empty());
     }
 }

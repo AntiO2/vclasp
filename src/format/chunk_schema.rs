@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-pub const FILE_IDENTIFIER: &str = "HVS1";
+pub const FILE_IDENTIFIER: &str = "VCL1";
 
 #[derive(Copy, Clone, PartialEq)]
 pub struct ChunkHeader<'a> {

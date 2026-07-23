@@ -1,5 +1,5 @@
-use vclasp::chunk::ChunkReader;
 use std::path::Path;
+use vclasp::chunk::ChunkReader;
 
 fn test_chunk_path() -> Option<String> {
     std::env::var("VCLASP_TEST_CHUNK").ok()
@@ -13,8 +13,7 @@ fn open_test_chunk() -> Option<ChunkReader> {
 #[test]
 #[ignore = "requires VCLASP_TEST_CHUNK"]
 fn test_record_count_for_tier0() {
-    let reader =
-        open_test_chunk().expect("VCLASP_TEST_CHUNK not set");
+    let reader = open_test_chunk().expect("VCLASP_TEST_CHUNK not set");
     let count = reader.record_count_for("ApplyEyeMakeup/v_ApplyEyeMakeup_g01_c01.avi", 0);
     assert_eq!(count, 1, "every video should have exactly 1 tier0 record");
 }

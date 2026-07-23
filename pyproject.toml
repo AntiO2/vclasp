@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "vclasp"
+version = "0.1.0"
+description = "Codec-closure planning and selective video decode for object storage"
+requires-python = ">=3.9"
+readme = "README.md"
+
+[tool.maturin]
+features = ["ffmpeg"]
+module-name = "vclasp"
