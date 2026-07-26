@@ -90,6 +90,9 @@ logical batches whose IDs and order have already been chosen by the application
 or data loader. Visibility permits cross-batch deduplication and state reuse;
 it never permits VClasp to change sample order.
 
+`VClaspChunk.video_ids()` and `VClaspChunk.frame_indices(video_id)` enumerate
+the valid logical targets directly from the embedded closure catalog.
+
 ```python
 cost_model = {
     "request_latency_ns": 200_000.0,
@@ -104,12 +107,12 @@ cost_model = {
     "runtime_feedback_enabled": 1.0,
 }
 
-reader = vclasp.LocalVClaspExecutor(
+reader = vclasp.VClaspSession.local(
     "dataset.vclasp",
     cost_model,
     [],                         # optional calibrated request-wave overheads
     decoder_threads=1,
-    incremental_decode_slots=8,
+    global_decode_concurrency=8,
     resident_encoded_bytes=8 << 20,
     resident_read_ahead_bytes=64 << 10,
     resident_cursor_capacity=8,
@@ -120,19 +123,54 @@ window = [
     [(2, "video-0001", 8), (3, "video-0002", 47)],
 ]
 
-batches, ready_ns, delivery_ns, stats, mode, predicted_ns = (
-    reader.execute_window(window)
+pipeline = reader.pipeline(
+    max_outstanding_batches=8,
+    max_outstanding_targets=256,
 )
-assert [[item[0] for item in batch] for batch in batches] == [[0, 1], [2, 3]]
 ```
 
-Use `execute(batch)` only as the `L=1` convenience form. Applications that
-already prefetch multiple batches should call `execute_window` so
-the core can reason over the same bounded visibility.
+Training should run its sampler producer and model consumer concurrently:
 
-For S3-compatible storage, use `S3VClaspExecutor`; for a partitioned persistent
-pool, use `S3VClaspExecutorPool.execute_window`. These
-classes preserve the same request-window and output-order contract.
+```python
+from threading import Thread
+
+def produce():
+    try:
+        for batch in data_sampler:
+            pipeline.submit(batch)
+    finally:
+        pipeline.close()
+
+producer = Thread(target=produce)
+producer.start()
+while (item := pipeline.take()) is not None:
+    sequence, frames, stats, mode, predicted_ns, residence_ns = item
+    train_step(frames)
+producer.join()
+```
+
+`submit()` blocks when the declared batch or target capacity is full. Execution
+may complete out of order, but `take()` returns submission order and drains all
+admitted work after `close()`. This bounds prefetched state while overlapping
+sampling, object I/O, decode, and model compute.
+
+Use `execute(batch)` as the synchronous `L=1` convenience form and
+`execute_window` when an application already owns one finite request window.
+
+For S3-compatible storage, create one process-wide `VClaspSession`.
+Concurrent callers submit logical targets to that session; they do not select
+planner workers, cache partitions, or workload identities. The configured
+caller count bounds an admission cohort. `max_inflight_windows` independently
+bounds overlapping physical execution.
+Concurrent calls are jointly admitted within each cohort; the session restores
+each call's original batch boundaries and output order.
+
+`submit` and `submit_window` remain lower-level one-shot handle APIs.
+Visibility is supplied by already-sampled work, not inferred from a workload
+name.
+Select local or AIStore transport with
+`VClaspSession.local(...)` or `VClaspSession.aistore(...)`; execution preserves
+the same request-window and output-order contract.
 
 ## Execution contract
 
@@ -170,7 +208,9 @@ and configuration used for reproduction.
 See [execution architecture](docs/execution_architecture.md) for the detailed
 planner, cache, and fallback invariants. See
 [runtime cost feedback](docs/runtime_cost_feedback.md) for the online update
-model, safety gate, telemetry, and diagnostic runner.
+model, safety gate, telemetry, and diagnostic runner. The
+[final architecture audit](docs/final_architecture_audit.md) maps every
+production invariant to its code and verification evidence.
 
 ## Development
 
@@ -188,6 +228,6 @@ runtime observations, and explicit resource budgets.
 
 ## License
 
-This staging tree does not yet grant an open-source license. The author must
-select a license before public release; see `LICENSE`. Linked third-party
-components retain their own licenses.
+VClasp is licensed under the
+[GNU Affero General Public License v3.0](LICENSE), using the SPDX identifier
+`AGPL-3.0-only`. Linked third-party components retain their own licenses.

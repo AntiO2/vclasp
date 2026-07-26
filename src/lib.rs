@@ -9,6 +9,8 @@
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ffmpeg")]
+use std::sync::Mutex;
 
 #[path = "storage/backend.rs"]
 mod backend;
@@ -62,6 +64,9 @@ mod runtime_feedback;
 #[cfg(feature = "experiment-controls")]
 #[path = "execution/scheduler.rs"]
 mod scheduler;
+#[cfg(feature = "ffmpeg")]
+#[path = "execution/session.rs"]
+pub mod session;
 #[path = "execution/simd.rs"]
 mod simd;
 
@@ -75,16 +80,16 @@ pub struct VClaspChunk {
     inner: chunk::ChunkReader,
     #[cfg(feature = "experiment-controls")]
     path: String,
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     decoder_pool: decoder::DecoderPool,
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     cached_sps: Option<Vec<u8>>,
     #[cfg(feature = "ffmpeg")]
     hierarchical_catalog: Option<hierarchical_ingest::HierarchicalCatalog>,
 }
 
 /// Decoder adapter for closed H.264 Annex-B records independent of a chunk.
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 #[pyclass]
 pub struct H264Decoder {
     decoder_pool: decoder::DecoderPool,
@@ -114,56 +119,52 @@ struct PyAdaptiveBatchExecutor {
     inner: controls::adaptive::AdaptiveBatchExecutor,
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 #[pyclass]
-pub struct S3VClaspExecutor {
+struct S3VClaspExecutor {
+    inner: hierarchical_scheduler::HierarchicalBatchExecutor,
+}
+
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
+#[pyclass]
+struct LocalVClaspExecutor {
+    inner: hierarchical_scheduler::HierarchicalBatchExecutor,
+}
+
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
+#[pyclass]
+struct AIStoreVClaspExecutor {
     inner: hierarchical_scheduler::HierarchicalBatchExecutor,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
-pub struct LocalVClaspExecutor {
-    inner: hierarchical_scheduler::HierarchicalBatchExecutor,
+#[pyclass(name = "VClaspSession")]
+pub struct PyVClaspSession {
+    inner: session::VClaspSession,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
-pub struct AIStoreVClaspExecutor {
-    inner: hierarchical_scheduler::HierarchicalBatchExecutor,
+#[pyclass(name = "PendingBatch")]
+pub struct PyPendingBatch {
+    inner: Mutex<Option<session::PendingBatch>>,
 }
 
 #[cfg(feature = "ffmpeg")]
-#[pyclass]
-pub struct S3VClaspExecutorPool {
-    workers: Vec<HierarchicalExecutorWorker>,
-    routes: std::sync::Mutex<HierarchicalVideoRoutes>,
-    global_decode_concurrency: usize,
-    max_cursor_decoder_threads: usize,
+#[pyclass(name = "PendingWindow")]
+pub struct PyPendingWindow {
+    inner: Mutex<Option<session::PendingWindow>>,
 }
 
 #[cfg(feature = "ffmpeg")]
-fn cursor_threads_for_parallel_partitions(
-    global_decode_concurrency: usize,
-    max_cursor_decoder_threads: usize,
-    active_partitions: usize,
-) -> usize {
-    (global_decode_concurrency / active_partitions.max(1))
-        .max(1)
-        .min(max_cursor_decoder_threads)
+#[pyclass(name = "VClaspPipeline")]
+pub struct PyVClaspPipeline {
+    inner: session::VClaspPipeline,
 }
 
 #[cfg(all(test, feature = "ffmpeg"))]
 mod executor_pool_tests {
-    use super::cursor_threads_for_parallel_partitions;
-
-    #[test]
-    fn cursor_threads_share_one_global_budget_across_observed_partitions() {
-        assert_eq!(cursor_threads_for_parallel_partitions(8, 8, 1), 8);
-        assert_eq!(cursor_threads_for_parallel_partitions(8, 8, 2), 4);
-        assert_eq!(cursor_threads_for_parallel_partitions(8, 8, 4), 2);
-        assert_eq!(cursor_threads_for_parallel_partitions(8, 4, 1), 4);
-        assert_eq!(cursor_threads_for_parallel_partitions(8, 8, 16), 1);
-    }
+    #[cfg(feature = "experiment-controls")]
+    use super::hierarchical_action_from_python;
 
     #[test]
     fn production_planning_and_execution_do_not_branch_on_workload_labels() {
@@ -189,184 +190,147 @@ mod executor_pool_tests {
             );
         }
     }
-}
-
-#[cfg(feature = "ffmpeg")]
-type HierarchicalWorkerResult = Result<
-    (
-        Vec<hierarchical_scheduler::HierarchicalOutput>,
-        hierarchical_scheduler::HierarchicalBatchStats,
-    ),
-    String,
->;
-
-#[cfg(feature = "ffmpeg")]
-type HierarchicalWindowWorkerResult =
-    Result<hierarchical_scheduler::HierarchicalIncrementalWindow, String>;
-
-#[cfg(feature = "ffmpeg")]
-enum HierarchicalWorkerCommand {
-    Execute {
-        targets: Vec<hierarchical_scheduler::LogicalTarget>,
-        cursor_decoder_threads_hint: Option<usize>,
-        response: std::sync::mpsc::SyncSender<HierarchicalWorkerResult>,
-    },
-    ExecuteWindow {
-        batches: Vec<Vec<hierarchical_scheduler::LogicalTarget>>,
-        response: std::sync::mpsc::SyncSender<HierarchicalWindowWorkerResult>,
-    },
-    Metrics {
-        response: std::sync::mpsc::SyncSender<(u64, u64, u64, usize, usize, usize, usize)>,
-    },
-    Shutdown,
-}
-
-#[cfg(feature = "ffmpeg")]
-struct HierarchicalExecutorWorker {
-    sender: std::sync::mpsc::Sender<HierarchicalWorkerCommand>,
-    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-#[cfg(feature = "ffmpeg")]
-impl HierarchicalExecutorWorker {
-    fn spawn(mut executor: hierarchical_scheduler::HierarchicalBatchExecutor) -> Self {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            while let Ok(command) = receiver.recv() {
-                match command {
-                    HierarchicalWorkerCommand::Execute {
-                        targets,
-                        cursor_decoder_threads_hint,
-                        response,
-                    } => {
-                        let result = executor
-                            .execute_with_cursor_threads(&targets, cursor_decoder_threads_hint);
-                        let _ = response.send(result);
-                    }
-                    HierarchicalWorkerCommand::ExecuteWindow { batches, response } => {
-                        let _ = response.send(executor.execute_window(&batches));
-                    }
-                    HierarchicalWorkerCommand::Metrics { response } => {
-                        let _ = response.send(executor.resident_metrics());
-                    }
-                    HierarchicalWorkerCommand::Shutdown => break,
-                }
-            }
-        });
-        Self {
-            sender,
-            thread: std::sync::Mutex::new(Some(thread)),
-        }
-    }
 
     #[cfg(feature = "experiment-controls")]
-    fn submit(
-        &self,
-        targets: Vec<hierarchical_scheduler::LogicalTarget>,
-    ) -> Result<std::sync::mpsc::Receiver<HierarchicalWorkerResult>, String> {
-        self.submit_with_hint(targets, None)
+    #[test]
+    fn forced_pool_action_parser_keeps_fixed_gap_explicit() {
+        let action = hierarchical_action_from_python("fixed_gap_closure", 16 * 1024).unwrap();
+        assert!(matches!(
+            action,
+            crate::hierarchical_scheduler::HierarchicalAction::FixedGapClosure(16_384)
+        ));
+        assert!(hierarchical_action_from_python("unknown", 0).is_err());
     }
+}
 
-    fn submit_with_hint(
-        &self,
-        targets: Vec<hierarchical_scheduler::LogicalTarget>,
-        cursor_decoder_threads_hint: Option<usize>,
-    ) -> Result<std::sync::mpsc::Receiver<HierarchicalWorkerResult>, String> {
-        let (response, receiver) = std::sync::mpsc::sync_channel(1);
-        self.sender
-            .send(HierarchicalWorkerCommand::Execute {
-                targets,
-                cursor_decoder_threads_hint,
-                response,
+#[cfg(feature = "ffmpeg")]
+impl PyVClaspSession {
+    fn batch_result_to_python(
+        py: Python<'_>,
+        result: session::BatchResult,
+    ) -> PyResult<(
+        Vec<(u64, Py<PyBytes>, u32, u32)>,
+        std::collections::HashMap<String, u64>,
+        String,
+        f64,
+    )> {
+        let (outputs, stats) = result.map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        let frames = outputs
+            .into_iter()
+            .map(|output| {
+                (
+                    output.sample_id,
+                    PyBytes::new_bound(py, &output.frame.data).unbind(),
+                    output.frame.width,
+                    output.frame.height,
+                )
             })
-            .map_err(|_| "hierarchical executor worker stopped".to_string())?;
-        Ok(receiver)
+            .collect();
+        Ok((
+            frames,
+            hierarchical_stats_dict(&stats),
+            stats.mode.to_string(),
+            stats.predicted_total_ns,
+        ))
     }
 
-    fn metrics(&self) -> Result<(u64, u64, u64, usize, usize, usize, usize), String> {
-        let (response, receiver) = std::sync::mpsc::sync_channel(1);
-        self.sender
-            .send(HierarchicalWorkerCommand::Metrics { response })
-            .map_err(|_| "hierarchical executor worker stopped".to_string())?;
-        receiver
-            .recv()
-            .map_err(|_| "hierarchical executor worker dropped metrics response".to_string())
-    }
-
-    fn submit_window(
+    fn execute_batch_internal(
         &self,
-        batches: Vec<Vec<hierarchical_scheduler::LogicalTarget>>,
-    ) -> Result<std::sync::mpsc::Receiver<HierarchicalWindowWorkerResult>, String> {
-        let (response, receiver) = std::sync::mpsc::sync_channel(1);
-        self.sender
-            .send(HierarchicalWorkerCommand::ExecuteWindow { batches, response })
-            .map_err(|_| "hierarchical executor worker stopped".to_string())?;
-        Ok(receiver)
+        py: Python<'_>,
+        targets: Vec<(u64, String, i32)>,
+    ) -> PyResult<(
+        Vec<(u64, Py<PyBytes>, u32, u32)>,
+        std::collections::HashMap<String, u64>,
+        String,
+        f64,
+    )> {
+        let logical = targets
+            .into_iter()
+            .map(
+                |(sample_id, video_id, frame_idx)| hierarchical_scheduler::LogicalTarget {
+                    sample_id,
+                    video_id,
+                    frame_idx,
+                },
+            )
+            .collect::<Vec<_>>();
+        let result = py.allow_threads(|| self.inner.execute(logical));
+        Self::batch_result_to_python(py, result)
     }
-}
 
-#[cfg(feature = "ffmpeg")]
-impl Drop for S3VClaspExecutorPool {
-    fn drop(&mut self) {
-        for worker in &self.workers {
-            let _ = worker.sender.send(HierarchicalWorkerCommand::Shutdown);
-        }
-        for worker in &self.workers {
-            if let Ok(mut thread) = worker.thread.lock() {
-                if let Some(thread) = thread.take() {
-                    let _ = thread.join();
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "ffmpeg")]
-#[derive(Default)]
-struct HierarchicalVideoRoutes {
-    assignments: std::collections::HashMap<String, usize>,
-    next_worker: usize,
-}
-
-#[cfg(feature = "ffmpeg")]
-struct HierarchicalWorkerWindow {
-    batches: Vec<Vec<hierarchical_scheduler::LogicalTarget>>,
-    global_batch_indices: Vec<usize>,
-    positions: Vec<Vec<usize>>,
-}
-
-#[cfg(feature = "ffmpeg")]
-impl S3VClaspExecutorPool {
-    fn refresh_resident_metrics(
+    fn execute_window_internal(
         &self,
-        stats: &mut hierarchical_scheduler::HierarchicalBatchStats,
-    ) -> Result<(), String> {
-        let mut encoded_bytes = 0u64;
-        let mut cursor_bytes = 0u64;
-        let mut budget_bytes = 0u64;
-        let mut cursor_entries = 0usize;
-        let mut cursor_capacity = 0usize;
-        let mut pinned_entries = 0usize;
-        let mut probationary_entries = 0usize;
-        for worker in &self.workers {
-            let (encoded, cursor, budget, entries, capacity, pinned, probationary) =
-                worker.metrics()?;
-            encoded_bytes += encoded;
-            cursor_bytes += cursor;
-            budget_bytes += budget;
-            cursor_entries += entries;
-            cursor_capacity += capacity;
-            pinned_entries += pinned;
-            probationary_entries += probationary;
+        py: Python<'_>,
+        batches: Vec<Vec<(u64, String, i32)>>,
+    ) -> PyResult<(
+        Vec<Vec<(u64, Py<PyBytes>, u32, u32)>>,
+        Vec<u64>,
+        Vec<u64>,
+        std::collections::HashMap<String, u64>,
+        String,
+        f64,
+    )> {
+        if batches.is_empty() || batches.iter().any(Vec::is_empty) {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "VClasp request window requires non-empty batches",
+            ));
         }
-        stats.encoded_cache_resident_bytes = encoded_bytes;
-        stats.resident_read_ahead_bytes = cursor_bytes;
-        stats.resident_encoded_budget_bytes = budget_bytes;
-        stats.resident_cursor_entries = cursor_entries;
-        stats.resident_cursor_capacity = cursor_capacity;
-        stats.resident_cursor_pinned_entries = pinned_entries;
-        stats.resident_cursor_probationary_entries = probationary_entries;
-        Ok(())
+        let logical = batches
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_iter()
+                    .map(
+                        |(sample_id, video_id, frame_idx)| hierarchical_scheduler::LogicalTarget {
+                            sample_id,
+                            video_id,
+                            frame_idx,
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let result = py.allow_threads(|| self.inner.execute_window(logical));
+        Self::window_result_to_python(py, result)
+    }
+
+    fn window_result_to_python(
+        py: Python<'_>,
+        result: session::WindowResult,
+    ) -> PyResult<(
+        Vec<Vec<(u64, Py<PyBytes>, u32, u32)>>,
+        Vec<u64>,
+        Vec<u64>,
+        std::collections::HashMap<String, u64>,
+        String,
+        f64,
+    )> {
+        let window = result.map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        let frames = window
+            .batches
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_iter()
+                    .map(|output| {
+                        (
+                            output.sample_id,
+                            PyBytes::new_bound(py, &output.frame.data).unbind(),
+                            output.frame.width,
+                            output.frame.height,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Ok((
+            frames,
+            window.batch_ready_ns,
+            window.ordered_delivery_ns,
+            hierarchical_stats_dict(&window.stats),
+            window.stats.mode.to_string(),
+            window.stats.predicted_total_ns,
+        ))
     }
 }
 
@@ -1666,7 +1630,7 @@ fn materialize_pair_records(
     ))
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 #[pymethods]
 impl H264Decoder {
     #[new]
@@ -3115,7 +3079,7 @@ struct PyLogicalScheduler {
     inner: scheduler::LogicalScheduler,
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 impl VClaspChunk {
     fn get_sps_pps(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         if self.cached_sps.is_none() {
@@ -3142,9 +3106,9 @@ impl VClaspChunk {
             inner: reader,
             #[cfg(feature = "experiment-controls")]
             path: path.to_string(),
-            #[cfg(feature = "ffmpeg")]
+            #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
             decoder_pool: decoder::DecoderPool::new(decoder::DecoderConfig::default()),
-            #[cfg(feature = "ffmpeg")]
+            #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
             cached_sps: None,
             #[cfg(feature = "ffmpeg")]
             hierarchical_catalog,
@@ -3186,6 +3150,7 @@ impl VClaspChunk {
 
     /// Read a single record blob by (video_id, tier) — returns one random matching blob.
     /// For deterministic access, use read_record_at(video_id, tier, idx).
+    #[cfg(feature = "experiment-controls")]
     fn read_record(&mut self, py: Python<'_>, video_id: &str, tier: i32) -> PyResult<Py<PyBytes>> {
         let data = self
             .inner
@@ -3195,6 +3160,7 @@ impl VClaspChunk {
     }
 
     /// Read a single deterministic record at index `idx` within the (video_id, tier) group.
+    #[cfg(feature = "experiment-controls")]
     fn read_record_at(
         &mut self,
         py: Python<'_>,
@@ -3210,11 +3176,53 @@ impl VClaspChunk {
     }
 
     /// Return the number of records for (video_id, tier), or 0 if not found.
+    #[cfg(feature = "experiment-controls")]
     fn record_count_for(&self, video_id: &str, tier: i32) -> usize {
         self.inner.record_count_for(video_id, tier)
     }
 
+    /// Enumerate logical video IDs registered in the closure catalog.
+    #[cfg(feature = "ffmpeg")]
+    fn video_ids(&self) -> PyResult<Vec<String>> {
+        let catalog = self.hierarchical_catalog.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "chunk does not contain a valid closure catalog",
+            )
+        })?;
+        let mut video_ids = catalog
+            .records()
+            .map(|record| record.video_id.clone())
+            .collect::<Vec<_>>();
+        video_ids.sort();
+        video_ids.dedup();
+        Ok(video_ids)
+    }
+
+    /// Enumerate registered display-order frame indices for one logical video.
+    #[cfg(feature = "ffmpeg")]
+    fn frame_indices(&self, video_id: &str) -> PyResult<Vec<i32>> {
+        let catalog = self.hierarchical_catalog.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "chunk does not contain a valid closure catalog",
+            )
+        })?;
+        let mut frame_indices = catalog
+            .records()
+            .filter(|record| record.video_id == video_id)
+            .map(|record| record.frame_idx)
+            .collect::<Vec<_>>();
+        if frame_indices.is_empty() {
+            return Err(PyErr::new::<pyo3::exceptions::PyKeyError, _>(
+                video_id.to_string(),
+            ));
+        }
+        frame_indices.sort_unstable();
+        frame_indices.dedup();
+        Ok(frame_indices)
+    }
+
     /// Read a specific byte range from the payload.
+    #[cfg(feature = "experiment-controls")]
     fn read_bytes(&mut self, py: Python<'_>, offset: u64, length: u64) -> PyResult<Py<PyBytes>> {
         let data = self
             .inner
@@ -3228,14 +3236,14 @@ impl VClaspChunk {
     ///
     /// This only affects decoders created *after* the call. Existing cached
     /// decoders keep their original thread count.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     fn set_decoder_threads(&mut self, num: usize) {
         self.decoder_pool.set_threads(num);
     }
 
     /// Decode one target from the bitstream-grounded closure stored in the
     /// hierarchical index. The target is addressed in source display order.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     fn decode_hierarchical_target_rgb24(
         &mut self,
         py: Python<'_>,
@@ -3323,7 +3331,7 @@ impl VClaspChunk {
     /// Decode a record through Rust FFmpeg/libavcodec and return (rgb24_bytes, width, height).
     ///
     /// This method is available only when compiled with `--features ffmpeg`.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     fn decode_record_rgb24(
         &mut self,
         py: Python<'_>,
@@ -3355,7 +3363,7 @@ impl VClaspChunk {
     /// Reads `count` records, concatenates them with per-record SPS/PPS prefixes,
     /// and decodes all frames through a single FFmpeg decoder + scaler session.
     /// Returns one `(rgb_bytes, width, height)` tuple per decoded frame.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     fn decode_records_batch_rgb24(
         &mut self,
         py: Python<'_>,
@@ -3388,6 +3396,7 @@ impl VClaspChunk {
 
     /// Batch lookup: resolve many (video_id, tier) pairs and return their blob byte ranges.
     /// Uses SIMD-accelerated columnar scan for large batches.
+    #[cfg(feature = "experiment-controls")]
     fn batch_lookup(&self, video_ids: Vec<String>, tiers: Vec<i32>) -> PyResult<Vec<(u64, u64)>> {
         if video_ids.len() != tiers.len() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -3404,7 +3413,7 @@ impl VClaspChunk {
     /// Tier 2 records with full_gop or anchor_p policy store multiple frames per
     /// record. This method decodes all frames using a single decoder session and
     /// returns `(rgb24_bytes, width, height)` for each frame.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     fn decode_gop_record_rgb24(
         &mut self,
         py: Python<'_>,
@@ -3435,7 +3444,7 @@ impl VClaspChunk {
     /// `start_idx` (0-based within the matching record group), then batch-decodes
     /// all frames through a single FFmpeg decoder + scaler session.
     /// Returns `[(rgb24_bytes, width, height), ...]` per decoded frame.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     fn decode_gop_records_batch_rgb24(
         &mut self,
         py: Python<'_>,
@@ -3466,7 +3475,7 @@ impl VClaspChunk {
     ///
     /// Single-scan variant: reads all matching records with one index scan,
     /// then batch-decodes all of them. Returns `[(rgb24_bytes, width, height), ...]`.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     fn decode_gop_all_records_rgb24(
         &mut self,
         py: Python<'_>,
@@ -3493,7 +3502,7 @@ impl VClaspChunk {
 
     /// Decode a single GOP record at deterministic index `idx`.
     /// Reads the record at idx, prepends SPS/PPS, decodes all frames.
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     fn decode_gop_record_at(
         &mut self,
         py: Python<'_>,
@@ -4649,7 +4658,7 @@ impl PyAdaptiveBatchExecutor {
     }
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 fn hierarchical_metadata_from_chunk(
     path: &str,
 ) -> PyResult<(hierarchical_ingest::HierarchicalCatalog, Vec<u8>, usize)> {
@@ -4663,6 +4672,26 @@ fn hierarchical_metadata_from_chunk(
         .read_sps_pps()
         .map_err(|error| PyErr::new::<pyo3::exceptions::PyIOError, _>(error.to_string()))?;
     Ok((catalog, codec_config, reader.layout.payload_start))
+}
+
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
+fn hierarchical_action_from_python(
+    action: &str,
+    fixed_gap_bytes: u64,
+) -> PyResult<hierarchical_scheduler::HierarchicalAction> {
+    match action {
+        "keyframe_prefix" => Ok(hierarchical_scheduler::HierarchicalAction::KeyframePrefix),
+        "calibrated_closure" => Ok(hierarchical_scheduler::HierarchicalAction::CalibratedClosure),
+        "exact_closure" => Ok(hierarchical_scheduler::HierarchicalAction::ExactClosure),
+        "fixed_gap_closure" => Ok(hierarchical_scheduler::HierarchicalAction::FixedGapClosure(
+            fixed_gap_bytes,
+        )),
+        "region_selective" => Ok(hierarchical_scheduler::HierarchicalAction::RegionSelective),
+        "region_all" => Ok(hierarchical_scheduler::HierarchicalAction::RegionAll),
+        value => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "unknown hierarchical experiment action {value}"
+        ))),
+    }
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -4750,6 +4779,55 @@ fn runtime_feedback_config_from_python(
             .copied()
             .unwrap_or(0.25),
         activation_stable_observations: stable_observations as usize,
+    };
+    config
+        .validate()
+        .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+    Ok(config)
+}
+
+#[cfg(feature = "ffmpeg")]
+#[allow(clippy::too_many_arguments)]
+fn session_config_from_python(
+    cost_model: &std::collections::HashMap<String, f64>,
+    wave_request_overhead_ns: Vec<f64>,
+    max_callers: usize,
+    max_pending_calls: Option<usize>,
+    max_inflight_windows: Option<usize>,
+    admission_quiet_us: u64,
+    max_merge_gap_bytes: Option<u64>,
+    max_range_bytes: Option<u64>,
+    decoder_threads: usize,
+    global_decode_threads: usize,
+    cursor_decoder_threads: Option<usize>,
+    resident_encoded_bytes: usize,
+    resident_read_ahead_bytes: usize,
+    resident_cursor_capacity: Option<usize>,
+) -> PyResult<session::SessionConfig> {
+    let runtime_feedback = runtime_feedback_config_from_python(cost_model)?;
+    let cost_model = hierarchical_model_from_python(cost_model, wave_request_overhead_ns)?;
+    let default_pipeline_depth = max_callers
+        .min(global_decode_threads / decoder_threads.max(1))
+        .min(cost_model.io_concurrency)
+        .max(1);
+    let config = session::SessionConfig {
+        cost_model,
+        runtime_feedback,
+        max_callers,
+        max_pending_calls: max_pending_calls
+            .unwrap_or_else(|| max_callers.saturating_mul(4).max(max_callers)),
+        max_inflight_windows: max_inflight_windows.unwrap_or(default_pipeline_depth),
+        admission_quiet: std::time::Duration::from_micros(admission_quiet_us),
+        max_merge_gap_bytes,
+        max_range_bytes,
+        decoder_threads,
+        global_decode_threads,
+        cursor_decoder_threads: cursor_decoder_threads.unwrap_or(decoder_threads),
+        resident_state: session::ResidentStateBudget {
+            encoded_bytes: resident_encoded_bytes,
+            read_ahead_bytes: resident_read_ahead_bytes,
+            live_cursors: resident_cursor_capacity.unwrap_or(global_decode_threads),
+        },
     };
     config
         .validate()
@@ -4916,6 +4994,18 @@ fn hierarchical_stats_dict(
             "planner_candidate_count",
             stats.planner_candidate_count as u64,
         ),
+        (
+            "fixed16_reference_ranges",
+            stats.fixed16_reference_ranges as u64,
+        ),
+        (
+            "fixed16_reference_fetched_bytes",
+            stats.fixed16_reference_fetched_bytes,
+        ),
+        (
+            "fixed16_reference_predicted_ns",
+            stats.fixed16_reference_predicted_ns,
+        ),
         ("range_le_4k", stats.range_le_4k as u64),
         ("range_4k_to_16k", stats.range_4k_to_16k as u64),
         ("range_16k_to_64k", stats.range_16k_to_64k as u64),
@@ -4963,8 +5053,34 @@ fn hierarchical_stats_dict(
         ("decoder_state_resets", stats.decoder_state_resets as u64),
         ("plan_ns", stats.plan_ns),
         ("fetch_ns", stats.fetch_ns),
+        ("range_dispatch_ns_sum", stats.range_dispatch_ns_sum),
+        ("range_ttfb_ns_sum", stats.range_ttfb_ns_sum),
+        ("range_service_ns_sum", stats.range_service_ns_sum),
+        ("range_max_in_flight", stats.range_max_in_flight as u64),
+        ("range_timing_samples", stats.range_timing_samples as u64),
+        (
+            "io_pressure_max_concurrency",
+            stats.io_pressure_max_concurrency as u64,
+        ),
+        (
+            "io_pressure_active_at_plan",
+            stats.io_pressure_active_at_plan as u64,
+        ),
+        (
+            "io_pressure_outstanding_at_plan",
+            stats.io_pressure_outstanding_at_plan as u64,
+        ),
+        (
+            "io_pressure_queued_at_plan",
+            stats.io_pressure_queued_at_plan as u64,
+        ),
         ("assemble_ns", stats.assemble_ns),
         ("decode_ns", stats.decode_ns),
+        ("session_admission_ns", stats.session_admission_ns),
+        (
+            "session_joint_submissions",
+            stats.session_joint_submissions as u64,
+        ),
         ("total_ns", stats.total_ns),
         (
             "runtime_feedback_io_observations",
@@ -4981,6 +5097,10 @@ fn hierarchical_stats_dict(
         (
             "runtime_feedback_active",
             u64::from(stats.runtime_feedback_active),
+        ),
+        (
+            "runtime_feedback_fixed16_fallback",
+            u64::from(stats.runtime_feedback_fixed16_fallback),
         ),
         (
             "runtime_feedback_io_ape_ppm",
@@ -5004,7 +5124,7 @@ fn hierarchical_stats_dict(
     .collect()
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 fn execute_hierarchical_python(
     inner: &mut hierarchical_scheduler::HierarchicalBatchExecutor,
     py: Python<'_>,
@@ -5047,7 +5167,7 @@ fn execute_hierarchical_python(
     ))
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 fn execute_hierarchical_window_python(
     inner: &mut hierarchical_scheduler::HierarchicalBatchExecutor,
     py: Python<'_>,
@@ -5250,14 +5370,14 @@ fn plan_label_preserving_logical_sampler_python(
     Ok((plan.batches, stats))
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 #[pymethods]
 impl LocalVClaspExecutor {
     #[new]
     #[pyo3(signature = (
         chunk_path, cost_model, wave_request_overhead_ns,
         max_merge_gap_bytes=None, max_range_bytes=None, decoder_threads=1,
-        incremental_decode_slots=1, incremental_batch_deadline_fences=false,
+        decoder_slots=1, batch_deadline_fences=false,
         resident_encoded_bytes=1048576, resident_read_ahead_bytes=65536,
         resident_cursor_capacity=None
     ))]
@@ -5269,8 +5389,8 @@ impl LocalVClaspExecutor {
         max_merge_gap_bytes: Option<u64>,
         max_range_bytes: Option<u64>,
         decoder_threads: usize,
-        incremental_decode_slots: usize,
-        incremental_batch_deadline_fences: bool,
+        decoder_slots: usize,
+        batch_deadline_fences: bool,
         resident_encoded_bytes: usize,
         resident_read_ahead_bytes: usize,
         resident_cursor_capacity: Option<usize>,
@@ -5297,12 +5417,12 @@ impl LocalVClaspExecutor {
             max_merge_gap_bytes,
             max_range_bytes,
             decoder_threads,
-            incremental_decode_slots,
-            incremental_batch_deadline_fences,
+            decoder_slots,
+            batch_deadline_fences,
             hierarchical_scheduler::ResidentStateBudget {
                 encoded_bytes: resident_encoded_bytes,
                 read_ahead_bytes: resident_read_ahead_bytes,
-                live_cursors: resident_cursor_capacity.unwrap_or(incremental_decode_slots),
+                live_cursors: resident_cursor_capacity.unwrap_or(decoder_slots),
             },
         )
         .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
@@ -5437,7 +5557,7 @@ impl LocalVClaspExecutor {
     }
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 #[pymethods]
 impl S3VClaspExecutor {
     #[new]
@@ -5445,8 +5565,8 @@ impl S3VClaspExecutor {
         local_chunk_path, object_key, endpoint, bucket, access_key, secret_key,
         cost_model, wave_request_overhead_ns, region="us-east-1".to_string(),
         max_concurrency=8, max_merge_gap_bytes=None, max_range_bytes=None,
-        decoder_threads=1, incremental_decode_slots=1,
-        incremental_batch_deadline_fences=false, resident_encoded_bytes=1048576,
+        decoder_threads=1, decoder_slots=1,
+        batch_deadline_fences=false, resident_encoded_bytes=1048576,
         resident_read_ahead_bytes=65536,
         resident_cursor_capacity=None
     ))]
@@ -5465,8 +5585,8 @@ impl S3VClaspExecutor {
         max_merge_gap_bytes: Option<u64>,
         max_range_bytes: Option<u64>,
         decoder_threads: usize,
-        incremental_decode_slots: usize,
-        incremental_batch_deadline_fences: bool,
+        decoder_slots: usize,
+        batch_deadline_fences: bool,
         resident_encoded_bytes: usize,
         resident_read_ahead_bytes: usize,
         resident_cursor_capacity: Option<usize>,
@@ -5493,12 +5613,12 @@ impl S3VClaspExecutor {
             max_merge_gap_bytes,
             max_range_bytes,
             decoder_threads,
-            incremental_decode_slots,
-            incremental_batch_deadline_fences,
+            decoder_slots,
+            batch_deadline_fences,
             hierarchical_scheduler::ResidentStateBudget {
                 encoded_bytes: resident_encoded_bytes,
                 read_ahead_bytes: resident_read_ahead_bytes,
-                live_cursors: resident_cursor_capacity.unwrap_or(incremental_decode_slots),
+                live_cursors: resident_cursor_capacity.unwrap_or(decoder_slots),
             },
         )
         .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
@@ -5633,7 +5753,7 @@ impl S3VClaspExecutor {
     }
 }
 
-#[cfg(feature = "ffmpeg")]
+#[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
 #[pymethods]
 impl AIStoreVClaspExecutor {
     #[new]
@@ -5641,7 +5761,7 @@ impl AIStoreVClaspExecutor {
         local_chunk_path, object_key, endpoint, bucket, cost_model,
         wave_request_overhead_ns, provider="ais".to_string(),
         max_merge_gap_bytes=None, max_range_bytes=None, decoder_threads=1,
-        incremental_decode_slots=1, incremental_batch_deadline_fences=false,
+        decoder_slots=1, batch_deadline_fences=false,
         resident_encoded_bytes=1048576, resident_read_ahead_bytes=65536,
         resident_cursor_capacity=None
     ))]
@@ -5657,8 +5777,8 @@ impl AIStoreVClaspExecutor {
         max_merge_gap_bytes: Option<u64>,
         max_range_bytes: Option<u64>,
         decoder_threads: usize,
-        incremental_decode_slots: usize,
-        incremental_batch_deadline_fences: bool,
+        decoder_slots: usize,
+        batch_deadline_fences: bool,
         resident_encoded_bytes: usize,
         resident_read_ahead_bytes: usize,
         resident_cursor_capacity: Option<usize>,
@@ -5682,12 +5802,12 @@ impl AIStoreVClaspExecutor {
             max_merge_gap_bytes,
             max_range_bytes,
             decoder_threads,
-            incremental_decode_slots,
-            incremental_batch_deadline_fences,
+            decoder_slots,
+            batch_deadline_fences,
             hierarchical_scheduler::ResidentStateBudget {
                 encoded_bytes: resident_encoded_bytes,
                 read_ahead_bytes: resident_read_ahead_bytes,
-                live_cursors: resident_cursor_capacity.unwrap_or(incremental_decode_slots),
+                live_cursors: resident_cursor_capacity.unwrap_or(decoder_slots),
             },
         )
         .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
@@ -5778,13 +5898,265 @@ impl AIStoreVClaspExecutor {
 
 #[cfg(feature = "ffmpeg")]
 #[pymethods]
-impl S3VClaspExecutorPool {
+impl PyPendingBatch {
+    fn result(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(
+        Vec<(u64, Py<PyBytes>, u32, u32)>,
+        std::collections::HashMap<String, u64>,
+        String,
+        f64,
+    )> {
+        let pending = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "pending VClasp batch result was already consumed",
+                )
+            })?;
+        let result = py.allow_threads(|| pending.wait());
+        PyVClaspSession::batch_result_to_python(py, result)
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+#[pymethods]
+impl PyPendingWindow {
+    fn result(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(
+        Vec<Vec<(u64, Py<PyBytes>, u32, u32)>>,
+        Vec<u64>,
+        Vec<u64>,
+        std::collections::HashMap<String, u64>,
+        String,
+        f64,
+    )> {
+        let pending = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "pending VClasp window result was already consumed",
+                )
+            })?;
+        let result = py.allow_threads(|| pending.wait());
+        PyVClaspSession::window_result_to_python(py, result)
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+#[pymethods]
+impl PyVClaspPipeline {
+    /// Submit one already-sampled training batch. This releases the GIL while
+    /// waiting for bounded pipeline capacity.
+    fn submit(&self, py: Python<'_>, targets: Vec<(u64, String, i32)>) -> PyResult<u64> {
+        let logical = targets
+            .into_iter()
+            .map(
+                |(sample_id, video_id, frame_idx)| hierarchical_scheduler::LogicalTarget {
+                    sample_id,
+                    video_id,
+                    frame_idx,
+                },
+            )
+            .collect::<Vec<_>>();
+        py.allow_threads(|| self.inner.submit(logical))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
+    /// Consume the next batch in submission order. Physical execution remains
+    /// concurrent and may complete out of order behind this ordered boundary.
+    #[allow(clippy::type_complexity)]
+    fn take(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<
+        Option<(
+            u64,
+            Vec<(u64, Py<PyBytes>, u32, u32)>,
+            std::collections::HashMap<String, u64>,
+            String,
+            f64,
+            u64,
+        )>,
+    > {
+        let Some(batch) = py.allow_threads(|| self.inner.take()) else {
+            return Ok(None);
+        };
+        let (frames, stats, mode, predicted_ns) =
+            PyVClaspSession::batch_result_to_python(py, batch.result)?;
+        Ok(Some((
+            batch.sequence,
+            frames,
+            stats,
+            mode,
+            predicted_ns,
+            batch.residence_ns,
+        )))
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn metrics_snapshot(&self) -> std::collections::HashMap<String, u64> {
+        let metrics = self.inner.metrics_snapshot();
+        [
+            ("submitted_batches", metrics.submitted_batches),
+            ("submitted_targets", metrics.submitted_targets),
+            ("delivered_batches", metrics.delivered_batches),
+            ("delivered_targets", metrics.delivered_targets),
+            ("outstanding_batches", metrics.outstanding_batches as u64),
+            ("outstanding_targets", metrics.outstanding_targets as u64),
+            (
+                "peak_outstanding_batches",
+                metrics.peak_outstanding_batches as u64,
+            ),
+            (
+                "peak_outstanding_targets",
+                metrics.peak_outstanding_targets as u64,
+            ),
+            ("producer_wait_ns", metrics.producer_wait_ns),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+#[pymethods]
+impl PyVClaspSession {
+    #[staticmethod]
+    #[pyo3(signature = (
+        chunk_path, cost_model, wave_request_overhead_ns,
+        max_callers=1, max_pending_calls=None, max_inflight_windows=None,
+        admission_quiet_us=0,
+        max_merge_gap_bytes=None, max_range_bytes=None, decoder_threads=1,
+        global_decode_concurrency=8, resident_encoded_bytes=1048576,
+        resident_read_ahead_bytes=65536, resident_cursor_capacity=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn local(
+        chunk_path: &str,
+        cost_model: std::collections::HashMap<String, f64>,
+        wave_request_overhead_ns: Vec<f64>,
+        max_callers: usize,
+        max_pending_calls: Option<usize>,
+        max_inflight_windows: Option<usize>,
+        admission_quiet_us: u64,
+        max_merge_gap_bytes: Option<u64>,
+        max_range_bytes: Option<u64>,
+        decoder_threads: usize,
+        global_decode_concurrency: usize,
+        resident_encoded_bytes: usize,
+        resident_read_ahead_bytes: usize,
+        resident_cursor_capacity: Option<usize>,
+    ) -> PyResult<Self> {
+        let config = session_config_from_python(
+            &cost_model,
+            wave_request_overhead_ns,
+            max_callers,
+            max_pending_calls,
+            max_inflight_windows,
+            admission_quiet_us,
+            max_merge_gap_bytes,
+            max_range_bytes,
+            decoder_threads,
+            global_decode_concurrency,
+            None,
+            resident_encoded_bytes,
+            resident_read_ahead_bytes,
+            resident_cursor_capacity,
+        )?;
+        Ok(Self {
+            inner: session::VClaspSession::open_local(chunk_path, config)
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
+        })
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (
+        local_chunk_path, object_key, endpoint, bucket, cost_model,
+        wave_request_overhead_ns, max_callers=8,
+        max_pending_calls=None, max_inflight_windows=None,
+        provider="ais".to_string(), admission_quiet_us=250,
+        max_merge_gap_bytes=None, max_range_bytes=None, decoder_threads=1,
+        global_decode_concurrency=8, resident_encoded_bytes=1048576,
+        resident_read_ahead_bytes=65536, resident_cursor_capacity=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn aistore(
+        local_chunk_path: &str,
+        object_key: String,
+        endpoint: String,
+        bucket: String,
+        cost_model: std::collections::HashMap<String, f64>,
+        wave_request_overhead_ns: Vec<f64>,
+        max_callers: usize,
+        max_pending_calls: Option<usize>,
+        max_inflight_windows: Option<usize>,
+        provider: String,
+        admission_quiet_us: u64,
+        max_merge_gap_bytes: Option<u64>,
+        max_range_bytes: Option<u64>,
+        decoder_threads: usize,
+        global_decode_concurrency: usize,
+        resident_encoded_bytes: usize,
+        resident_read_ahead_bytes: usize,
+        resident_cursor_capacity: Option<usize>,
+    ) -> PyResult<Self> {
+        let config = session_config_from_python(
+            &cost_model,
+            wave_request_overhead_ns,
+            max_callers,
+            max_pending_calls,
+            max_inflight_windows,
+            admission_quiet_us,
+            max_merge_gap_bytes,
+            max_range_bytes,
+            decoder_threads,
+            global_decode_concurrency,
+            None,
+            resident_encoded_bytes,
+            resident_read_ahead_bytes,
+            resident_cursor_capacity,
+        )?;
+        Ok(Self {
+            inner: session::VClaspSession::open_aistore(
+                local_chunk_path,
+                session::AIStoreConfig {
+                    endpoint,
+                    bucket,
+                    object_key,
+                    provider,
+                },
+                config,
+            )
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
+        })
+    }
+
     #[new]
     #[pyo3(signature = (
         local_chunk_path, object_key, endpoint, bucket, access_key, secret_key,
-        cost_model, wave_request_overhead_ns, workers,
+        cost_model, wave_request_overhead_ns, max_callers,
+        max_pending_calls=None, max_inflight_windows=None,
         region="us-east-1".to_string(), global_io_concurrency=8,
         global_decode_concurrency=8,
+        admission_quiet_us=250,
         max_merge_gap_bytes=None, max_range_bytes=None, decoder_threads=1,
         cursor_decoder_threads=None,
         resident_encoded_bytes=1048576, resident_read_ahead_bytes=65536,
@@ -5800,10 +6172,13 @@ impl S3VClaspExecutorPool {
         secret_key: String,
         cost_model: std::collections::HashMap<String, f64>,
         wave_request_overhead_ns: Vec<f64>,
-        workers: usize,
+        max_callers: usize,
+        max_pending_calls: Option<usize>,
+        max_inflight_windows: Option<usize>,
         region: String,
         global_io_concurrency: usize,
         global_decode_concurrency: usize,
+        admission_quiet_us: u64,
         max_merge_gap_bytes: Option<u64>,
         max_range_bytes: Option<u64>,
         decoder_threads: usize,
@@ -5812,114 +6187,60 @@ impl S3VClaspExecutorPool {
         resident_read_ahead_bytes: usize,
         resident_cursor_capacity: Option<usize>,
     ) -> PyResult<Self> {
-        if workers == 0 {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "hierarchical executor pool requires at least one worker",
-            ));
-        }
-        if global_decode_concurrency < workers {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "global decode concurrency cannot be smaller than executor workers",
-            ));
-        }
-        if decoder_threads == 0 {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "decoder threads must be positive",
-            ));
-        }
-        let cursor_decoder_threads = cursor_decoder_threads.unwrap_or(decoder_threads);
-        if cursor_decoder_threads == 0 || cursor_decoder_threads > global_decode_concurrency {
+        let config = session_config_from_python(
+            &cost_model,
+            wave_request_overhead_ns,
+            max_callers,
+            max_pending_calls,
+            max_inflight_windows,
+            admission_quiet_us,
+            max_merge_gap_bytes,
+            max_range_bytes,
+            decoder_threads,
+            global_decode_concurrency,
+            cursor_decoder_threads,
+            resident_encoded_bytes,
+            resident_read_ahead_bytes,
+            resident_cursor_capacity,
+        )?;
+        if config.cost_model.io_concurrency != global_io_concurrency {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "cursor decoder threads must be within 1..={global_decode_concurrency}"
+                "cost-model I/O concurrency {} differs from the execution budget {}",
+                config.cost_model.io_concurrency, global_io_concurrency
             )));
         }
-        let (catalog, codec_config, payload_start) =
-            hierarchical_metadata_from_chunk(local_chunk_path)?;
-        let client = backend::S3ObjectStoreClient::new(
-            endpoint,
-            bucket,
-            access_key,
-            secret_key,
-            region,
-            global_io_concurrency,
-        )
-        .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string()))?;
-        let runtime_feedback = runtime_feedback_config_from_python(&cost_model)?;
-        let model = hierarchical_model_from_python(&cost_model, wave_request_overhead_ns)?;
-        let shared_runtime_feedback = std::sync::Arc::new(std::sync::Mutex::new(
-            runtime_feedback::RuntimeCostFeedback::new(&model, runtime_feedback)
-                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
-        ));
-        let per_worker_resident_encoded_bytes = resident_encoded_bytes / workers;
-        let global_resident_cursor_capacity =
-            resident_cursor_capacity.unwrap_or(global_decode_concurrency);
-        let cursor_capacity_per_worker = global_resident_cursor_capacity / workers;
-        let workers_with_extra_cursor = global_resident_cursor_capacity % workers;
-        let decode_budget = decoder::DecodeBudget::new(global_decode_concurrency);
-        let mut executors = Vec::with_capacity(workers);
-        let slots_per_worker = global_decode_concurrency / workers;
-        let workers_with_extra_slot = global_decode_concurrency % workers;
-        for worker in 0..workers {
-            let backend = backend::S3Backend::from_shared_client(
-                client.clone(),
-                object_key.clone(),
-                payload_start,
-            )
-            .map_err(|error| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
-            })?;
-            let executor = hierarchical_scheduler::HierarchicalBatchExecutor::new(
-                catalog.clone(),
-                Box::new(backend),
-                codec_config.clone(),
-                model.clone(),
-                max_merge_gap_bytes,
-                max_range_bytes,
-                decoder_threads,
-                slots_per_worker + usize::from(worker < workers_with_extra_slot),
-                false,
-                hierarchical_scheduler::ResidentStateBudget {
-                    encoded_bytes: per_worker_resident_encoded_bytes,
-                    read_ahead_bytes: resident_read_ahead_bytes,
-                    live_cursors: cursor_capacity_per_worker
-                        + usize::from(worker < workers_with_extra_cursor),
-                },
-            )
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?
-            .with_shared_runtime_feedback(std::sync::Arc::clone(&shared_runtime_feedback))
-            .with_shared_decode_budget(
-                std::sync::Arc::clone(&decode_budget),
-                cursor_decoder_threads,
-            )
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
-            executors.push(HierarchicalExecutorWorker::spawn(executor));
-        }
         Ok(Self {
-            workers: executors,
-            routes: std::sync::Mutex::new(HierarchicalVideoRoutes::default()),
-            global_decode_concurrency,
-            max_cursor_decoder_threads: cursor_decoder_threads,
+            inner: session::VClaspSession::open_s3(
+                local_chunk_path,
+                session::S3Config {
+                    endpoint,
+                    bucket,
+                    object_key,
+                    access_key_id: access_key,
+                    secret_access_key: secret_key,
+                    region,
+                    max_concurrency: global_io_concurrency,
+                },
+                config,
+            )
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
         })
     }
 
     #[cfg(feature = "experiment-controls")]
-    fn execute_on_worker(
+    fn execute_forced(
         &self,
         py: Python<'_>,
-        worker: usize,
         targets: Vec<(u64, String, i32)>,
+        action: String,
+        fixed_gap_bytes: u64,
     ) -> PyResult<(
         Vec<(u64, Py<PyBytes>, u32, u32)>,
         std::collections::HashMap<String, u64>,
         String,
         f64,
     )> {
-        let slot = self.workers.get(worker).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyIndexError, _>(format!(
-                "worker {worker} outside executor pool of size {}",
-                self.workers.len()
-            ))
-        })?;
+        let action = hierarchical_action_from_python(&action, fixed_gap_bytes)?;
         let logical = targets
             .into_iter()
             .map(
@@ -5930,15 +6251,8 @@ impl S3VClaspExecutorPool {
                 },
             )
             .collect::<Vec<_>>();
-        let receiver = slot
-            .submit(logical)
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
         let (outputs, stats) = py
-            .allow_threads(move || {
-                receiver.recv().map_err(|_| {
-                    "hierarchical executor worker dropped execution response".to_string()
-                })?
-            })
+            .allow_threads(|| self.inner.execute_forced(logical, action))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
         let frames = outputs
             .into_iter()
@@ -5969,189 +6283,115 @@ impl S3VClaspExecutorPool {
         String,
         f64,
     )> {
-        if targets.is_empty() {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "hierarchical batch is empty",
-            ));
-        }
-        let mut routes = self.routes.lock().map_err(|_| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "hierarchical video-route lock is poisoned",
-            )
-        })?;
-        let mut partitions = std::collections::HashMap::<
-            usize,
-            Vec<(usize, hierarchical_scheduler::LogicalTarget)>,
-        >::new();
-        for (position, (sample_id, video_id, frame_idx)) in targets.into_iter().enumerate() {
-            let worker = if let Some(worker) = routes.assignments.get(&video_id) {
-                *worker
-            } else {
-                let worker = routes.next_worker % self.workers.len();
-                routes.next_worker += 1;
-                routes.assignments.insert(video_id.clone(), worker);
-                worker
-            };
-            partitions.entry(worker).or_default().push((
-                position,
-                hierarchical_scheduler::LogicalTarget {
+        self.execute_batch_internal(py, targets)
+    }
+
+    /// Admit work without waiting for completion. The returned handle may be
+    /// resolved later, after additional requests have entered the same bounded
+    /// planning window.
+    fn submit(&self, py: Python<'_>, targets: Vec<(u64, String, i32)>) -> PyResult<PyPendingBatch> {
+        let logical = targets
+            .into_iter()
+            .map(
+                |(sample_id, video_id, frame_idx)| hierarchical_scheduler::LogicalTarget {
                     sample_id,
                     video_id,
                     frame_idx,
                 },
-            ));
-        }
-        drop(routes);
-        let cursor_decoder_threads_hint = cursor_threads_for_parallel_partitions(
-            self.global_decode_concurrency,
-            self.max_cursor_decoder_threads,
-            partitions.len(),
-        );
-        let output_count = partitions.values().map(Vec::len).sum::<usize>();
-        let started = std::time::Instant::now();
-        let (ordered, stats, mode) = py
-            .allow_threads(|| {
-                let mut pending = Vec::with_capacity(partitions.len());
-                for (worker, positioned) in partitions {
-                    let positions = positioned
-                        .iter()
-                        .map(|(position, _)| *position)
-                        .collect::<Vec<_>>();
-                    let logical = positioned
-                        .into_iter()
-                        .map(|(_, target)| target)
-                        .collect::<Vec<_>>();
-                    let receiver = self.workers[worker]
-                        .submit_with_hint(logical, Some(cursor_decoder_threads_hint))?;
-                    pending.push((positions, receiver));
-                }
-
-                let mut ordered = std::iter::repeat_with(|| None)
-                    .take(output_count)
-                    .collect::<Vec<Option<hierarchical_scheduler::HierarchicalOutput>>>();
-                let mut parts = Vec::with_capacity(pending.len());
-                for (positions, receiver) in pending {
-                    let (outputs, stats) = receiver.recv().map_err(|_| {
-                        "hierarchical executor worker dropped execution response".to_string()
-                    })??;
-                    if positions.len() != outputs.len() {
-                        return Err("hierarchical partition changed output cardinality".to_string());
-                    }
-                    for (position, output) in positions.into_iter().zip(outputs) {
-                        ordered[position] = Some(output);
-                    }
-                    parts.push(stats);
-                }
-
-                let mut stats = parts
-                    .pop()
-                    .ok_or_else(|| "hierarchical partition produced no stats".to_string())?;
-                let partition_count = parts.len() + 1;
-                for part in parts {
-                    stats.logical_targets += part.logical_targets;
-                    stats.unique_targets += part.unique_targets;
-                    stats.physical_ranges += part.physical_ranges;
-                    stats.client_requests += part.client_requests;
-                    stats.useful_bytes += part.useful_bytes;
-                    stats.fetched_bytes += part.fetched_bytes;
-                    stats.submitted_access_units += part.submitted_access_units;
-                    stats.decoded_access_units += part.decoded_access_units;
-                    stats.planner_candidate_count += part.planner_candidate_count;
-                    stats.range_le_4k += part.range_le_4k;
-                    stats.range_4k_to_16k += part.range_4k_to_16k;
-                    stats.range_16k_to_64k += part.range_16k_to_64k;
-                    stats.range_64k_to_256k += part.range_64k_to_256k;
-                    stats.range_gt_256k += part.range_gt_256k;
-                    stats.decode_groups += part.decode_groups;
-                    stats.encoded_cache_hits += part.encoded_cache_hits;
-                    stats.encoded_cache_misses += part.encoded_cache_misses;
-                    stats.resident_cursor_hits += part.resident_cursor_hits;
-                    stats.resident_cursor_misses += part.resident_cursor_misses;
-                    stats.decoder_state_resets += part.decoder_state_resets;
-                    stats.resident_cursor_candidates += part.resident_cursor_candidates;
-                    stats.resident_cursor_selected += part.resident_cursor_selected;
-                    stats.cursor_policy_ns += part.cursor_policy_ns;
-                    stats.resident_cursor_pinned_entries += part.resident_cursor_pinned_entries;
-                    stats.resident_cursor_probationary_entries +=
-                        part.resident_cursor_probationary_entries;
-                    stats.plan_ns += part.plan_ns;
-                    stats.fetch_ns += part.fetch_ns;
-                    stats.assemble_ns += part.assemble_ns;
-                    stats.decode_ns += part.decode_ns;
-                    if stats.predicted_total_ns >= 0.0 {
-                        if part.predicted_total_ns < 0.0 {
-                            stats.predicted_total_ns = -1.0;
-                        } else {
-                            stats.predicted_total_ns += part.predicted_total_ns;
-                        }
-                    }
-                }
-
-                let mut encoded_bytes = 0u64;
-                let mut cursor_bytes = 0u64;
-                let mut budget_bytes = 0u64;
-                let mut cursor_entries = 0usize;
-                let mut cursor_capacity = 0usize;
-                let mut pinned_entries = 0usize;
-                let mut probationary_entries = 0usize;
-                for worker in &self.workers {
-                    let (encoded, cursor, budget, entries, capacity, pinned, probationary) =
-                        worker.metrics()?;
-                    encoded_bytes += encoded;
-                    cursor_bytes += cursor;
-                    budget_bytes += budget;
-                    cursor_entries += entries;
-                    cursor_capacity += capacity;
-                    pinned_entries += pinned;
-                    probationary_entries += probationary;
-                }
-                stats.encoded_cache_resident_bytes = encoded_bytes;
-                stats.resident_read_ahead_bytes = cursor_bytes;
-                stats.resident_encoded_budget_bytes = budget_bytes;
-                stats.resident_cursor_entries = cursor_entries;
-                stats.resident_cursor_capacity = cursor_capacity;
-                stats.resident_cursor_pinned_entries = pinned_entries;
-                stats.resident_cursor_probationary_entries = probationary_entries;
-                stats.total_ns = started.elapsed().as_nanos() as u64;
-                let mode = if partition_count > 1 {
-                    "resident_pool_partitioned"
-                } else {
-                    stats.mode
-                };
-                let ordered = ordered
-                    .into_iter()
-                    .map(|output| {
-                        output.ok_or_else(|| {
-                            "hierarchical partition lost an output position".to_string()
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, String>((ordered, stats, mode))
-            })
+            )
+            .collect::<Vec<_>>();
+        let pending = py
+            .allow_threads(|| self.inner.submit(logical))
             .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        let frames = ordered
-            .into_iter()
-            .map(|output| {
-                (
-                    output.sample_id,
-                    PyBytes::new_bound(py, &output.frame.data).unbind(),
-                    output.frame.width,
-                    output.frame.height,
-                )
-            })
-            .collect();
-        let predicted = stats.predicted_total_ns;
-        Ok((
-            frames,
-            hierarchical_stats_dict(&stats),
-            mode.to_string(),
-            predicted,
-        ))
+        Ok(PyPendingBatch {
+            inner: Mutex::new(Some(pending)),
+        })
     }
 
-    /// Execute one already-sampled request window. Video-to-worker routing is
-    /// stable across the entire window so each worker can derive dependency
-    /// liveness and retain compatible decoder state without a workload label.
+    /// Create the default bounded producer/consumer interface for training.
+    #[pyo3(signature = (max_outstanding_batches=8, max_outstanding_targets=None))]
+    fn pipeline(
+        &self,
+        max_outstanding_batches: usize,
+        max_outstanding_targets: Option<usize>,
+    ) -> PyResult<PyVClaspPipeline> {
+        let inner = session::VClaspPipeline::new(
+            self.inner.clone(),
+            session::PipelineConfig {
+                max_outstanding_batches,
+                max_outstanding_targets,
+            },
+        )
+        .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        Ok(PyVClaspPipeline { inner })
+    }
+
+    /// Admit an already-sampled bounded window without waiting. Logical batch
+    /// boundaries and order are restored after joint physical execution.
+    fn submit_window(
+        &self,
+        py: Python<'_>,
+        batches: Vec<Vec<(u64, String, i32)>>,
+    ) -> PyResult<PyPendingWindow> {
+        if batches.is_empty() || batches.iter().any(Vec::is_empty) {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "VClasp request window requires non-empty batches",
+            ));
+        }
+        let logical = batches
+            .into_iter()
+            .map(|batch| {
+                batch
+                    .into_iter()
+                    .map(
+                        |(sample_id, video_id, frame_idx)| hierarchical_scheduler::LogicalTarget {
+                            sample_id,
+                            video_id,
+                            frame_idx,
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let pending = py
+            .allow_threads(|| self.inner.submit_window(logical))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        Ok(PyPendingWindow {
+            inner: Mutex::new(Some(pending)),
+        })
+    }
+
+    fn metrics_snapshot(&self) -> std::collections::HashMap<String, u64> {
+        let metrics = self.inner.metrics_snapshot();
+        [
+            ("completed_windows", metrics.completed_windows),
+            ("logical_targets", metrics.logical_targets),
+            ("physical_ranges", metrics.physical_ranges),
+            ("client_requests", metrics.client_requests),
+            ("useful_bytes", metrics.useful_bytes),
+            ("fetched_bytes", metrics.fetched_bytes),
+            ("submitted_access_units", metrics.submitted_access_units),
+            ("decoded_access_units", metrics.decoded_access_units),
+            ("decode_groups", metrics.decode_groups),
+            ("resident_cursor_hits", metrics.resident_cursor_hits),
+            ("resident_cursor_misses", metrics.resident_cursor_misses),
+            ("decoder_state_resets", metrics.decoder_state_resets),
+            ("plan_ns", metrics.plan_ns),
+            ("fetch_ns", metrics.fetch_ns),
+            ("assemble_ns", metrics.assemble_ns),
+            ("decode_ns", metrics.decode_ns),
+            ("range_ttfb_ns_sum", metrics.range_ttfb_ns_sum),
+            ("range_service_ns_sum", metrics.range_service_ns_sum),
+            ("range_timing_samples", metrics.range_timing_samples),
+            ("range_max_in_flight", metrics.range_max_in_flight),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
+    }
+
+    /// Execute one already-sampled request window through the same global
+    /// planner and resident-state owner used by concurrent submissions.
     fn execute_window(
         &self,
         py: Python<'_>,
@@ -6164,169 +6404,7 @@ impl S3VClaspExecutorPool {
         String,
         f64,
     )> {
-        if batches.is_empty() || batches.iter().any(Vec::is_empty) {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "hierarchical request window requires non-empty batches",
-            ));
-        }
-        let batch_sizes = batches.iter().map(Vec::len).collect::<Vec<_>>();
-        let mut routes = self.routes.lock().map_err(|_| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "hierarchical video-route lock is poisoned",
-            )
-        })?;
-        let mut partitions = std::collections::HashMap::<usize, HierarchicalWorkerWindow>::new();
-        for (global_batch, batch) in batches.into_iter().enumerate() {
-            let mut local = std::collections::HashMap::<
-                usize,
-                Vec<(usize, hierarchical_scheduler::LogicalTarget)>,
-            >::new();
-            for (position, (sample_id, video_id, frame_idx)) in batch.into_iter().enumerate() {
-                let worker = if let Some(worker) = routes.assignments.get(&video_id) {
-                    *worker
-                } else {
-                    let worker = routes.next_worker % self.workers.len();
-                    routes.next_worker += 1;
-                    routes.assignments.insert(video_id.clone(), worker);
-                    worker
-                };
-                local.entry(worker).or_default().push((
-                    position,
-                    hierarchical_scheduler::LogicalTarget {
-                        sample_id,
-                        video_id,
-                        frame_idx,
-                    },
-                ));
-            }
-            for (worker, positioned) in local {
-                let partition =
-                    partitions
-                        .entry(worker)
-                        .or_insert_with(|| HierarchicalWorkerWindow {
-                            batches: Vec::new(),
-                            global_batch_indices: Vec::new(),
-                            positions: Vec::new(),
-                        });
-                partition.global_batch_indices.push(global_batch);
-                partition
-                    .positions
-                    .push(positioned.iter().map(|(position, _)| *position).collect());
-                partition
-                    .batches
-                    .push(positioned.into_iter().map(|(_, target)| target).collect());
-            }
-        }
-        drop(routes);
-
-        let started = std::time::Instant::now();
-        let result = py
-            .allow_threads(|| {
-                let mut pending = Vec::with_capacity(partitions.len());
-                for (worker, partition) in partitions {
-                    let receiver = self.workers[worker].submit_window(partition.batches)?;
-                    pending.push((
-                        partition.global_batch_indices,
-                        partition.positions,
-                        receiver,
-                    ));
-                }
-                let mut ordered = batch_sizes
-                    .iter()
-                    .map(|size| {
-                        std::iter::repeat_with(|| None)
-                            .take(*size)
-                            .collect::<Vec<Option<hierarchical_scheduler::HierarchicalOutput>>>()
-                    })
-                    .collect::<Vec<_>>();
-                let mut ready = vec![0u64; batch_sizes.len()];
-                let mut delivered = vec![0u64; batch_sizes.len()];
-                let mut total_stats = None;
-                for (global_batches, positions, receiver) in pending {
-                    let window = receiver.recv().map_err(|_| {
-                        "hierarchical executor worker dropped window response".to_string()
-                    })??;
-                    if window.batches.len() != global_batches.len()
-                        || window.batch_ready_ns.len() != global_batches.len()
-                        || window.ordered_delivery_ns.len() != global_batches.len()
-                    {
-                        return Err("hierarchical worker changed window cardinality".to_string());
-                    }
-                    for (
-                        ((global_batch, local_positions), outputs),
-                        (local_ready, local_delivered),
-                    ) in global_batches
-                        .into_iter()
-                        .zip(positions)
-                        .zip(window.batches)
-                        .zip(
-                            window
-                                .batch_ready_ns
-                                .into_iter()
-                                .zip(window.ordered_delivery_ns),
-                        )
-                    {
-                        if local_positions.len() != outputs.len() {
-                            return Err("hierarchical worker changed batch cardinality".to_string());
-                        }
-                        for (position, output) in local_positions.into_iter().zip(outputs) {
-                            ordered[global_batch][position] = Some(output);
-                        }
-                        ready[global_batch] = ready[global_batch].max(local_ready);
-                        delivered[global_batch] = delivered[global_batch].max(local_delivered);
-                    }
-                    if let Some(total) = total_stats.as_mut() {
-                        hierarchical_scheduler::accumulate_batch_stats(total, &window.stats);
-                    } else {
-                        total_stats = Some(window.stats);
-                    }
-                }
-                let mut stats = total_stats
-                    .ok_or_else(|| "hierarchical window produced no statistics".to_string())?;
-                self.refresh_resident_metrics(&mut stats)?;
-                stats.total_ns = started.elapsed().as_nanos() as u64;
-                stats.mode = "window_pool_partitioned";
-                let ordered = ordered
-                    .into_iter()
-                    .map(|batch| {
-                        batch
-                            .into_iter()
-                            .map(|output| {
-                                output.ok_or_else(|| {
-                                    "hierarchical window lost an output position".to_string()
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, String>((ordered, ready, delivered, stats))
-            })
-            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
-        let (ordered, ready, delivered, stats) = result;
-        let frames = ordered
-            .into_iter()
-            .map(|batch| {
-                batch
-                    .into_iter()
-                    .map(|output| {
-                        (
-                            output.sample_id,
-                            PyBytes::new_bound(py, &output.frame.data).unbind(),
-                            output.frame.width,
-                            output.frame.height,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        Ok((
-            frames,
-            ready,
-            delivered,
-            hierarchical_stats_dict(&stats),
-            stats.mode.to_string(),
-            stats.predicted_total_ns,
-        ))
+        self.execute_window_internal(py, batches)
     }
 }
 
@@ -6335,20 +6413,31 @@ impl S3VClaspExecutorPool {
 fn vclasp(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add_class::<VClaspChunk>()?;
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     m.add_class::<H264Decoder>()?;
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     m.add_class::<LocalVClaspExecutor>()?;
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     m.add_class::<S3VClaspExecutor>()?;
-    #[cfg(feature = "ffmpeg")]
+    #[cfg(all(feature = "ffmpeg", feature = "experiment-controls"))]
     m.add_class::<AIStoreVClaspExecutor>()?;
     #[cfg(feature = "ffmpeg")]
-    m.add_class::<S3VClaspExecutorPool>()?;
+    m.add_class::<PyVClaspSession>()?;
+    #[cfg(feature = "ffmpeg")]
+    m.add_class::<PyPendingBatch>()?;
+    #[cfg(feature = "ffmpeg")]
+    m.add_class::<PyPendingWindow>()?;
+    #[cfg(feature = "ffmpeg")]
+    m.add_class::<PyVClaspPipeline>()?;
+    #[cfg(feature = "experiment-controls")]
     m.add_class::<ByteCache>()?;
+    #[cfg(feature = "experiment-controls")]
     m.add_class::<S3RangeReader>()?;
+    #[cfg(feature = "experiment-controls")]
     m.add_class::<S3ObjectStoreReader>()?;
+    #[cfg(feature = "experiment-controls")]
     m.add_class::<LocalRangeReader>()?;
+    #[cfg(feature = "experiment-controls")]
     m.add_class::<AIStoreGetBatchReader>()?;
     #[cfg(feature = "ffmpeg")]
     m.add_class::<VClaspBuildStats>()?;

@@ -6,6 +6,8 @@ const IO_BYTE_SCALE: f64 = 64.0 * 1024.0;
 const TAIL_HISTORY: usize = 128;
 const TAIL_QUANTILE: f64 = 0.95;
 const COLD_START_RISK_MULTIPLIER: f64 = 16.0;
+const FALLBACK_BAD_OBSERVATIONS: usize = 8;
+const FALLBACK_RECOVERY_OBSERVATIONS: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeFeedbackConfig {
@@ -78,6 +80,7 @@ pub struct RuntimeFeedbackSnapshot {
     pub decode_observations: usize,
     pub rejected_observations: usize,
     pub active: bool,
+    pub fixed16_fallback: bool,
     pub io_absolute_percentage_error_ppm: u64,
     pub decode_absolute_percentage_error_ppm: u64,
     pub io_tail_multiplier_ppm: u64,
@@ -86,6 +89,7 @@ pub struct RuntimeFeedbackSnapshot {
 
 #[derive(Debug, Clone)]
 struct RobustOnlineRegression {
+    initial: Vec<f64>,
     theta: Vec<f64>,
     lower: Vec<f64>,
     upper: Vec<f64>,
@@ -94,6 +98,7 @@ struct RobustOnlineRegression {
     absolute_percentage_error: f64,
     last_absolute_percentage_error: f64,
     accurate_streak: usize,
+    inaccurate_streak: usize,
     latency_ratios: VecDeque<f64>,
 }
 
@@ -102,6 +107,7 @@ impl RobustOnlineRegression {
         debug_assert_eq!(initial.len(), lower.len());
         debug_assert_eq!(initial.len(), upper.len());
         Self {
+            initial: initial.clone(),
             theta: initial,
             lower,
             upper,
@@ -110,6 +116,7 @@ impl RobustOnlineRegression {
             absolute_percentage_error: 0.0,
             last_absolute_percentage_error: f64::INFINITY,
             accurate_streak: 0,
+            inaccurate_streak: 0,
             latency_ratios: VecDeque::with_capacity(TAIL_HISTORY),
         }
     }
@@ -174,8 +181,10 @@ impl RobustOnlineRegression {
         self.last_absolute_percentage_error = absolute_percentage_error;
         if absolute_percentage_error <= config.activation_ape_threshold {
             self.accurate_streak += 1;
+            self.inaccurate_streak = 0;
         } else {
             self.accurate_streak = 0;
+            self.inaccurate_streak += 1;
         }
         self.absolute_percentage_error = if self.observations == 1 {
             absolute_percentage_error
@@ -201,6 +210,17 @@ impl RobustOnlineRegression {
     fn clear_tail_history(&mut self) {
         self.latency_ratios.clear();
     }
+
+    fn reset_to_bootstrap(&mut self) {
+        self.theta.clone_from(&self.initial);
+        self.residual_scale = 0.0;
+        self.observations = 0;
+        self.absolute_percentage_error = 0.0;
+        self.last_absolute_percentage_error = f64::INFINITY;
+        self.accurate_streak = 0;
+        self.inaccurate_streak = 0;
+        self.latency_ratios.clear();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +231,7 @@ pub struct RuntimeCostFeedback {
     decode: RobustOnlineRegression,
     rejected_observations: usize,
     activated: bool,
+    fixed16_fallback: bool,
 }
 
 impl RuntimeCostFeedback {
@@ -261,6 +282,7 @@ impl RuntimeCostFeedback {
             decode: RobustOnlineRegression::new(decode_initial, decode_lower, decode_upper),
             rejected_observations: 0,
             activated: false,
+            fixed16_fallback: false,
         })
     }
 
@@ -302,6 +324,20 @@ impl RuntimeCostFeedback {
             // object-store tail behavior.
             self.io.clear_tail_history();
             self.decode.clear_tail_history();
+        }
+        if self.activated {
+            if !self.fixed16_fallback && self.io.inaccurate_streak >= FALLBACK_BAD_OBSERVATIONS {
+                self.fixed16_fallback = true;
+                self.io.reset_to_bootstrap();
+                self.decode.reset_to_bootstrap();
+            } else if self.fixed16_fallback
+                && self.io.accurate_streak >= FALLBACK_RECOVERY_OBSERVATIONS
+                && self.decode.accurate_streak >= FALLBACK_RECOVERY_OBSERVATIONS
+            {
+                self.fixed16_fallback = false;
+                self.io.clear_tail_history();
+                self.decode.clear_tail_history();
+            }
         }
     }
 
@@ -363,6 +399,7 @@ impl RuntimeCostFeedback {
             decode_observations: self.decode.observations,
             rejected_observations: self.rejected_observations,
             active: self.active(),
+            fixed16_fallback: self.fixed16_fallback(),
             io_absolute_percentage_error_ppm: ratio_to_ppm(self.io.last_absolute_percentage_error),
             decode_absolute_percentage_error_ppm: ratio_to_ppm(
                 self.decode.last_absolute_percentage_error,
@@ -393,7 +430,11 @@ impl RuntimeCostFeedback {
     }
 
     fn active(&self) -> bool {
-        self.config.enabled && self.activated
+        self.config.enabled && self.activated && !self.fixed16_fallback
+    }
+
+    pub fn fixed16_fallback(&self) -> bool {
+        self.config.enabled && self.activated && self.fixed16_fallback
     }
 }
 
@@ -509,6 +550,38 @@ mod tests {
         assert!(feedback.snapshot().active);
         feedback.observe(4, 64 * 1024, 30_000_000_000, 8, 30_000_000_000);
         assert!(feedback.snapshot().active);
+        assert!(!feedback.snapshot().fixed16_fallback);
+    }
+
+    #[test]
+    fn sustained_io_error_enters_and_recovers_from_fixed16_fallback() {
+        let config = RuntimeFeedbackConfig {
+            min_observations: 8,
+            activation_ape_threshold: 0.5,
+            activation_stable_observations: 1,
+            ..RuntimeFeedbackConfig::default()
+        };
+        let mut feedback = RuntimeCostFeedback::new(&bootstrap(), config).unwrap();
+        for _ in 0..16 {
+            feedback.observe(4, 64 * 1024, 1_200_000, 8, 500_000);
+        }
+        assert!(feedback.snapshot().active);
+
+        for _ in 0..FALLBACK_BAD_OBSERVATIONS {
+            feedback.observe(4, 64 * 1024, 30_000_000, 8, 500_000);
+        }
+        assert!(!feedback.snapshot().active);
+        assert!(feedback.snapshot().fixed16_fallback);
+        assert_eq!(
+            feedback.apply_to(&bootstrap()).request_latency_ns,
+            bootstrap().request_latency_ns
+        );
+
+        for _ in 0..FALLBACK_RECOVERY_OBSERVATIONS {
+            feedback.observe(4, 64 * 1024, 1_200_000, 8, 500_000);
+        }
+        assert!(feedback.snapshot().active);
+        assert!(!feedback.snapshot().fixed16_fallback);
     }
 
     #[test]

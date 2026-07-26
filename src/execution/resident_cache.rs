@@ -5,6 +5,9 @@ use std::hash::Hash;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResidentCandidate {
     pub visible_consumers: usize,
+    /// Later targets in the registered dependency group that could be served
+    /// by monotonic decoder progress, even when they are not in this window.
+    pub potential_consumers: usize,
     pub next_use_batch: Option<usize>,
 }
 
@@ -64,9 +67,9 @@ struct ResidencyPriority {
     next_use_batch: Option<usize>,
 }
 
-/// Admit states with proven reuse in the visible window. Under pressure,
-/// evict the least-recent probationary state first; pinned states are ordered
-/// by farthest next use only when the visible working set exceeds capacity.
+/// Admit states with visible reuse or registered forward consumers. Only
+/// visible reuse pins a state; unknown future reuse remains probationary and
+/// is evicted before pinned state.
 pub struct DependencyLivenessLru<K> {
     order: VecDeque<K>,
     resident: HashSet<K>,
@@ -98,7 +101,8 @@ where
     K: Clone + Eq + Hash + Send,
 {
     fn admit(&self, candidate: ResidentCandidate) -> bool {
-        candidate.visible_consumers > 0
+        (candidate.visible_consumers > 0 && candidate.next_use_batch.is_some())
+            || candidate.potential_consumers > 0
     }
 
     fn on_insert(&mut self, key: K) {
@@ -185,14 +189,22 @@ mod tests {
         let policy = DependencyLivenessLru::<u64>::new();
         assert!(!policy.admit(ResidentCandidate {
             visible_consumers: 0,
+            potential_consumers: 0,
+            next_use_batch: None,
+        }));
+        assert!(policy.admit(ResidentCandidate {
+            visible_consumers: 0,
+            potential_consumers: 1,
             next_use_batch: None,
         }));
         assert!(!policy.admit(ResidentCandidate {
-            visible_consumers: 0,
+            visible_consumers: 1,
+            potential_consumers: 0,
             next_use_batch: None,
         }));
         assert!(policy.admit(ResidentCandidate {
             visible_consumers: 1,
+            potential_consumers: 0,
             next_use_batch: Some(1),
         }));
     }

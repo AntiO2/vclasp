@@ -16,7 +16,7 @@ use parquet::arrow::ArrowWriter;
 
 use crate::chunk::{self, ChunkWriteConfig};
 use crate::hierarchical_layout::{
-    AccessUnitRecord, GopRegion, HierarchicalLayoutIndex, TargetClosure,
+    AccessUnitRecord, GopRegion, HierarchicalLayoutIndex, RegionDecodeMode, TargetClosure,
 };
 
 #[derive(Debug, Clone)]
@@ -72,6 +72,8 @@ pub struct HierarchicalRecordMeta {
     pub video_id: String,
     pub frame_idx: i32,
     pub gop_id: u64,
+    pub pts: i64,
+    pub dts: i64,
     pub offset: u64,
     pub length: u64,
     pub decode_ordinal: usize,
@@ -140,6 +142,8 @@ impl HierarchicalCatalog {
         let offsets = column!("record_offset", Int64Array);
         let lengths = column!("record_length", Int64Array);
         let packet_indices = column!("packet_index", Int32Array);
+        let presentation_timestamps = column!("pts", Int64Array);
+        let decode_timestamps = column!("dts", Int64Array);
         let closure_ids = column!("closure_record_ids", BinaryArray);
         let output_ordinals = column!("target_output_ordinal", Int32Array);
         let nal_length_sizes = column!("nal_length_size", Int32Array);
@@ -185,6 +189,8 @@ impl HierarchicalCatalog {
                     .value(row)
                     .try_into()
                     .map_err(|_| format!("negative GOP id at row {row}"))?,
+                pts: presentation_timestamps.value(row),
+                dts: decode_timestamps.value(row),
                 offset: parse_non_negative(offsets.value(row), "record_offset")?,
                 length: parse_non_negative(lengths.value(row), "record_length")?,
                 decode_ordinal: packet_indices
@@ -242,6 +248,14 @@ impl HierarchicalCatalog {
         }
         for record_ids in gop_records.values_mut() {
             record_ids.sort_unstable_by_key(|record_id| records[record_id].decode_ordinal);
+            if record_ids
+                .windows(2)
+                .any(|pair| records[&pair[0]].dts >= records[&pair[1]].dts)
+            {
+                return Err(
+                    "hierarchical GOP decode timestamps are not strictly increasing".into(),
+                );
+            }
         }
         Ok(Self {
             records,
@@ -333,7 +347,12 @@ impl HierarchicalCatalog {
                 record_ids: group.iter().map(|record| record.record_id).collect(),
             });
         }
-        HierarchicalLayoutIndex::new(records, closures, regions)
+        HierarchicalLayoutIndex::new_with_region_decode_mode(
+            records,
+            closures,
+            regions,
+            RegionDecodeMode::ClosureOnly,
+        )
     }
 }
 

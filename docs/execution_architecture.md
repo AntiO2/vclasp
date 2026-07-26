@@ -1,124 +1,226 @@
 # VClasp Execution Architecture
 
-## One Request Interface
+## Contract
 
-The production reader accepts an already sampled request window:
-
-```text
-read_window([
-  [(sample_id, video_id, frame_idx), ...],
-  ...
-])
-```
-
-The caller does not label the window as Uniform, Zipf, Clip, Same-video, or
-Sequential. Those names belong to benchmark trace generation only. The reader
-derives locality and dependency geometry from the request IDs and embedded
-chunk index.
+VClasp accepts logical targets, never workload labels:
 
 ```text
-logical request window
-  -> target lookup
-  -> sufficient closure union
-  -> request/layout geometry
-  -> production action selection
-  -> Range GET
-  -> filter transfer-only gaps
-  -> codec-order decode
-  -> restore duplicates and request order
+(sample_id, video_id, frame_index)
 ```
 
-The production implementation is
-`hierarchical_scheduler::HierarchicalBatchExecutor`. Its canonical operation is
-`execute_window`; `execute` is exactly the one-batch (`L=1`)
-convenience form. Local, S3, AIStore, and the partitioned S3 executor pool expose
-the same window semantics. In particular, monotonic requests may reuse a
-compatible bounded decoder cursor, but the caller never selects a separate
-sequential reader.
+`execute(batch)` and `execute_window(batches)` are blocking convenience APIs.
+`submit(batch)` and `submit_window(batches)` admit the same requests and return
+one-shot handles. A producer can therefore expose bounded future work before it
+waits for ordered results; no thread-per-request adapter is required.
+Concurrent application callers use one `VClaspSession`; callers do not provide
+an identity, route, worker, or workload label. `max_callers` bounds one
+admission cohort, `max_pending_calls` provides process-wide backpressure, and
+`max_inflight_windows` bounds overlapping immutable execution windows.
+`execute` and `execute_window` enter the same admission stream. Concurrent
+calls of either shape are flattened into one visible logical window before
+closure resolution, then restored to their original API and batch boundaries.
 
-## Production Actions
+The default training adapter is a bounded ordered pipeline over this same
+session:
 
-`HierarchicalBatchExecutor` may select a sparse closure plan, contiguous region
-plan, or resident decoder cursor from observable request and physical-layout
-facts. Cursor admission has two independent gates: dependency liveness proves
-that reuse exists, then the same current request/byte/decode model compares the
-monotonic cursor suffix against ordinary adaptive execution over the visible
-requests. Reuse alone does not force cursor execution.
-The selection code must not receive a benchmark workload name.
+```text
+sampler/producer -> submit(batch) -> shared session -> ordered take() -> training
+                        ^                                  |
+                        +----------- backpressure ---------+
+```
 
-The model supplied by the application is a bootstrap. Successful fetch/decode
-measurements update a shared robust online estimator after an accuracy gate;
-the estimator has no backend or workload-name input. See
-[`runtime_cost_feedback.md`](runtime_cost_feedback.md).
+Production, I/O, decode, and model consumption overlap. The adapter does not
+introduce a second planner or a workload-specific route. It bounds submitted
+but unconsumed batches and targets, allows physical work to finish out of
+order, and serializes only the delivery boundary so `take()` matches submission
+order.
 
-Forced actions exist only inside the Rust mechanism-control boundary. The
-default Python extension cannot select them. Registered ablations use the same
-payload, index, transport, and decoder as the production reader.
+Uniform, Zipf, Same-video, Clip, and Sequential are benchmark trace names. They
+must not appear in production planning or execution code.
 
-## Bounded Resident State
+## Session Control Plane
 
-The production executor has two independent compressed-state layers:
+```text
+concurrent logical submissions
+          |
+          v
+bounded admission window
+          |
+          v
+bounded immutable execution windows
+          |
+          v
+target lookup and closure union
+          |
+          v
+deduplicate dependencies and resident state
+          |
+          v
+enumerate physical span candidates
+          |
+          v
+one cost decision per admitted request set
+          |
+          v
+immutable execution plan
+```
 
-1. The encoded-AU cache avoids repeated object reads. A hit still belongs to
-   the sufficient closure and may need to be submitted to a decoder.
-2. The live decoder-cursor cache retains an FFmpeg decoder and its DPB for a
-   particular `(video, representation, GOP/anchor group)`. A compatible
-   monotonic request submits only newly required AUs.
+The session coordinator owns:
 
-The catalog stores encoder/bitstream-grounded sufficient closures, not inferred
-direct edges. At runtime, VClasp derives remaining consumers from the closure
-union in the visible request window. A cursor is admitted only when this window
-proves reuse; states with a future consumer are pinned, while states whose last
-visible consumer completed become probationary. Capacity eviction uses LRU
-among probationary states and farthest-next-use only when every state is pinned.
-A leaf target does not itself justify a cursor. This policy uses neither a
-workload label nor a target-count threshold, and it does not claim that FFmpeg
-exposes individual DPB entries; reference marking remains a codec property.
+- admission and API-boundary restoration;
+- shared runtime cost feedback;
+- global I/O and weighted decode budgets;
+- session-wide physical accounting.
 
-The compressed-byte budget is shared by encoded AU bytes and cursor read-ahead,
-and the live cursor count is separately capped by the configured decoder-slot
-budget. These are different resources: encoded bytes are byte-accounted, while
-FFmpeg's private DPB allocation is not. Cache misses, backward requests,
-cost-ineffective suffixes, evicted state, and stream-key mismatches fall back to
-one global sufficient-closure plan. Formal memory studies must therefore report
-measured process RSS in addition to the logical encoded-byte and cursor-count
-limits.
+There is no per-caller planner, cache, or decoder pool. The session combines
+concurrently admitted requests before span selection.
+Logical batch boundaries constrain result restoration, not physical planning.
+Cross-request dependency deduplication, resident-state selection, and range
+coalescing therefore happen in one decision that accounts for bytes, requests,
+decoder work, and shared resource pressure.
 
-VClasp does not serialize FFmpeg decoder checkpoints. Public libavcodec state
-contains private pointer-rich H.264 structures and has no stable export/import
-API. An isolated FFmpeg 6.1.1 prototype demonstrates version-pinned in-memory
-context cloning through FFmpeg's private thread-context copy implementation;
-see `experiments/ffmpeg_checkpoint`. The clone is process-local, requires an
-already-open single-thread decoder, and is not part of the production executor.
-A portable checkpoint would instead require a stateless decoder whose client
-explicitly owns the DPB and all associated codec state.
+Several immutable windows may execute concurrently. They share the same object
+store client and connection semaphore, runtime-feedback estimator, weighted
+decode budget, and metrics owner. Each window is planned exactly once after
+admission. Before physical dispatch, the S3 range broker can deduplicate and
+coalesce immutable spans from concurrently executing windows. It never changes
+codec closures and never revisits a span after that span has been dispatched.
 
-## Historical Controls
+Execution lanes retain lane-local encoded AUs and live decoder cursors. The
+declared state budget is partitioned across lanes, and single-video streams use
+deterministic lane affinity so compatible DPB state reaches the same owner.
+Mixed-video cohorts remain eligible for joint cross-video span planning.
 
-The following implementations are retained to reproduce registered ablations:
+Range GET completion and decoding form a completion-driven pipeline both within
+and across concurrently executing windows. The broker publishes every logical
+range as soon as its containing physical span completes; it does not wait for
+the other ranges in that caller's request. Persistent decoder workers can
+therefore consume ready closures while later GETs remain in flight. One
+accounting owner retains each shared physical GET and byte count, so completion
+fan-out does not duplicate physical statistics.
 
-| Control | Rust implementation | Paper role |
-| --- | --- | --- |
-| Prefix | `controls::closed_record` | Scanner-style/stream control |
-| Pair | `controls::closed_record` | materialization control |
-| Normalized | `controls::normalized` | historical representation control |
-| Packed GOP8 | `fragment_scheduler` | physical-layout control |
+The admission quiet window is a session resource parameter. A single-caller
+session does not wait for speculative peers. Multi-caller sessions collect
+requests until the configured quiet interval expires or the declared caller
+capacity is reached. `session_admission_ns` and
+`session_joint_submissions` make this latency visible.
 
-They are not aliases for VClasp and are not part of the default extension. The
-formal artifact builds explicit controls separately and rejects their method
-IDs unless mechanism controls are enabled.
+While all S3 slots are occupied, the range broker may collect intents for the
+next physical wave. Its wait bound starts from the calibrated request-wave
+estimate and follows an EWMA of observed Range GET service time. It is not a
+workload-specific timeout; it adapts to current backend execution state.
 
-Control variants are explicit as well. Prefix streaming requires
-`--prefix-control-streaming`; a trace named `sequential` cannot enable it.
+## Parallel Data Plane
 
-## Benchmark Boundary
+Global planning does not serialize physical execution:
 
-Every adapter implements `execute_window(batches)` and returns
-ordered batches plus a common metrics record. `execute(batch)` delegates to an
-`L=1` window. A trace generator may create different access patterns, but trace
-names cannot select a different VClasp implementation. The constant
-`VCLASP_PRIMARY_METHOD` in `scripts/method_registry.py` is the sole mapping from
-the paper method name to executable code.
+```text
+final spans
+  -> bounded parallel Range GETs
+  -> extract required AU bytes
+  -> discard transfer-only gaps
+  -> ready decode groups
+  -> weighted parallel decoder slots
+  -> ordered completion
+```
 
-New paper-facing runners must import this registry instead of spelling a
-VClasp method ID directly.
+The session first produces immutable per-window spans. The S3 range broker may
+then combine overlapping or nearby spans from concurrent callers under the
+declared gap and maximum-range bounds. This transport-level operation has no
+codec metadata and cannot add records to the decoder closure. The S3 transport
+executes the resulting physical spans through one shared connection pool and
+semaphore. A completed physical span is sliced back into its original logical
+ranges before completion is published.
+
+The executor may fetch gap bytes to reduce object-store request waves, but only
+registered closure AUs enter libavcodec. This is the `overfetch without
+overdecode` contract.
+
+`execute_window` records per-batch readiness separately from ordered delivery.
+Physical completion order may differ from logical order, while sample IDs,
+duplicates, batch boundaries, and output order remain exact.
+
+## Cost Decision
+
+For every visible request set, the planner derives candidates from registered
+AU offsets and closures. The model accounts for:
+
+- request waves and current global I/O pressure;
+- fetched and overfetched bytes;
+- submitted access units and decoder work;
+- bounded I/O/decode overlap;
+- resident encoded AUs and compatible live decoder state;
+- backend-calibrated request and bandwidth terms.
+
+Runtime observations update one shared robust estimator. Cross-candidate
+selection remains a calibrated heuristic; fixed span-count minimum-byte covers
+remain deterministic. Neither path receives a benchmark workload name.
+
+Admission wait, assembly/copy CPU, and ordered-readiness penalties are reported
+separately. They must not be hidden inside backend latency.
+
+## Resident Codec State
+
+VClasp has two compressed-state layers:
+
+1. The encoded-AU cache avoids repeated reads. A cached AU may still need to be
+   submitted to a decoder.
+2. The live cursor cache retains an FFmpeg decoder and its DPB for one
+   `(video, GOP/anchor group)` stream. A compatible monotonic request submits
+   only newly required AUs.
+
+The index retains packet PTS and DTS. A live cursor feeds through the first
+packet whose DTS exceeds the requested PTS, plus the configured frame-thread
+pipeline depth. This is the decoder output-release contract; VClasp does not
+guess a B-frame margin from GOP size or workload shape.
+
+Closure liveness over the visible window determines whether retaining a cursor
+has a future consumer. States with remaining consumers are pinned; exhausted
+states become probationary. Capacity eviction is policy-driven and globally
+bounded. Resident cursor capacity is a state-memory budget, independent of the
+weighted semaphore that limits concurrently active decoder threads. Leaf
+targets do not justify persistent decoder state.
+
+VClasp does not serialize FFmpeg decoder checkpoints. libavcodec does not expose
+a portable DPB export/import contract.
+
+## Backend Boundary
+
+All backends implement the same logical execution contract:
+
+- Local SSD uses mmap-backed byte ranges.
+- S3/MinIO uses explicit final Range GETs through `object_store`.
+- AIStore uses its native multi-range request transport.
+
+Backend adapters may change transport mechanics and physical request
+accounting. They may not perform dependency resolution, choose a workload path,
+or apply another VClasp span policy.
+S3 session construction performs a HEAD size check against the registered local
+chunk before accepting its catalog-to-object mapping. This startup integrity
+check is outside measured request execution. It rejects an obvious stale or
+truncated mapping; it is not a cryptographic object-identity check.
+
+## Experiment Controls
+
+Whole-GOP, Keyframe-Prefix, Pair, Normalized, and forced span policies are
+mechanism controls. They compile only with the
+`experiment-controls` feature and are absent from the default Python module.
+They are not alternative production readers.
+
+## Invariants
+
+- Every physical span comes from immutable planned spans admitted to the
+  session-global range broker.
+- Required closure records are deduplicated before I/O and decode.
+- Transfer-only gaps never enter the decoder.
+- I/O and decode concurrency use process-global budgets.
+- Encoded cache and live DPB state persist across requests in one session.
+- Duplicates, batch boundaries, and logical order are restored exactly.
+- Production behavior does not branch on workload names.
+- Calls may arrive during execution, but cohort formation, planning, and
+  resident-state mutation remain serialized within each execution lane.
+- Range completion, closure assembly, and decode overlap across concurrently
+  executing windows; completed batches need not wait for unrelated ranges.
+- Session-wide I/O/decode limits and feedback are shared across overlapping
+  windows. Queued cross-window spans may be deduplicated or coalesced, while
+  already-dispatched spans are never recalled.
