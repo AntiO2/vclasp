@@ -80,8 +80,21 @@ vclasp.build_vclasp_chunk(
     crf=23,
     preset="veryfast",
     workers=8,
+    dependency_policy="closed_gop",
 )
 ```
+
+`dependency_policy` registers the encoded stream's actual dependency graph in
+the embedded closure catalog:
+
+- `closed_gop` uses the standard I/P/B closed-GOP path;
+- `chained_p` uses a controlled no-B `I -> P1 -> P2 -> ...` stream;
+- `shared_anchor` stores one I anchor per GOP and makes each P target depend
+  directly on that anchor.
+
+All policies use the same reader and planner. `shared_anchor` is limited to
+groups of at most 17 frames by x264's short-term reference capacity. It is an
+optional storage/performance policy, not a workload-specific reader.
 
 ### 2. Read an already-sampled request window
 

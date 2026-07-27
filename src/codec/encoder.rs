@@ -1,3 +1,4 @@
+use std::ffi::CString;
 use std::ptr::NonNull;
 
 /// One IDR plus at most sixteen directly Anchor-referenced P frames. Stock
@@ -14,6 +15,16 @@ extern "C" {
         crf: i32,
         gop_size: i32,
         anchor_p: i32,
+    ) -> *mut VClaspX264EncoderOpaque;
+
+    fn vclasp_encoder_open_configured(
+        width: i32,
+        height: i32,
+        crf: i32,
+        gop_size: i32,
+        anchor_p: i32,
+        fps: i32,
+        preset: *const std::ffi::c_char,
     ) -> *mut VClaspX264EncoderOpaque;
 
     fn vclasp_encoder_open_two_level(
@@ -80,6 +91,47 @@ impl X264Encoder {
             out_buf_size: Self::max_nal_size(w, h),
             anchor_p,
         }
+    }
+
+    pub fn new_configured(
+        width: u32,
+        height: u32,
+        crf: u32,
+        gop_size: u32,
+        anchor_p: bool,
+        fps: u32,
+        preset: &str,
+    ) -> Result<Self, String> {
+        if fps == 0 {
+            return Err("encoder fps must be positive".to_string());
+        }
+        let preset = CString::new(preset)
+            .map_err(|_| "encoder preset contains an interior NUL".to_string())?;
+        let w = width as i32;
+        let h = height as i32;
+        let yuv_sz = (w as usize) * (h as usize) * 3 / 2;
+        let inner = unsafe {
+            vclasp_encoder_open_configured(
+                w,
+                h,
+                crf as i32,
+                gop_size as i32,
+                anchor_p as i32,
+                fps as i32,
+                preset.as_ptr(),
+            )
+        };
+        let inner = NonNull::new(inner).ok_or_else(|| {
+            format!("vclasp_encoder_open_configured failed for preset {preset:?}")
+        })?;
+        Ok(Self {
+            inner,
+            width: w,
+            height: h,
+            yuv_frame_size: yuv_sz,
+            out_buf_size: Self::max_nal_size(w, h),
+            anchor_p,
+        })
     }
 
     /// Build a root/checkpoint/target encoder. Each page checkpoint directly

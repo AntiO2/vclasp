@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::io::BufReader;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -15,6 +16,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 
 use crate::chunk::{self, ChunkWriteConfig};
+use crate::encoder::{X264Encoder, MAX_ANCHOR_P_GROUP_FRAMES};
 use crate::hierarchical_layout::{
     AccessUnitRecord, GopRegion, HierarchicalLayoutIndex, RegionDecodeMode, TargetClosure,
 };
@@ -40,6 +42,35 @@ pub struct HierarchicalBuildOptions {
     pub crf: u8,
     pub preset: String,
     pub workers: usize,
+    pub dependency_policy: DependencyPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyPolicy {
+    ClosedGop,
+    ChainedP,
+    SharedAnchor,
+}
+
+impl DependencyPolicy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "closed_gop" => Ok(Self::ClosedGop),
+            "chained_p" => Ok(Self::ChainedP),
+            "shared_anchor" => Ok(Self::SharedAnchor),
+            _ => Err(format!(
+                "unknown dependency policy {value}; expected closed_gop|chained_p|shared_anchor"
+            )),
+        }
+    }
+
+    fn dependency_kind(self) -> &'static str {
+        match self {
+            Self::ClosedGop => "closed_gop_closure",
+            Self::ChainedP => "chained_p_closure",
+            Self::SharedAnchor => "shared_anchor_closure",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -713,6 +744,152 @@ fn encode_video(
     Ok(())
 }
 
+fn encode_reference_policy_video(
+    video: &VideoInput,
+    output: &Path,
+    options: &HierarchicalBuildOptions,
+    shared_anchor: bool,
+) -> Result<(), String> {
+    let frame_size = options.width as usize * options.height as usize * 3 / 2;
+    let mut decode = Command::new(&options.ffmpeg_path);
+    decode
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&video.source_path)
+        .args(["-an", "-frames:v"])
+        .arg(options.max_frames.to_string())
+        .args([
+            "-vf",
+            &format!(
+                "scale={}:{},setsar=1,setpts=N/({}*TB)",
+                options.width, options.height, options.fps
+            ),
+            "-r",
+            &options.fps.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = decode
+        .spawn()
+        .map_err(|error| format!("failed to start FFmpeg decode: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "FFmpeg raw-video stdout is unavailable".to_string())?;
+    let mut source = BufReader::new(stdout);
+    let mut encoder = X264Encoder::new_configured(
+        options.width as u32,
+        options.height as u32,
+        options.crf as u32,
+        options.gop_size,
+        shared_anchor,
+        options.fps as u32,
+        &options.preset,
+    )?;
+    let raw_path = output.with_extension("policy.h264");
+    let mut raw = File::create(&raw_path)
+        .map_err(|error| format!("failed to create {}: {error}", raw_path.display()))?;
+    let mut frame = vec![0u8; frame_size];
+    let mut frame_index = 0u32;
+    loop {
+        let mut filled = 0usize;
+        while filled < frame_size {
+            let count = source
+                .read(&mut frame[filled..])
+                .map_err(|error| format!("failed to read decoded frame: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            filled += count;
+        }
+        if filled == 0 {
+            break;
+        }
+        if filled != frame_size {
+            let _ = std::fs::remove_file(&raw_path);
+            return Err(format!(
+                "partial decoded frame for {}: {filled}/{frame_size} bytes",
+                video.video_id
+            ));
+        }
+        let encoded = encoder
+            .try_encode_frame(&frame, frame_index % options.gop_size == 0)
+            .map_err(|error| format!("x264 failed at frame {frame_index}: {error}"))?;
+        raw.write_all(&encoded)
+            .map_err(|error| format!("failed to write raw H.264: {error}"))?;
+        frame_index += 1;
+    }
+    loop {
+        let encoded = encoder.try_flush()?;
+        if encoded.is_empty() {
+            break;
+        }
+        raw.write_all(&encoded)
+            .map_err(|error| format!("failed to flush raw H.264: {error}"))?;
+    }
+    raw.flush()
+        .map_err(|error| format!("failed to flush {}: {error}", raw_path.display()))?;
+    let decode_output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for FFmpeg decode: {error}"))?;
+    if !decode_output.status.success() {
+        let _ = std::fs::remove_file(&raw_path);
+        return Err(format!(
+            "FFmpeg decode failed for {}: {}",
+            video.source_path.display(),
+            String::from_utf8_lossy(&decode_output.stderr)
+        ));
+    }
+    if frame_index == 0 {
+        let _ = std::fs::remove_file(&raw_path);
+        return Err(format!("no source frames decoded for {}", video.video_id));
+    }
+    let remux = Command::new(&options.ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-r",
+        ])
+        .arg(options.fps.to_string())
+        .args(["-i"])
+        .arg(&raw_path)
+        .args(["-an", "-c:v", "copy", "-movflags", "+faststart"])
+        .arg(output)
+        .output()
+        .map_err(|error| format!("failed to start FFmpeg remux: {error}"))?;
+    let _ = std::fs::remove_file(&raw_path);
+    if !remux.status.success() {
+        return Err(format!(
+            "FFmpeg remux failed for {}: {}",
+            video.video_id,
+            String::from_utf8_lossy(&remux.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn encode_video_for_policy(
+    video: &VideoInput,
+    output: &Path,
+    options: &HierarchicalBuildOptions,
+) -> Result<(), String> {
+    match options.dependency_policy {
+        DependencyPolicy::ClosedGop => encode_video(video, output, options),
+        DependencyPolicy::ChainedP => encode_reference_policy_video(video, output, options, false),
+        DependencyPolicy::SharedAnchor => {
+            encode_reference_policy_video(video, output, options, true)
+        }
+    }
+}
+
 fn validate_encoded_frame_count(
     video_id: &str,
     packets: usize,
@@ -849,6 +1026,48 @@ fn derive_closures(
     Ok((closures, gop_ids))
 }
 
+fn derive_shared_anchor_closures(
+    frame_types: &[String],
+    packet_indices: &[usize],
+) -> Result<(Vec<Vec<usize>>, Vec<usize>), String> {
+    if frame_types.len() != packet_indices.len() {
+        return Err("shared-Anchor closure inputs have different lengths".to_string());
+    }
+    let anchors = frame_types
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, value)| (value == "I").then_some(ordinal))
+        .collect::<Vec<_>>();
+    if anchors.first().copied() != Some(0) {
+        return Err("shared-Anchor stream does not begin with an I frame".to_string());
+    }
+    if frame_types
+        .iter()
+        .any(|value| !matches!(value.as_str(), "I" | "P"))
+    {
+        return Err("shared-Anchor stream must contain only I/P frames".to_string());
+    }
+    let mut closures = vec![Vec::new(); frame_types.len()];
+    let mut gop_ids = vec![0usize; frame_types.len()];
+    for (gop_id, start) in anchors.iter().copied().enumerate() {
+        let stop = anchors
+            .get(gop_id + 1)
+            .copied()
+            .unwrap_or(frame_types.len());
+        for target in start..stop {
+            gop_ids[target] = gop_id;
+            let mut closure = if target == start {
+                vec![start]
+            } else {
+                vec![start, target]
+            };
+            closure.sort_unstable_by_key(|ordinal| packet_indices[*ordinal]);
+            closures[target] = closure;
+        }
+    }
+    Ok((closures, gop_ids))
+}
+
 fn validate_closures(
     closures: &[Vec<usize>],
     gop_ids: &[usize],
@@ -974,10 +1193,19 @@ pub fn build_vclasp_chunk_internal(
     if videos.is_empty() {
         return Err("video list is empty".into());
     }
-    if options.gop_size < 8 || options.max_frames == 0 || options.fps == 0 || options.workers == 0 {
+    if options.gop_size < 2 || options.max_frames == 0 || options.fps == 0 || options.workers == 0 {
         return Err(
-            "gop_size must be at least 8 and frame/fps/worker limits must be positive".into(),
+            "gop_size must be at least 2 and frame/fps/worker limits must be positive".into(),
         );
+    }
+    if options.dependency_policy == DependencyPolicy::SharedAnchor
+        && options.gop_size > MAX_ANCHOR_P_GROUP_FRAMES
+    {
+        return Err(format!(
+            "shared_anchor gop_size {} exceeds x264 reference limit {}",
+            options.gop_size, MAX_ANCHOR_P_GROUP_FRAMES
+        )
+        .into());
     }
     let parent = options
         .output_path
@@ -1016,7 +1244,7 @@ pub fn build_vclasp_chunk_internal(
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let stage_started = Instant::now();
         parallel_map(videos.len(), options.workers, |video_index| {
-            encode_video(&videos[video_index], &encoded_paths[video_index], options)
+            encode_video_for_policy(&videos[video_index], &encoded_paths[video_index], options)
         })?;
         encode_seconds = stage_started.elapsed().as_secs_f64();
 
@@ -1050,7 +1278,12 @@ pub fn build_vclasp_chunk_internal(
             canonical_config.get_or_insert(config);
             canonical_nal_length_size.get_or_insert(nal_length_size);
             let stage_started = Instant::now();
-            let (closures, gop_ids) = derive_closures(&frame_types, &packet_indices)?;
+            let (closures, gop_ids) = if options.dependency_policy == DependencyPolicy::SharedAnchor
+            {
+                derive_shared_anchor_closures(&frame_types, &packet_indices)?
+            } else {
+                derive_closures(&frame_types, &packet_indices)?
+            };
             closure_construction_seconds += stage_started.elapsed().as_secs_f64();
             let stage_started = Instant::now();
             validate_closures(&closures, &gop_ids, &packet_indices)?;
@@ -1093,7 +1326,7 @@ pub fn build_vclasp_chunk_internal(
                     record_length: packet.size as i64,
                     frame_idx: ordinal as i32,
                     codec_config_id: 0,
-                    dependency_kind: "vclasp_closure".to_string(),
+                    dependency_kind: options.dependency_policy.dependency_kind().to_string(),
                     record_id: base_record_id + packet_index as i64,
                     packet_index: packet_index as i32,
                     gop_id: gop_ids[ordinal] as i32,
@@ -1223,6 +1456,56 @@ mod tests {
         assert_eq!(closures[1], vec![0, 4, 2, 1]);
         assert_eq!(closures[2], vec![0, 4, 2]);
         assert_eq!(gops, vec![0; 5]);
+    }
+
+    #[test]
+    fn parses_registered_dependency_policies() {
+        assert_eq!(
+            DependencyPolicy::parse("closed_gop").unwrap(),
+            DependencyPolicy::ClosedGop
+        );
+        assert_eq!(
+            DependencyPolicy::parse("chained_p").unwrap(),
+            DependencyPolicy::ChainedP
+        );
+        assert_eq!(
+            DependencyPolicy::parse("shared_anchor").unwrap(),
+            DependencyPolicy::SharedAnchor
+        );
+        assert!(DependencyPolicy::parse("uniform").is_err());
+    }
+
+    #[test]
+    fn shared_anchor_closure_contains_only_anchor_and_target() {
+        let types = ["I", "P", "P", "P", "I", "P"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let packet_indices = vec![0, 1, 2, 3, 4, 5];
+        let (closures, gops) = derive_shared_anchor_closures(&types, &packet_indices).unwrap();
+        assert_eq!(
+            closures,
+            vec![
+                vec![0],
+                vec![0, 1],
+                vec![0, 2],
+                vec![0, 3],
+                vec![4],
+                vec![4, 5]
+            ]
+        );
+        assert_eq!(gops, vec![0, 0, 0, 0, 1, 1]);
+        validate_closures(&closures, &gops, &packet_indices).unwrap();
+    }
+
+    #[test]
+    fn shared_anchor_closure_rejects_b_frames() {
+        let types = ["I", "B", "P"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let error = derive_shared_anchor_closures(&types, &[0, 2, 1]).unwrap_err();
+        assert!(error.contains("only I/P"));
     }
 
     #[test]

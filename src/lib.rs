@@ -32,7 +32,7 @@ mod decoder;
 #[cfg(feature = "experiment-controls")]
 #[path = "execution/dependency_sampler.rs"]
 mod dependency_sampler;
-#[cfg(any(test, feature = "experiment-controls"))]
+#[cfg(feature = "ffmpeg")]
 #[path = "codec/encoder.rs"]
 mod encoder;
 #[cfg(feature = "experiment-controls")]
@@ -187,6 +187,25 @@ mod executor_pool_tests {
             assert!(
                 !production_sources.contains(&label),
                 "production source contains benchmark label {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_planning_and_execution_do_not_branch_on_ingest_policy_names() {
+        let production_sources = [
+            include_str!("planning/hierarchical_layout.rs"),
+            include_str!("planning/planner.rs"),
+            include_str!("execution/hierarchical_scheduler.rs"),
+            include_str!("execution/resident_cache.rs"),
+            include_str!("execution/session.rs"),
+        ]
+        .join("\n")
+        .to_ascii_lowercase();
+        for policy in ["closed_gop", "chained_p", "shared_anchor"] {
+            assert!(
+                !production_sources.contains(policy),
+                "production source branches on ingestion policy {policy}"
             );
         }
     }
@@ -4000,6 +4019,7 @@ fn run_hierarchical_build(
     crf: u8,
     preset: String,
     workers: usize,
+    dependency_policy: String,
 ) -> PyResult<hierarchical_ingest::HierarchicalBuildStats> {
     let inputs = videos
         .into_iter()
@@ -4024,6 +4044,8 @@ fn run_hierarchical_build(
         crf,
         preset,
         workers,
+        dependency_policy: hierarchical_ingest::DependencyPolicy::parse(&dependency_policy)
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
     };
     py.allow_threads(|| {
         hierarchical_ingest::build_vclasp_chunk_internal(&inputs, &options)
@@ -4047,7 +4069,8 @@ fn run_hierarchical_build(
     fps=25,
     crf=23,
     preset="veryfast".to_string(),
-    workers=1
+    workers=1,
+    dependency_policy="closed_gop".to_string()
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_vclasp_chunk(
@@ -4065,6 +4088,7 @@ fn build_vclasp_chunk(
     crf: u8,
     preset: String,
     workers: usize,
+    dependency_policy: String,
 ) -> PyResult<(usize, usize, usize, u64, u64, u64, usize)> {
     let stats = run_hierarchical_build(
         py,
@@ -4081,6 +4105,7 @@ fn build_vclasp_chunk(
         crf,
         preset,
         workers,
+        dependency_policy,
     )?;
     Ok((
         stats.videos,
@@ -4099,7 +4124,8 @@ fn build_vclasp_chunk(
     videos, output_path, baseline_mp4_dir=None,
     ffmpeg_path="ffmpeg".to_string(), ffprobe_path="ffprobe".to_string(),
     gop_size=64, max_frames=512, width=320, height=240, fps=25, crf=23,
-    preset="veryfast".to_string(), workers=1
+    preset="veryfast".to_string(), workers=1,
+    dependency_policy="closed_gop".to_string()
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_vclasp_chunk_profiled(
@@ -4117,6 +4143,7 @@ fn build_vclasp_chunk_profiled(
     crf: u8,
     preset: String,
     workers: usize,
+    dependency_policy: String,
 ) -> PyResult<VClaspBuildStats> {
     run_hierarchical_build(
         py,
@@ -4133,6 +4160,7 @@ fn build_vclasp_chunk_profiled(
         crf,
         preset,
         workers,
+        dependency_policy,
     )
     .map(Into::into)
 }
