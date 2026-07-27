@@ -43,11 +43,12 @@ pub struct HierarchicalBuildOptions {
     pub preset: String,
     pub workers: usize,
     pub dependency_policy: DependencyPolicy,
+    pub hierarchical_b: HierarchicalBConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyPolicy {
-    ClosedGop,
+    HierarchicalB,
     ChainedP,
     SharedAnchor,
 }
@@ -55,21 +56,95 @@ pub enum DependencyPolicy {
 impl DependencyPolicy {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "closed_gop" => Ok(Self::ClosedGop),
+            "hierarchical_b" => Ok(Self::HierarchicalB),
             "chained_p" => Ok(Self::ChainedP),
             "shared_anchor" => Ok(Self::SharedAnchor),
             _ => Err(format!(
-                "unknown dependency policy {value}; expected closed_gop|chained_p|shared_anchor"
+                "unknown dependency policy {value}; expected hierarchical_b|chained_p|shared_anchor"
             )),
         }
     }
 
     fn dependency_kind(self) -> &'static str {
         match self {
-            Self::ClosedGop => "closed_gop_closure",
+            Self::HierarchicalB => "hierarchical_b_closure",
             Self::ChainedP => "chained_p_closure",
             Self::SharedAnchor => "shared_anchor_closure",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BFramePyramid {
+    None,
+    Strict,
+}
+
+impl BFramePyramid {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "strict" => Ok(Self::Strict),
+            _ => Err(format!(
+                "unknown B-frame pyramid {value}; expected none|strict"
+            )),
+        }
+    }
+
+    fn x264_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HierarchicalBConfig {
+    pub max_b_frames: u8,
+    pub pyramid: BFramePyramid,
+    pub adaptive: u8,
+    pub lookahead: u16,
+    pub reference_frames: u8,
+}
+
+impl Default for HierarchicalBConfig {
+    fn default() -> Self {
+        Self {
+            max_b_frames: 7,
+            pyramid: BFramePyramid::Strict,
+            adaptive: 0,
+            lookahead: 0,
+            reference_frames: 1,
+        }
+    }
+}
+
+impl HierarchicalBConfig {
+    fn validate(self, gop_size: u32) -> Result<(), String> {
+        if self.max_b_frames > 16 {
+            return Err("hierarchical-B max_b_frames must be at most 16".to_string());
+        }
+        if u32::from(self.max_b_frames) >= gop_size {
+            return Err(format!(
+                "hierarchical-B max_b_frames {} must be smaller than gop_size {gop_size}",
+                self.max_b_frames
+            ));
+        }
+        if self.adaptive > 2 {
+            return Err("hierarchical-B adaptive mode must be 0, 1, or 2".to_string());
+        }
+        if self.adaptive > 0 && self.lookahead < u16::from(self.max_b_frames).saturating_add(1) {
+            return Err(format!(
+                "hierarchical-B adaptive mode {} requires lookahead >= {}",
+                self.adaptive,
+                u16::from(self.max_b_frames).saturating_add(1)
+            ));
+        }
+        if self.reference_frames == 0 || self.reference_frames > 16 {
+            return Err("hierarchical-B reference_frames must be in 1..=16".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -87,6 +162,10 @@ pub struct HierarchicalBuildStats {
     pub median_closure_records: f64,
     pub p95_closure_records: f64,
     pub gops: usize,
+    pub i_frames: usize,
+    pub p_frames: usize,
+    pub b_frames: usize,
+    pub max_b_run: usize,
     pub total_seconds: f64,
     pub encode_seconds: f64,
     pub au_parse_seconds: f64,
@@ -696,7 +775,12 @@ fn encode_video(
     output: &Path,
     options: &HierarchicalBuildOptions,
 ) -> Result<(), String> {
-    let x264_params = "b-pyramid=strict:open-gop=0:rc-lookahead=0:sync-lookahead=0";
+    let hierarchical_b = options.hierarchical_b;
+    let x264_params = format!(
+        "b-pyramid={}:open-gop=0:rc-lookahead={}:sync-lookahead=0",
+        hierarchical_b.pyramid.x264_value(),
+        hierarchical_b.lookahead
+    );
     let status = Command::new(&options.ffmpeg_path)
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&video.source_path)
@@ -721,13 +805,13 @@ fn encode_video(
             "-sc_threshold",
             "0",
             "-bf",
-            "7",
+            &hierarchical_b.max_b_frames.to_string(),
             "-b_strategy",
-            "0",
+            &hierarchical_b.adaptive.to_string(),
             "-refs",
-            "1",
+            &hierarchical_b.reference_frames.to_string(),
             "-x264-params",
-            x264_params,
+            &x264_params,
             "-map_metadata",
             "-1",
             "-map_chapters",
@@ -882,7 +966,7 @@ fn encode_video_for_policy(
     options: &HierarchicalBuildOptions,
 ) -> Result<(), String> {
     match options.dependency_policy {
-        DependencyPolicy::ClosedGop => encode_video(video, output, options),
+        DependencyPolicy::HierarchicalB => encode_video(video, output, options),
         DependencyPolicy::ChainedP => encode_reference_policy_video(video, output, options, false),
         DependencyPolicy::SharedAnchor => {
             encode_reference_policy_video(video, output, options, true)
@@ -1198,6 +1282,14 @@ pub fn build_vclasp_chunk_internal(
             "gop_size must be at least 2 and frame/fps/worker limits must be positive".into(),
         );
     }
+    if options.dependency_policy == DependencyPolicy::HierarchicalB {
+        options.hierarchical_b.validate(options.gop_size)?;
+    } else if options.hierarchical_b != HierarchicalBConfig::default() {
+        return Err(
+            "hierarchical-B encoder parameters are only valid for dependency_policy=hierarchical_b"
+                .into(),
+        );
+    }
     if options.dependency_policy == DependencyPolicy::SharedAnchor
         && options.gop_size > MAX_ANCHOR_P_GROUP_FRAMES
     {
@@ -1233,6 +1325,10 @@ pub fn build_vclasp_chunk_internal(
     let mut max_closure_records = 0usize;
     let mut closure_lengths = Vec::new();
     let mut gops = 0usize;
+    let mut i_frames = 0usize;
+    let mut p_frames = 0usize;
+    let mut b_frames = 0usize;
+    let mut max_b_run = 0usize;
     let mut encode_seconds = 0.0;
     let mut au_parse_seconds = 0.0;
     let mut closure_construction_seconds = 0.0;
@@ -1277,6 +1373,25 @@ pub fn build_vclasp_chunk_internal(
             }
             canonical_config.get_or_insert(config);
             canonical_nal_length_size.get_or_insert(nal_length_size);
+            let mut current_b_run = 0usize;
+            for frame_type in &frame_types {
+                match frame_type.as_str() {
+                    "I" => {
+                        i_frames += 1;
+                        current_b_run = 0;
+                    }
+                    "P" => {
+                        p_frames += 1;
+                        current_b_run = 0;
+                    }
+                    "B" => {
+                        b_frames += 1;
+                        current_b_run += 1;
+                        max_b_run = max_b_run.max(current_b_run);
+                    }
+                    _ => {}
+                }
+            }
             let stage_started = Instant::now();
             let (closures, gop_ids) = if options.dependency_policy == DependencyPolicy::SharedAnchor
             {
@@ -1401,6 +1516,10 @@ pub fn build_vclasp_chunk_internal(
         median_closure_records: percentile(&closure_lengths, 0.5),
         p95_closure_records: percentile(&closure_lengths, 0.95),
         gops,
+        i_frames,
+        p_frames,
+        b_frames,
+        max_b_run,
         total_seconds: total_started.elapsed().as_secs_f64(),
         encode_seconds,
         au_parse_seconds,
@@ -1461,8 +1580,8 @@ mod tests {
     #[test]
     fn parses_registered_dependency_policies() {
         assert_eq!(
-            DependencyPolicy::parse("closed_gop").unwrap(),
-            DependencyPolicy::ClosedGop
+            DependencyPolicy::parse("hierarchical_b").unwrap(),
+            DependencyPolicy::HierarchicalB
         );
         assert_eq!(
             DependencyPolicy::parse("chained_p").unwrap(),
@@ -1473,6 +1592,40 @@ mod tests {
             DependencyPolicy::SharedAnchor
         );
         assert!(DependencyPolicy::parse("uniform").is_err());
+    }
+
+    #[test]
+    fn validates_hierarchical_b_parameters_before_encoding() {
+        HierarchicalBConfig::default().validate(16).unwrap();
+        HierarchicalBConfig {
+            max_b_frames: 3,
+            pyramid: BFramePyramid::Strict,
+            adaptive: 2,
+            lookahead: 16,
+            reference_frames: 3,
+        }
+        .validate(16)
+        .unwrap();
+        assert!(HierarchicalBConfig {
+            max_b_frames: 16,
+            ..HierarchicalBConfig::default()
+        }
+        .validate(16)
+        .is_err());
+        assert!(HierarchicalBConfig {
+            max_b_frames: 7,
+            adaptive: 2,
+            lookahead: 7,
+            ..HierarchicalBConfig::default()
+        }
+        .validate(16)
+        .is_err());
+        assert!(HierarchicalBConfig {
+            reference_frames: 0,
+            ..HierarchicalBConfig::default()
+        }
+        .validate(16)
+        .is_err());
     }
 
     #[test]

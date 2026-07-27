@@ -80,14 +80,21 @@ vclasp.build_vclasp_chunk(
     crf=23,
     preset="veryfast",
     workers=8,
-    dependency_policy="closed_gop",
+    dependency_policy="hierarchical_b",
+    max_b_frames=7,
+    b_pyramid="strict",
+    b_adapt=0,
+    rc_lookahead=0,
+    reference_frames=1,
 )
 ```
 
 `dependency_policy` registers the encoded stream's actual dependency graph in
 the embedded closure catalog:
 
-- `closed_gop` uses the standard I/P/B closed-GOP path;
+- `hierarchical_b` uses a closed I/P/B GOP. Its parameters control the maximum
+  B-frame run, strict/disabled B-pyramid, adaptive B placement, lookahead, and
+  reference-frame count;
 - `chained_p` uses a controlled no-B `I -> P1 -> P2 -> ...` stream;
 - `shared_anchor` stores one I anchor per GOP and makes each P target depend
   directly on that anchor.
@@ -95,6 +102,11 @@ the embedded closure catalog:
 All policies use the same reader and planner. `shared_anchor` is limited to
 groups of at most 17 frames by x264's short-term reference capacity. It is an
 optional storage/performance policy, not a workload-specific reader.
+Hierarchical-B defaults reproduce the current experimental contract:
+`max_b_frames=7`, `b_pyramid="strict"`, `b_adapt=0`,
+`rc_lookahead=0`, and `reference_frames=1`. Open GOPs are intentionally not
+exposed because the closure index currently requires every dependency to
+remain within one GOP.
 
 ### 2. Read an already-sampled request window
 

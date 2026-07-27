@@ -85,12 +85,25 @@ stats = vclasp.build_vclasp_chunk(
     fps=25,
     crf=23,
     preset="veryfast",
+    dependency_policy="hierarchical_b",
+    max_b_frames=7,
+    b_pyramid="strict",
+    b_adapt=0,
+    rc_lookahead=0,
+    reference_frames=1,
 )
 ```
 
 Each input tuple is `(video_id, class_name, source_path)`. Video IDs must be
 unique. The returned tuple reports videos, records, logical targets, payload
 bytes, index bytes, total chunk bytes, and maximum closure size.
+
+For `dependency_policy="hierarchical_b"`, `max_b_frames` must be smaller than
+`gop_size`; `b_pyramid` is `strict` or `none`; `b_adapt` is 0, 1, or 2; and
+adaptive placement requires enough `rc_lookahead` to cover the configured
+B-frame run. `reference_frames` is in `1..=16`. Other dependency policies
+reject non-default Hierarchical-B parameters so an irrelevant knob cannot be
+silently accepted.
 
 ## Inspect a chunk
 

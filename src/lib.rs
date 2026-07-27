@@ -202,7 +202,7 @@ mod executor_pool_tests {
         ]
         .join("\n")
         .to_ascii_lowercase();
-        for policy in ["closed_gop", "chained_p", "shared_anchor"] {
+        for policy in ["hierarchical_b", "chained_p", "shared_anchor"] {
             assert!(
                 !production_sources.contains(policy),
                 "production source branches on ingestion policy {policy}"
@@ -3964,6 +3964,10 @@ struct VClaspBuildStats {
     median_closure_records: f64,
     p95_closure_records: f64,
     gops: usize,
+    i_frames: usize,
+    p_frames: usize,
+    b_frames: usize,
+    max_b_run: usize,
     total_seconds: f64,
     encode_seconds: f64,
     au_parse_seconds: f64,
@@ -3990,6 +3994,10 @@ impl From<hierarchical_ingest::HierarchicalBuildStats> for VClaspBuildStats {
             median_closure_records: stats.median_closure_records,
             p95_closure_records: stats.p95_closure_records,
             gops: stats.gops,
+            i_frames: stats.i_frames,
+            p_frames: stats.p_frames,
+            b_frames: stats.b_frames,
+            max_b_run: stats.max_b_run,
             total_seconds: stats.total_seconds,
             encode_seconds: stats.encode_seconds,
             au_parse_seconds: stats.au_parse_seconds,
@@ -4020,6 +4028,11 @@ fn run_hierarchical_build(
     preset: String,
     workers: usize,
     dependency_policy: String,
+    max_b_frames: u8,
+    b_pyramid: String,
+    b_adapt: u8,
+    rc_lookahead: u16,
+    reference_frames: u8,
 ) -> PyResult<hierarchical_ingest::HierarchicalBuildStats> {
     let inputs = videos
         .into_iter()
@@ -4046,6 +4059,14 @@ fn run_hierarchical_build(
         workers,
         dependency_policy: hierarchical_ingest::DependencyPolicy::parse(&dependency_policy)
             .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
+        hierarchical_b: hierarchical_ingest::HierarchicalBConfig {
+            max_b_frames,
+            pyramid: hierarchical_ingest::BFramePyramid::parse(&b_pyramid)
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
+            adaptive: b_adapt,
+            lookahead: rc_lookahead,
+            reference_frames,
+        },
     };
     py.allow_threads(|| {
         hierarchical_ingest::build_vclasp_chunk_internal(&inputs, &options)
@@ -4070,7 +4091,12 @@ fn run_hierarchical_build(
     crf=23,
     preset="veryfast".to_string(),
     workers=1,
-    dependency_policy="closed_gop".to_string()
+    dependency_policy="hierarchical_b".to_string(),
+    max_b_frames=7,
+    b_pyramid="strict".to_string(),
+    b_adapt=0,
+    rc_lookahead=0,
+    reference_frames=1
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_vclasp_chunk(
@@ -4089,6 +4115,11 @@ fn build_vclasp_chunk(
     preset: String,
     workers: usize,
     dependency_policy: String,
+    max_b_frames: u8,
+    b_pyramid: String,
+    b_adapt: u8,
+    rc_lookahead: u16,
+    reference_frames: u8,
 ) -> PyResult<(usize, usize, usize, u64, u64, u64, usize)> {
     let stats = run_hierarchical_build(
         py,
@@ -4106,6 +4137,11 @@ fn build_vclasp_chunk(
         preset,
         workers,
         dependency_policy,
+        max_b_frames,
+        b_pyramid,
+        b_adapt,
+        rc_lookahead,
+        reference_frames,
     )?;
     Ok((
         stats.videos,
@@ -4125,7 +4161,9 @@ fn build_vclasp_chunk(
     ffmpeg_path="ffmpeg".to_string(), ffprobe_path="ffprobe".to_string(),
     gop_size=64, max_frames=512, width=320, height=240, fps=25, crf=23,
     preset="veryfast".to_string(), workers=1,
-    dependency_policy="closed_gop".to_string()
+    dependency_policy="hierarchical_b".to_string(),
+    max_b_frames=7, b_pyramid="strict".to_string(), b_adapt=0,
+    rc_lookahead=0, reference_frames=1
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_vclasp_chunk_profiled(
@@ -4144,6 +4182,11 @@ fn build_vclasp_chunk_profiled(
     preset: String,
     workers: usize,
     dependency_policy: String,
+    max_b_frames: u8,
+    b_pyramid: String,
+    b_adapt: u8,
+    rc_lookahead: u16,
+    reference_frames: u8,
 ) -> PyResult<VClaspBuildStats> {
     run_hierarchical_build(
         py,
@@ -4161,6 +4204,11 @@ fn build_vclasp_chunk_profiled(
         preset,
         workers,
         dependency_policy,
+        max_b_frames,
+        b_pyramid,
+        b_adapt,
+        rc_lookahead,
+        reference_frames,
     )
     .map(Into::into)
 }
