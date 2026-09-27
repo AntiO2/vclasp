@@ -16,3 +16,14 @@ classifiers = [
 [tool.maturin]
 features = ["ffmpeg"]
 module-name = "vclasp"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not integration'"
+markers = [
+    "integration: requires external datasets, services, or experimental readers",
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 88

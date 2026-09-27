@@ -1,0 +1,18 @@
+name: Set up native build dependencies
+description: Install the CPU codec toolchain used by build and unit-test jobs.
+runs:
+  using: composite
+  steps:
+    - name: Install FFmpeg and x264 development packages
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential pkg-config clang libclang-dev \
+          libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+          libx264-dev ffmpeg
+    - name: Select Rust toolchain
+      shell: bash
+      run: |
+        rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+        rustup default "$RUST_TOOLCHAIN"

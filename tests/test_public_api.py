@@ -3,9 +3,7 @@
 import vclasp
 
 
-PRODUCTION_EXECUTORS = (
-    vclasp.VClaspSession,
-)
+PRODUCTION_EXECUTORS = (vclasp.VClaspSession,)
 
 
 def test_production_executors_share_one_request_interface():

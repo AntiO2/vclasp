@@ -26,6 +26,10 @@ backend names or workload labels.
 Paper runners, cluster deployment, baseline ports, datasets, and result files
 belong in the separate reproducibility artifact, not this reusable core.
 
+See the [API guide](docs/API.md) for application examples, the
+[setup guide](docs/SETUP_AND_RUNBOOK.md) for environment details, and the
+[source guide](src/README.md) for the code structure.
+
 ## Requirements
 
 Verified on Ubuntu x86-64 with Rust 1.96, Python 3.12, and FFmpeg 6.x.
@@ -47,12 +51,18 @@ cargo test --release --features ffmpeg
 cargo build --release --features ffmpeg
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e . pytest
-python -m pytest tests/test_public_api.py
+python -m pip install -r requirements-dev.txt
+python -m pip install -e .
+python -m pytest
 ```
 
 Fixture-backed decode tests are ignored unless `VCLASP_TEST_CHUNK` is set. The
 default suite does not require private datasets.
+
+[CI](.github/workflows/ci.yml) checks Rust/Python formatting, compilation, and
+unit tests. Rust and Python tests run as independent parallel jobs with local
+temporary files; no object-store service is required. See
+[Contributing](CONTRIBUTING.md#validate-the-change) for the matching commands.
 
 New chunks use FlatBuffer identifier `VCSP`, header magic `VClasp`, and format
 version 1. Earlier pre-release chunks must be rebuilt; the reader does not
@@ -245,7 +255,8 @@ production invariant to its code and verification evidence.
 
 ## Development
 
-Before submitting a change:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and checks
+required for a pull request. The main checks are:
 
 ```bash
 cargo test --features ffmpeg --lib
@@ -256,6 +267,15 @@ cargo fmt --check
 Do not add benchmark-name branches to the core. New execution choices must be
 derived from logical targets, registered codec dependencies, physical extents,
 runtime observations, and explicit resource budgets.
+
+## Community and security
+
+Use the [issue templates](https://github.com/AntiO2/vclasp/issues/new/choose)
+to report bugs, propose features, or provide reproducible performance results.
+Participation follows our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Coding agents should also read [AGENTS.md](AGENTS.md).
 
 ## License
 

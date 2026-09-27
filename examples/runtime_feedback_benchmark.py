@@ -52,7 +52,9 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     for name in ("endpoint", "bucket", "access_key", "secret_key"):
         if not getattr(args, name):
-            parser.error(f"--{name.replace('_', '-')} or its environment variable is required")
+            parser.error(
+                f"--{name.replace('_', '-')} or its environment variable is required"
+            )
     args.lookahead_candidates = sorted(
         {int(value) for value in args.lookahead_candidates.split(",")}
     )
@@ -205,9 +207,7 @@ def execute_trace(
                         "runtime_feedback_io_observations"
                     ],
                     "feedback_io_ape": stats["runtime_feedback_io_ape_ppm"] / 1e6,
-                    "feedback_decode_ape": stats[
-                        "runtime_feedback_decode_ape_ppm"
-                    ]
+                    "feedback_decode_ape": stats["runtime_feedback_decode_ape_ppm"]
                     / 1e6,
                     "feedback_io_tail_multiplier": stats[
                         "runtime_feedback_io_tail_multiplier_ppm"
@@ -240,18 +240,14 @@ def execute_trace(
         "slo_feasible_fraction": statistics.fmean(
             row["selected_under_slo"] for row in rows
         ),
-        "gets_per_sample": sum(row["physical_ranges"] for row in rows)
-        / total_samples,
-        "bytes_per_sample": sum(row["fetched_bytes"] for row in rows)
-        / total_samples,
+        "gets_per_sample": sum(row["physical_ranges"] for row in rows) / total_samples,
+        "bytes_per_sample": sum(row["fetched_bytes"] for row in rows) / total_samples,
         "active_windows": sum(row["feedback_active"] for row in rows),
         "final_io_observations": rows[-1]["feedback_io_observations"],
         "final_io_ape": rows[-1]["feedback_io_ape"],
         "final_decode_ape": rows[-1]["feedback_decode_ape"],
         "final_io_tail_multiplier": rows[-1]["feedback_io_tail_multiplier"],
-        "final_decode_tail_multiplier": rows[-1][
-            "feedback_decode_tail_multiplier"
-        ],
+        "final_decode_tail_multiplier": rows[-1]["feedback_decode_tail_multiplier"],
         "rows": rows,
     }
 

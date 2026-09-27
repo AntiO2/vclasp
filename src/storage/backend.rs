@@ -234,6 +234,44 @@ impl StorageBackend for LocalBackend {
     }
 }
 
+#[cfg(test)]
+mod local_tests {
+    use super::{LocalBackend, StorageBackend};
+    use std::fs::{self, File};
+
+    fn temporary_backend() -> (tempfile::TempDir, LocalBackend) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("payload.bin");
+        fs::write(&path, b"HEADabcdefgh").unwrap();
+        let file = File::open(path).unwrap();
+        // The fixture is immutable and lives until after its mapping is dropped.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
+        (directory, LocalBackend::new(mmap, 4))
+    }
+
+    #[test]
+    fn reads_payload_relative_ranges_from_temporary_storage() {
+        let (_directory, backend) = temporary_backend();
+        assert_eq!(backend.read_byte_range(2, 3).unwrap(), b"cde");
+        assert_eq!(backend.read_byte_range(7, 1).unwrap(), b"h");
+        assert!(backend.read_byte_range(8, 1).is_err());
+    }
+
+    #[test]
+    fn temporary_storage_preserves_range_order_duplicates_and_byte_accounting() {
+        let (_directory, backend) = temporary_backend();
+        let result = backend
+            .read_byte_ranges_profiled(&[(5, 2), (0, 2), (5, 2)])
+            .unwrap();
+        assert_eq!(
+            result.buffers,
+            vec![b"fg".to_vec(), b"ab".to_vec(), b"fg".to_vec()]
+        );
+        assert_eq!(result.physical_requests, 3);
+        assert_eq!(result.physical_fetched_bytes, 6);
+    }
+}
+
 // ── MinIO / S3 backend (via object_store) ─────────────────────────
 
 /// Single-object view over the shared S3 transport used by VClasp layouts.

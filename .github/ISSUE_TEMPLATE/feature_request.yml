@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose an API or system capability for a concrete application.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Application and problem
+      description: What are you trying to do, and where does the current API fall short?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include a short API example if useful. Explain effects on ordering, dependencies, or resource budgets.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and constraints
+      description: Describe existing approaches, expected scale, and any file-format or compatibility constraints.
