@@ -3167,6 +3167,11 @@ impl VClaspChunk {
         Ok(PyBytes::new_bound(py, &data).unbind())
     }
 
+    /// Return the embedded Parquet AU index without reparsing the video stream.
+    fn read_au_index(&self, py: Python<'_>) -> Py<PyBytes> {
+        PyBytes::new_bound(py, &self.inner.mmap[self.inner.layout.index_start..]).unbind()
+    }
+
     /// Read a single record blob by (video_id, tier) — returns one random matching blob.
     /// For deterministic access, use read_record_at(video_id, tier, idx).
     #[cfg(feature = "experiment-controls")]
@@ -6521,6 +6526,8 @@ fn vclasp(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_vclasp_chunk, m)?)?;
     #[cfg(feature = "ffmpeg")]
     m.add_function(wrap_pyfunction!(build_vclasp_chunk_profiled, m)?)?;
+    #[cfg(feature = "experiment-controls")]
+    m.add_function(wrap_pyfunction!(write_chunk_from_files, m)?)?;
     m.add_function(wrap_pyfunction!(plan_byte_ranges, m)?)?;
     Ok(())
 }

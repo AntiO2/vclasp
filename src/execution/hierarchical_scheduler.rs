@@ -5,9 +5,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use crate::backend::{ObjectStorePressure, StorageBackend};
-use crate::decoder::{
-    self, DecodeBudget, DecodedRgbFrame, DecoderConfig, DecoderPool, SharedDecoderSlots,
-};
+use crate::decoder::{self, DecodeBudget, DecodedRgbFrame, DecoderConfig, SharedDecoderSlots};
 use crate::hierarchical_ingest::{
     mp4_sample_to_annex_b, HierarchicalCatalog, HierarchicalRecordMeta,
 };
@@ -37,7 +35,8 @@ mod tests {
     use super::{
         cursor_admission_with_existing_state, evict_resident_entries_to_capacity,
         frame_thread_release_margin, monotonic_visible_reuses, range_size_buckets,
-        read_ahead_allowance, single_gop_key, HierarchicalBatchExecutor,
+        read_ahead_allowance, requested_display_ordinals, single_gop_key,
+        HierarchicalBatchExecutor,
     };
     #[cfg(feature = "experiment-controls")]
     use crate::backend::NoopBackend;
@@ -64,6 +63,20 @@ mod tests {
             target_output_ordinal: 0,
             nal_length_size: 4,
         }
+    }
+
+    #[test]
+    fn decode_job_targets_use_display_order_independent_of_physical_order() {
+        let records = [
+            record("video", 0, 3),
+            record("video", 0, 1),
+            record("video", 0, 2),
+        ];
+        let target_ids = [1u64, 3].into_iter().collect();
+
+        let requested = requested_display_ordinals(records.iter().collect(), &target_ids);
+
+        assert_eq!(requested, vec![(1, 0), (3, 2)]);
     }
 
     #[test]
@@ -672,7 +685,6 @@ pub struct HierarchicalBatchExecutor {
     runtime_feedback_fixed16_fallback: bool,
     max_merge_gap_bytes: Option<u64>,
     max_range_bytes: Option<u64>,
-    decoder_pool: DecoderPool,
     decoder_threads: usize,
     cursor_decoder_threads: usize,
     decode_budget: Arc<DecodeBudget>,
@@ -759,6 +771,53 @@ struct IncrementalDecodedJob {
     frames: Vec<(u64, DecodedRgbFrame)>,
     completed_ns: u64,
     access_units: usize,
+}
+
+fn requested_display_ordinals(
+    mut records: Vec<&HierarchicalRecordMeta>,
+    target_ids: &HashSet<u64>,
+) -> Vec<(u64, usize)> {
+    records.sort_unstable_by_key(|record| record.frame_idx);
+    records
+        .into_iter()
+        .enumerate()
+        .filter_map(|(ordinal, record)| {
+            target_ids
+                .contains(&record.record_id)
+                .then_some((record.record_id, ordinal))
+        })
+        .collect()
+}
+
+fn build_incremental_decode_job<F>(
+    codec_config: &[u8],
+    mut records: Vec<&HierarchicalRecordMeta>,
+    target_ids: &HashSet<u64>,
+    mut load_annex_b: F,
+) -> Result<IncrementalDecodeJob, String>
+where
+    F: FnMut(&HierarchicalRecordMeta) -> Result<Vec<u8>, String>,
+{
+    records.sort_unstable_by_key(|record| record.decode_ordinal);
+    let mut annex_b = Vec::new();
+    for record in &records {
+        annex_b.extend_from_slice(&load_annex_b(record)?);
+    }
+    let mut self_contained = Vec::with_capacity(codec_config.len() + annex_b.len());
+    self_contained.extend_from_slice(codec_config);
+    self_contained.extend_from_slice(&annex_b);
+    let (parsed_config, vcl_record, _) =
+        decoder::extract_closed_record_parts(&self_contained).map_err(|error| error.to_string())?;
+    let requested = requested_display_ordinals(records.clone(), target_ids);
+    if requested.is_empty() {
+        return Err("decode job does not contain a requested target".to_string());
+    }
+    Ok(IncrementalDecodeJob {
+        requested,
+        codec_config: parsed_config,
+        vcl_record,
+        access_units: records.len(),
+    })
 }
 
 enum IncrementalPipelineEvent {
@@ -880,6 +939,34 @@ impl IncrementalDecodePool {
                 completion,
             })
             .map_err(|_| "incremental decoder worker stopped early".to_string())
+    }
+
+    fn decode_all(
+        &self,
+        jobs: Vec<IncrementalDecodeJob>,
+        total_started: Instant,
+    ) -> Result<Vec<IncrementalDecodedJob>, String> {
+        let job_count = jobs.len();
+        let (sender, receiver) = mpsc::channel();
+        for job in jobs {
+            self.submit(job, total_started, sender.clone())?;
+        }
+        drop(sender);
+
+        let mut decoded = Vec::with_capacity(job_count);
+        while decoded.len() < job_count {
+            match receiver
+                .recv()
+                .map_err(|_| "parallel decoder workers stopped early".to_string())?
+            {
+                IncrementalPipelineEvent::Decoded(Ok((job, _))) => decoded.push(job),
+                IncrementalPipelineEvent::Decoded(Err(error)) => return Err(error),
+                IncrementalPipelineEvent::Range(_) | IncrementalPipelineEvent::FetchFinished(_) => {
+                    return Err("decode-only pool returned an unexpected I/O event".to_string())
+                }
+            }
+        }
+        Ok(decoded)
     }
 }
 
@@ -1127,9 +1214,6 @@ impl HierarchicalBatchExecutor {
             runtime_feedback_fixed16_fallback: false,
             max_merge_gap_bytes,
             max_range_bytes,
-            decoder_pool: DecoderPool::new(DecoderConfig {
-                num_threads: decoder_threads,
-            }),
             decoder_threads,
             cursor_decoder_threads: decoder_threads,
             decode_budget,
@@ -3039,52 +3123,37 @@ impl HierarchicalBatchExecutor {
                     if missing_target_ids.is_empty() {
                         continue;
                     }
-                    let records = task.records.iter().collect::<Vec<_>>();
                     let assemble_started = Instant::now();
-                    let mut annex_b = Vec::new();
-                    for record in &records {
-                        let indices = &record_ranges[&record.record_id];
-                        let record_fetch_ranges = indices
-                            .iter()
-                            .map(|index| ranges[*index])
-                            .collect::<Vec<_>>();
-                        let record_buffers = indices
-                            .iter()
-                            .map(|index| completed_buffers[*index].as_ref().unwrap().clone())
-                            .collect::<Vec<_>>();
-                        let sample =
-                            Self::extract_record(record, &record_fetch_ranges, &record_buffers)?;
-                        annex_b.extend_from_slice(&mp4_sample_to_annex_b(
-                            &sample,
-                            record.nal_length_size,
-                        )?);
-                    }
-                    let mut self_contained = Vec::with_capacity(codec_config.len() + annex_b.len());
-                    self_contained.extend_from_slice(codec_config);
-                    self_contained.extend_from_slice(&annex_b);
-                    let (parsed_config, vcl_record, _) =
-                        decoder::extract_closed_record_parts(&self_contained)
-                            .map_err(|error| error.to_string())?;
+                    let records = task.records.iter().collect::<Vec<_>>();
+                    let job = build_incremental_decode_job(
+                        codec_config,
+                        records,
+                        &missing_target_ids,
+                        |record| {
+                            let indices = &record_ranges[&record.record_id];
+                            let record_fetch_ranges = indices
+                                .iter()
+                                .map(|index| ranges[*index])
+                                .collect::<Vec<_>>();
+                            let record_buffers = indices
+                                .iter()
+                                .map(|index| {
+                                    completed_buffers[*index]
+                                        .as_ref()
+                                        .expect("ready decode task has all range buffers")
+                                        .clone()
+                                })
+                                .collect::<Vec<_>>();
+                            let sample = Self::extract_record(
+                                record,
+                                &record_fetch_ranges,
+                                &record_buffers,
+                            )?;
+                            mp4_sample_to_annex_b(&sample, record.nal_length_size)
+                        },
+                    )?;
                     assemble_ns += assemble_started.elapsed().as_nanos() as u64;
-
-                    let mut display_records = records;
-                    display_records.sort_unstable_by_key(|record| record.frame_idx);
-                    let requested = display_records
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(ordinal, record)| {
-                            missing_target_ids
-                                .contains(&record.record_id)
-                                .then_some((record.record_id, ordinal))
-                        })
-                        .collect::<Vec<_>>();
                     claimed_target_ids.extend(missing_target_ids);
-                    let job = IncrementalDecodeJob {
-                        requested,
-                        codec_config: parsed_config,
-                        vcl_record,
-                        access_units: display_records.len(),
-                    };
                     if let Err(error) =
                         incremental_decode_pool.submit(job, total_started, event_sender.clone())
                     {
@@ -3737,7 +3806,6 @@ impl HierarchicalBatchExecutor {
         }
         let assemble_ns = assemble_started.elapsed().as_nanos() as u64;
 
-        let _decode_permit = self.decode_budget.acquire(self.decoder_threads)?;
         let decode_started = Instant::now();
         let mut groups = HashMap::<(String, u64), Vec<&HierarchicalRecordMeta>>::new();
         for record_id in &selected_ids {
@@ -3747,47 +3815,36 @@ impl HierarchicalBatchExecutor {
                 .or_default()
                 .push(record);
         }
-        let mut decoded = HashMap::<u64, DecodedRgbFrame>::new();
-        for ((video_id, gop_id), mut records) in groups {
-            records.sort_unstable_by_key(|record| record.decode_ordinal);
-            let mut annex_b = Vec::new();
-            for record in &records {
-                annex_b.extend_from_slice(&encoded_records[&record.record_id]);
-            }
-            let mut self_contained = Vec::with_capacity(self.codec_config.len() + annex_b.len());
-            self_contained.extend_from_slice(&self.codec_config);
-            self_contained.extend_from_slice(&annex_b);
-            let (codec_config, vcl_record, _) =
-                decoder::extract_closed_record_parts(&self_contained)
-                    .map_err(|error| error.to_string())?;
-            let mut display_records = records.clone();
-            display_records.sort_unstable_by_key(|record| record.frame_idx);
-            let group_targets = target_records
-                .iter()
-                .filter(|target| target.video_id == video_id && target.gop_id == gop_id)
-                .map(|target| target.record_id)
-                .collect::<HashSet<_>>();
-            let requested = display_records
-                .iter()
-                .enumerate()
-                .filter_map(|(ordinal, record)| {
-                    group_targets
-                        .contains(&record.record_id)
-                        .then_some((record.record_id, ordinal))
+        let targets_by_group = target_records.iter().fold(
+            HashMap::<(String, u64), HashSet<u64>>::new(),
+            |mut grouped, target| {
+                grouped
+                    .entry((target.video_id.clone(), target.gop_id))
+                    .or_default()
+                    .insert(target.record_id);
+                grouped
+            },
+        );
+        let jobs = groups
+            .into_iter()
+            .map(|(key, records)| {
+                let group_targets = targets_by_group
+                    .get(&key)
+                    .ok_or_else(|| format!("decode group {:?} has no logical targets", key))?;
+                build_incremental_decode_job(&self.codec_config, records, group_targets, |record| {
+                    encoded_records
+                        .get(&record.record_id)
+                        .cloned()
+                        .ok_or_else(|| format!("missing encoded record {}", record.record_id))
                 })
-                .collect::<Vec<_>>();
-            let ordinals = requested
-                .iter()
-                .map(|(_, ordinal)| *ordinal)
-                .collect::<Vec<_>>();
-            let frames = decoder::decode_full_gop_selected_rgb24(
-                &codec_config,
-                &vcl_record,
-                &mut self.decoder_pool,
-                &ordinals,
-            )
-            .map_err(|error| error.to_string())?;
-            for ((record_id, _), frame) in requested.into_iter().zip(frames) {
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let decoded_jobs = self
+            .incremental_decode_pool
+            .decode_all(jobs, total_started)?;
+        let mut decoded = HashMap::<u64, DecodedRgbFrame>::new();
+        for job in decoded_jobs {
+            for (record_id, frame) in job.frames {
                 decoded.insert(record_id, frame);
             }
         }
