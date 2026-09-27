@@ -73,8 +73,6 @@ jobs:
     name: Rust unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,16 +88,18 @@ jobs:
             . -> target
             object-store-transport -> target
       - name: Test core and public Rust API
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --locked --features ffmpeg --lib --test rust_session_api
       - name: Test transport validation and accounting
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: cargo test --locked --manifest-path object-store-transport/Cargo.toml --lib
 
   python-unit-tests:
     name: Python unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -119,4 +119,6 @@ jobs:
           maturin build --locked --features ffmpeg --profile dev --compatibility linux --interpreter python --out "$RUNNER_TEMP/wheels"
           python -m pip install --no-deps "$RUNNER_TEMP"/wheels/*.whl
       - name: Run Python unit tests with temporary local storage
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: python -m pytest --basetemp "$RUNNER_TEMP/pytest"
