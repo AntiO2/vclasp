@@ -35,13 +35,13 @@ jobs:
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
           rustup default "$RUST_TOOLCHAIN"
-          python -m pip install -r requirements-dev.txt
+          python -m pip install -c requirements-dev.txt ruff
       - name: Check Rust formatting
         run: |
           cargo fmt --all --check
           cargo fmt --manifest-path object-store-transport/Cargo.toml --all --check
       - name: Check Python formatting
-        run: python -m ruff format --check tests examples
+        run: python -m ruff format --check tests examples scripts/ci
 
   build:
     name: Build
@@ -57,47 +57,48 @@ jobs:
       - uses: ./.github/actions/setup-native
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: build
-          workspaces: |
-            . -> target
-            object-store-transport -> target
-      - name: Build default and codec APIs
-        run: |
-          cargo build --locked
-          cargo build --locked --features ffmpeg --lib --examples
-          cargo build --locked --manifest-path object-store-transport/Cargo.toml
-      - name: Compile experiment controls
-        run: cargo check --locked --features experiment-controls --all-targets
+          key: unit-test-build
+      - name: Compile Rust tests and Python extension
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          PYO3_PYTHON: python
+        run: python scripts/ci/build_tests.py --output "$RUNNER_TEMP/test-build"
+      - name: Publish compiled test artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unit-test-artifacts
+          path: ${{ runner.temp }}/test-build/unit-test-artifacts.tar
+          if-no-files-found: error
+          retention-days: 3
 
   rust-unit-tests:
     name: Rust unit tests
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.12"
       - uses: ./.github/actions/setup-native
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: rust-unit-tests
-          workspaces: |
-            . -> target
-            object-store-transport -> target
-      - name: Test core and public Rust API
+          runtime-only: "true"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unit-test-artifacts
+          path: ${{ runner.temp }}/test-build
+      - name: Run prebuilt Rust tests
         env:
           TMPDIR: ${{ runner.temp }}
-        run: cargo test --locked --features ffmpeg --lib --test rust_session_api
-      - name: Test transport validation and accounting
-        env:
-          TMPDIR: ${{ runner.temp }}
-        run: cargo test --locked --manifest-path object-store-transport/Cargo.toml --lib
+        run: |
+          tar -xf "$RUNNER_TEMP/test-build/unit-test-artifacts.tar" -C "$RUNNER_TEMP/test-build"
+          "$RUNNER_TEMP/test-build/rust-tests/vclasp"
+          "$RUNNER_TEMP/test-build/rust-tests/rust_session_api"
+          "$RUNNER_TEMP/test-build/rust-tests/vclasp_object_store"
 
   python-unit-tests:
     name: Python unit tests
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -110,15 +111,18 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
       - uses: ./.github/actions/setup-native
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: python-unit-tests
-      - name: Build and install this checkout
+          runtime-only: "true"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unit-test-artifacts
+          path: ${{ runner.temp }}/test-build
+      - name: Prepare prebuilt Python extension
         run: |
-          python -m pip install -r requirements-dev.txt
-          maturin build --locked --features ffmpeg --profile dev --compatibility linux --interpreter python --out "$RUNNER_TEMP/wheels"
-          python -m pip install --no-deps "$RUNNER_TEMP"/wheels/*.whl
+          python -m pip install -c requirements-dev.txt pytest
+          tar -xf "$RUNNER_TEMP/test-build/unit-test-artifacts.tar" -C "$RUNNER_TEMP/test-build"
       - name: Run Python unit tests with temporary local storage
         env:
           TMPDIR: ${{ runner.temp }}
+          PYTHONPATH: ${{ runner.temp }}/test-build/python
         run: python -m pytest --basetemp "$RUNNER_TEMP/pytest"
