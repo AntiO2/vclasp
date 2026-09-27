@@ -42,6 +42,12 @@ branch or fork. Keep each pull request focused on one change and use an
 existing checkout when practical. Additional worktrees are optional, not a
 requirement of this project.
 
+Only **Squash and merge** is allowed. Merge commits and rebase merges are
+disabled in repository settings. Do not merge PRs automatically or bypass branch
+protection. After a PR is squash-merged, fetch `origin/main` and start the next
+PR branch from that revision; do not keep pushing follow-up work to the merged
+PR branch. Check the remote PR state before every submission.
+
 Describe the problem, the resulting behavior, and the checks you ran. Call out
 any public API or file-format change, including whether existing chunks must
 be rebuilt. Preserve unrelated work in the working tree.
