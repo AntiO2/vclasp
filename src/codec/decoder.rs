@@ -8,7 +8,7 @@ use ffmpeg_next as ffmpeg;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Configuration for the FFmpeg decoder.
 ///
@@ -104,15 +104,73 @@ impl DecoderPool {
 
 pub(crate) type SharedDecoderSlots = Arc<Vec<Mutex<DecoderPool>>>;
 
+pub(crate) struct DecodeBudget {
+    capacity: usize,
+    available: Mutex<usize>,
+    wake: Condvar,
+}
+
+pub(crate) struct DecodePermit {
+    budget: Arc<DecodeBudget>,
+    units: usize,
+}
+
+impl DecodeBudget {
+    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+        assert!(capacity > 0, "decode budget must be positive");
+        Arc::new(Self {
+            capacity,
+            available: Mutex::new(capacity),
+            wake: Condvar::new(),
+        })
+    }
+
+    pub(crate) fn acquire(self: &Arc<Self>, units: usize) -> Result<DecodePermit, String> {
+        if units == 0 || units > self.capacity {
+            return Err(format!(
+                "decode request of {units} threads exceeds budget {}",
+                self.capacity
+            ));
+        }
+        let mut available = self
+            .available
+            .lock()
+            .map_err(|_| "decode budget lock poisoned".to_string())?;
+        while *available < units {
+            available = self
+                .wake
+                .wait(available)
+                .map_err(|_| "decode budget lock poisoned".to_string())?;
+        }
+        *available -= units;
+        Ok(DecodePermit {
+            budget: Arc::clone(self),
+            units,
+        })
+    }
+}
+
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        if let Ok(mut available) = self.budget.available.lock() {
+            *available += self.units;
+            debug_assert!(*available <= self.budget.capacity);
+            self.budget.wake.notify_all();
+        }
+    }
+}
+
 pub(crate) fn shared_decoder_slots(concurrency: usize) -> SharedDecoderSlots {
+    shared_decoder_slots_with_threads(concurrency, 1)
+}
+
+pub(crate) fn shared_decoder_slots_with_threads(
+    concurrency: usize,
+    num_threads: usize,
+) -> SharedDecoderSlots {
     Arc::new(
         (0..concurrency.max(1))
-            .map(|_| {
-                Mutex::new(DecoderPool::with_capacity(
-                    DecoderConfig { num_threads: 1 },
-                    1,
-                ))
-            })
+            .map(|_| Mutex::new(DecoderPool::with_capacity(DecoderConfig { num_threads }, 1)))
             .collect(),
     )
 }
@@ -351,8 +409,17 @@ pub fn decode_mp4_selected_rgb24(
 /// Persistent decoder state for monotonic reads from one immutable compact
 /// Prefix stream. Returned frames are removed immediately; only codec-delayed
 /// frames remain buffered, so this is decoder state rather than an RGB cache.
+struct ReusableScaler(ffmpeg::software::scaling::context::Context);
+
+// libswscale contexts have no thread affinity. PrefixCursor owns this context
+// exclusively and every caller serializes mutable cursor access, so moving the
+// context between executor threads cannot create concurrent C API calls.
+unsafe impl Send for ReusableScaler {}
+
+#[cfg(feature = "experiment-controls")]
 pub struct PrefixCursor {
     decoder: ffmpeg::codec::decoder::Video,
+    scaler: Option<ReusableScaler>,
     stream_key: u64,
     next_packet: usize,
     next_output: usize,
@@ -360,6 +427,7 @@ pub struct PrefixCursor {
     ended: bool,
 }
 
+#[cfg(feature = "experiment-controls")]
 impl PrefixCursor {
     pub fn new(
         sps_pps: &[u8],
@@ -369,6 +437,7 @@ impl PrefixCursor {
         ffmpeg::init()?;
         Ok(Self {
             decoder: create_decoder(&config)?,
+            scaler: None,
             stream_key: prefix_stream_key(sps_pps, record),
             next_packet: 0,
             next_output: 0,
@@ -384,6 +453,7 @@ impl PrefixCursor {
         config: DecoderConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.decoder = create_decoder(&config)?;
+        self.scaler = None;
         self.stream_key = prefix_stream_key(sps_pps, record);
         self.next_packet = 0;
         self.next_output = 0;
@@ -392,17 +462,17 @@ impl PrefixCursor {
         Ok(())
     }
 
-    fn drain(
-        &mut self,
-        scaler: &mut Option<ffmpeg::software::scaling::context::Context>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn drain(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let mut frame = ffmpeg::util::frame::video::Video::empty();
             if self.decoder.receive_frame(&mut frame).is_err() {
                 break;
             }
             let mut converted = Vec::with_capacity(1);
-            store_one(scaler, &frame, &mut converted)?;
+            let mut scaler = self.scaler.take().map(|scaler| scaler.0);
+            let result = store_one(&mut scaler, &frame, &mut converted);
+            self.scaler = scaler.map(ReusableScaler);
+            result?;
             self.pending.insert(
                 self.next_output,
                 converted.pop().expect("store_one emits one frame"),
@@ -439,8 +509,6 @@ impl PrefixCursor {
         if must_reset {
             self.reset(sps_pps, record, DecoderConfig { num_threads: 1 })?;
         }
-        let mut scaler = None;
-
         while ordinals
             .iter()
             .any(|ordinal| !self.pending.contains_key(ordinal))
@@ -461,7 +529,7 @@ impl PrefixCursor {
                         Ok(()) => break,
                         Err(_) => {
                             let before = self.next_output;
-                            self.drain(&mut scaler)?;
+                            self.drain()?;
                             if self.next_output == before {
                                 self.decoder.send_packet(&packet)?;
                                 break;
@@ -470,11 +538,11 @@ impl PrefixCursor {
                     }
                 }
                 self.next_packet += 1;
-                self.drain(&mut scaler)?;
+                self.drain()?;
             } else if !self.ended {
                 self.decoder.send_eof()?;
                 self.ended = true;
-                self.drain(&mut scaler)?;
+                self.drain()?;
             } else {
                 return Err("Prefix cursor ended before all requested frames were decoded".into());
             }
@@ -510,6 +578,161 @@ impl PrefixCursor {
     }
 }
 
+/// Decoder/DPB state for a monotonically advancing GOP stream.
+///
+/// Unlike `PrefixCursor`, this cursor does not retain the encoded GOP. The
+/// caller appends newly fetched access units in decode order and may release
+/// those bytes immediately after this call. Frames emitted ahead of their
+/// request remain pending only for this live GOP cursor; they are not admitted
+/// to the shared decoded-frame cache.
+pub struct MonotonicGopCursor {
+    decoder: ffmpeg::codec::decoder::Video,
+    decoder_threads: usize,
+    scaler: Option<ReusableScaler>,
+    next_decode_ordinal: usize,
+    next_output_ordinal: usize,
+    pending: BTreeMap<usize, DecodedRgbFrame>,
+    ended: bool,
+}
+
+impl MonotonicGopCursor {
+    pub fn new(config: DecoderConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        ffmpeg::init()?;
+        Ok(Self {
+            decoder: create_decoder(&config)?,
+            decoder_threads: config.num_threads,
+            scaler: None,
+            next_decode_ordinal: 0,
+            next_output_ordinal: 0,
+            pending: BTreeMap::new(),
+            ended: false,
+        })
+    }
+
+    pub fn next_decode_ordinal(&self) -> usize {
+        self.next_decode_ordinal
+    }
+
+    pub fn decoder_threads(&self) -> usize {
+        self.decoder_threads
+    }
+
+    pub fn next_output_ordinal(&self) -> usize {
+        self.next_output_ordinal
+    }
+
+    pub fn can_serve(&self, target_output_ordinals: &[usize]) -> bool {
+        target_output_ordinals.iter().all(|ordinal| {
+            self.pending.contains_key(ordinal)
+                || (!self.ended && *ordinal >= self.next_output_ordinal)
+        })
+    }
+
+    fn drain_requested(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            let mut frame = ffmpeg::util::frame::video::Video::empty();
+            if self.decoder.receive_frame(&mut frame).is_err() {
+                break;
+            }
+            let output_ordinal = self.next_output_ordinal;
+            self.next_output_ordinal += 1;
+            let mut converted = Vec::with_capacity(1);
+            let mut scaler = self.scaler.take().map(|scaler| scaler.0);
+            let result = store_one(&mut scaler, &frame, &mut converted);
+            self.scaler = scaler.map(ReusableScaler);
+            result?;
+            self.pending.insert(
+                output_ordinal,
+                converted.pop().expect("store_one emits one frame"),
+            );
+        }
+        Ok(())
+    }
+
+    /// Decode a contiguous extension beginning at the cursor's next packet.
+    /// Returns requested frames in caller order.
+    pub fn decode_extension(
+        &mut self,
+        sps_pps: &[u8],
+        start_decode_ordinal: usize,
+        access_units: &[Vec<u8>],
+        target_output_ordinals: &[usize],
+        end_of_stream: bool,
+    ) -> Result<Vec<DecodedRgbFrame>, Box<dyn std::error::Error>> {
+        if self.ended
+            && target_output_ordinals
+                .iter()
+                .any(|ordinal| !self.pending.contains_key(ordinal))
+        {
+            return Err("monotonic GOP cursor has already ended".into());
+        }
+        if start_decode_ordinal != self.next_decode_ordinal {
+            return Err(format!(
+                "GOP extension starts at decode ordinal {start_decode_ordinal}, expected {}",
+                self.next_decode_ordinal
+            )
+            .into());
+        }
+        if !self.can_serve(target_output_ordinals) {
+            return Err("monotonic GOP cursor cannot serve a backward target".into());
+        }
+        for access_unit in access_units {
+            let packet_data = if self.next_decode_ordinal == 0 {
+                let mut data = Vec::with_capacity(sps_pps.len() + access_unit.len());
+                data.extend_from_slice(sps_pps);
+                data.extend_from_slice(access_unit);
+                data
+            } else {
+                access_unit.clone()
+            };
+            let packet = ffmpeg::Packet::copy(&packet_data);
+            loop {
+                match self.decoder.send_packet(&packet) {
+                    Ok(()) => break,
+                    Err(_) => {
+                        let before = self.next_output_ordinal;
+                        self.drain_requested()?;
+                        if self.next_output_ordinal == before {
+                            self.decoder.send_packet(&packet)?;
+                            break;
+                        }
+                    }
+                }
+            }
+            self.next_decode_ordinal += 1;
+        }
+        // Keep several packets in flight so libavcodec frame threading can
+        // overlap reference-frame work. Draining after every successful send
+        // serializes the decoder and defeats num_threads > 1; EAGAIN handling
+        // above still provides backpressure when the packet queue is full.
+        self.drain_requested()?;
+
+        if target_output_ordinals
+            .iter()
+            .any(|ordinal| !self.pending.contains_key(ordinal))
+            && end_of_stream
+        {
+            self.decoder.send_eof()?;
+            self.ended = true;
+            self.drain_requested()?;
+        }
+
+        target_output_ordinals
+            .iter()
+            .map(|ordinal| {
+                self.pending.remove(ordinal).ok_or_else(|| {
+                    format!(
+                        "GOP extension ended before requested output ordinal {ordinal}; next decode/output ordinals are {}/{}",
+                        self.next_decode_ordinal, self.next_output_ordinal
+                    )
+                    .into()
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(feature = "experiment-controls")]
 fn prefix_stream_key(sps_pps: &[u8], record: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     sps_pps.hash(&mut hasher);
@@ -529,7 +752,9 @@ fn prefix_stream_key(sps_pps: &[u8], record: &[u8]) -> u64 {
 /// SPS/PPS + record bytes
 /// ```
 ///
-/// The record must contain every byte required by a standard decoder.
+/// This is intended for legacy Tier 0 / Tier 1-IDR records first. Tier 1-GOP and
+/// Tier 2 decode groups can use the same function when the record contains all
+/// bytes needed by a standard decoder.
 pub fn decode_h264_annex_b_rgb24(
     data: &[u8],
     pool: &mut DecoderPool,
@@ -1275,6 +1500,66 @@ fn frame_to_rgb24(rgb: &ffmpeg::util::frame::video::Video) -> DecodedRgbFrame {
 
 #[cfg(all(test, feature = "ffmpeg"))]
 mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn weighted_decode_budget_blocks_until_capacity_is_released() {
+        let budget = DecodeBudget::new(2);
+        let held = budget.acquire(2).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let waiter_budget = Arc::clone(&budget);
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _permit = waiter_budget.acquire(1).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(held);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn live_cursor_and_shared_slots_preserve_requested_decoder_threads() {
+        let cursor = MonotonicGopCursor::new(DecoderConfig { num_threads: 2 }).unwrap();
+        assert_eq!(cursor.decoder_threads(), 2);
+
+        let slots = shared_decoder_slots_with_threads(3, 2);
+        assert_eq!(slots.len(), 3);
+        assert!(slots
+            .iter()
+            .all(|slot| slot.lock().unwrap().config.num_threads == 2));
+    }
+
+    #[test]
+    fn ended_cursor_serves_frames_already_emitted_into_pending_output() {
+        let mut cursor = MonotonicGopCursor::new(DecoderConfig { num_threads: 1 }).unwrap();
+        cursor.ended = true;
+        cursor.pending.insert(
+            3,
+            DecodedRgbFrame {
+                data: vec![1, 2, 3],
+                width: 1,
+                height: 1,
+            },
+        );
+
+        assert!(cursor.can_serve(&[3]));
+        assert!(!cursor.can_serve(&[4]));
+        let frames = cursor
+            .decode_extension(&[], 0, &[], &[3], true)
+            .expect("ended cursor should return its pending output");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data, vec![1, 2, 3]);
+        assert!(cursor.decode_extension(&[], 0, &[], &[4], true).is_err());
+    }
+
     use super::*;
     use crate::chunk::ChunkReader;
     use crate::encoder::X264Encoder;
@@ -1293,7 +1578,7 @@ mod tests {
 
     /// Stage-level decode microbenchmark.
     ///
-    /// Times each phase of the GOP batch decode pipeline to identify where
+    /// Times each phase of the legacy GOP batch decode pipeline to identify where
     /// the ~4.8× performance gap vs. decord originates:
     ///   1. NAL splitting + SPS/PPS prepend
     ///   2. decoder flush (pool get_or_create)
@@ -1898,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "fixture predates the corrected monotonic-PTS Anchor-P encoder"]
+    #[ignore = "legacy fixture predates the corrected monotonic-PTS Anchor-P encoder"]
     fn test_anchor_p_target_decodes_without_intermediate_p_frames() {
         let fixture = std::env::var("VCLASP_ANCHOR_P_TEST_CHUNK")
             .expect("VCLASP_ANCHOR_P_TEST_CHUNK is required");

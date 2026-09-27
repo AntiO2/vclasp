@@ -8,7 +8,22 @@ version = "0.1.0"
 description = "Codec-closure planning and selective video decode for object storage"
 requires-python = ">=3.9"
 readme = "README.md"
+license = "AGPL-3.0-only"
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+]
 
 [tool.maturin]
 features = ["ffmpeg"]
 module-name = "vclasp"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not integration'"
+markers = [
+    "integration: requires external datasets, services, or experimental readers",
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 88

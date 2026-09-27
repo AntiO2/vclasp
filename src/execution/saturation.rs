@@ -8,13 +8,13 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use crate::backend;
+use crate::controls::closed_record;
+use crate::controls::normalized;
 use crate::decoder;
 use crate::fragment_scheduler;
-use crate::normalized_scheduler;
-use crate::pair_scheduler;
 use crate::representation;
 
-#[pyclass(name = "SharedS3ObjectStream")]
+#[pyclass]
 pub struct PySharedS3ObjectStream {
     inner: backend::S3ObjectStream,
 }
@@ -33,7 +33,7 @@ impl PySharedS3ObjectStream {
     }
 }
 
-#[pyclass(name = "SharedS3ExecutionResources")]
+#[pyclass]
 pub struct PySharedS3ExecutionResources {
     client: backend::S3ObjectStoreClient,
     decoder_slots: decoder::SharedDecoderSlots,
@@ -43,7 +43,7 @@ pub struct PySharedS3ExecutionResources {
     decode_concurrency: usize,
 }
 
-#[pyclass(name = "SharedAIStoreExecutionResources")]
+#[pyclass]
 pub struct PySharedAIStoreExecutionResources {
     client: backend::SharedAIStoreGetBatchClient,
     decoder_slots: decoder::SharedDecoderSlots,
@@ -239,15 +239,15 @@ impl PySharedS3ExecutionResources {
     }
 }
 
-#[pyclass(name = "SharedAnchorDeltaBatchExecutor")]
+#[pyclass]
 pub struct PySharedNormalizedBatchExecutor {
-    inner: normalized_scheduler::NormalizedBatchExecutor,
+    inner: normalized::NormalizedBatchExecutor,
     dependency_group_spans: bool,
 }
 
-#[pyclass(name = "SharedAIStoreAnchorDeltaBatchExecutor")]
+#[pyclass]
 pub struct PySharedAIStoreNormalizedBatchExecutor {
-    inner: normalized_scheduler::NormalizedBatchExecutor,
+    inner: normalized::NormalizedBatchExecutor,
     dependency_group_spans: bool,
 }
 
@@ -294,7 +294,7 @@ impl PySharedAIStoreNormalizedBatchExecutor {
                 .map_err(|error| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
                 })?;
-        let mut inner = normalized_scheduler::NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
+        let mut inner = normalized::NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
             descriptors,
             Box::new(backend),
             merge_threshold_bytes,
@@ -424,7 +424,7 @@ impl PySharedNormalizedBatchExecutor {
             .map_err(|error| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
             })?;
-        let mut inner = normalized_scheduler::NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
+        let mut inner = normalized::NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
             descriptors,
             Box::new(backend),
             merge_threshold_bytes,
@@ -514,9 +514,9 @@ impl PySharedNormalizedBatchExecutor {
     }
 }
 
-#[pyclass(name = "SharedPrefixBatchExecutor")]
+#[pyclass]
 pub struct PySharedPrefixBatchExecutor {
-    inner: pair_scheduler::ClosedRecordBatchExecutor,
+    inner: closed_record::ClosedRecordBatchExecutor,
 }
 
 #[pymethods]
@@ -541,7 +541,7 @@ impl PySharedPrefixBatchExecutor {
         let descriptors = descriptors
             .into_iter()
             .map(|(sample_id, video_id, target_ordinal, offset, length)| {
-                pair_scheduler::ClosedRecordDescriptor {
+                closed_record::ClosedRecordDescriptor {
                     sample_id,
                     video_id,
                     offset,
@@ -554,7 +554,7 @@ impl PySharedPrefixBatchExecutor {
             .map_err(|error| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error.to_string())
             })?;
-        let inner = pair_scheduler::ClosedRecordBatchExecutor::new_with_decoder_slots(
+        let inner = closed_record::ClosedRecordBatchExecutor::new_with_decoder_slots(
             descriptors,
             representation::Representation::Prefix,
             Box::new(backend),
@@ -598,7 +598,7 @@ impl PySharedPrefixBatchExecutor {
     }
 }
 
-#[pyclass(name = "SharedS3FragmentBatchExecutor")]
+#[pyclass]
 pub struct PySharedS3FragmentBatchExecutor {
     inner: fragment_scheduler::FragmentBatchExecutor,
 }
@@ -795,7 +795,7 @@ impl PySharedS3FragmentBatchExecutor {
     }
 }
 
-#[pyclass(name = "SharedAIStoreFragmentBatchExecutor")]
+#[pyclass]
 pub struct PySharedAIStoreFragmentBatchExecutor {
     inner: fragment_scheduler::FragmentBatchExecutor,
 }

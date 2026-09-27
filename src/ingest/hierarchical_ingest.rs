@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::io::BufReader;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -13,11 +15,18 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 
-use crate::builder::VideoInput;
 use crate::chunk::{self, ChunkWriteConfig};
+use crate::encoder::{X264Encoder, MAX_ANCHOR_P_GROUP_FRAMES};
 use crate::hierarchical_layout::{
-    AccessUnitRecord, GopRegion, HierarchicalLayoutIndex, TargetClosure,
+    AccessUnitRecord, GopRegion, HierarchicalLayoutIndex, RegionDecodeMode, TargetClosure,
 };
+
+#[derive(Debug, Clone)]
+pub struct VideoInput {
+    pub video_id: String,
+    pub class_name: String,
+    pub source_path: PathBuf,
+}
 
 #[derive(Debug, Clone)]
 pub struct HierarchicalBuildOptions {
@@ -32,10 +41,116 @@ pub struct HierarchicalBuildOptions {
     pub fps: u16,
     pub crf: u8,
     pub preset: String,
+    pub workers: usize,
+    pub dependency_policy: DependencyPolicy,
+    pub hierarchical_b: HierarchicalBConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyPolicy {
+    HierarchicalB,
+    ChainedP,
+    SharedAnchor,
+}
+
+impl DependencyPolicy {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "hierarchical_b" => Ok(Self::HierarchicalB),
+            "chained_p" => Ok(Self::ChainedP),
+            "shared_anchor" => Ok(Self::SharedAnchor),
+            _ => Err(format!(
+                "unknown dependency policy {value}; expected hierarchical_b|chained_p|shared_anchor"
+            )),
+        }
+    }
+
+    fn dependency_kind(self) -> &'static str {
+        match self {
+            Self::HierarchicalB => "hierarchical_b_closure",
+            Self::ChainedP => "chained_p_closure",
+            Self::SharedAnchor => "shared_anchor_closure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BFramePyramid {
+    None,
+    Strict,
+}
+
+impl BFramePyramid {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "none" => Ok(Self::None),
+            "strict" => Ok(Self::Strict),
+            _ => Err(format!(
+                "unknown B-frame pyramid {value}; expected none|strict"
+            )),
+        }
+    }
+
+    fn x264_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HierarchicalBConfig {
+    pub max_b_frames: u8,
+    pub pyramid: BFramePyramid,
+    pub adaptive: u8,
+    pub lookahead: u16,
+    pub reference_frames: u8,
+}
+
+impl Default for HierarchicalBConfig {
+    fn default() -> Self {
+        Self {
+            max_b_frames: 7,
+            pyramid: BFramePyramid::Strict,
+            adaptive: 0,
+            lookahead: 0,
+            reference_frames: 1,
+        }
+    }
+}
+
+impl HierarchicalBConfig {
+    fn validate(self, gop_size: u32) -> Result<(), String> {
+        if self.max_b_frames > 16 {
+            return Err("hierarchical-B max_b_frames must be at most 16".to_string());
+        }
+        if u32::from(self.max_b_frames) >= gop_size {
+            return Err(format!(
+                "hierarchical-B max_b_frames {} must be smaller than gop_size {gop_size}",
+                self.max_b_frames
+            ));
+        }
+        if self.adaptive > 2 {
+            return Err("hierarchical-B adaptive mode must be 0, 1, or 2".to_string());
+        }
+        if self.adaptive > 0 && self.lookahead < u16::from(self.max_b_frames).saturating_add(1) {
+            return Err(format!(
+                "hierarchical-B adaptive mode {} requires lookahead >= {}",
+                self.adaptive,
+                u16::from(self.max_b_frames).saturating_add(1)
+            ));
+        }
+        if self.reference_frames == 0 || self.reference_frames > 16 {
+            return Err("hierarchical-B reference_frames must be in 1..=16".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct HierarchicalBuildStats {
+    pub workers: usize,
     pub videos: usize,
     pub records: usize,
     pub targets: usize,
@@ -43,6 +158,22 @@ pub struct HierarchicalBuildStats {
     pub index_bytes: u64,
     pub chunk_bytes: u64,
     pub max_closure_records: usize,
+    pub mean_closure_records: f64,
+    pub median_closure_records: f64,
+    pub p95_closure_records: f64,
+    pub gops: usize,
+    pub i_frames: usize,
+    pub p_frames: usize,
+    pub b_frames: usize,
+    pub max_b_run: usize,
+    pub total_seconds: f64,
+    pub encode_seconds: f64,
+    pub au_parse_seconds: f64,
+    pub closure_construction_seconds: f64,
+    pub closure_validation_seconds: f64,
+    pub payload_copy_seconds: f64,
+    pub index_serialization_seconds: f64,
+    pub chunk_write_seconds: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +182,8 @@ pub struct HierarchicalRecordMeta {
     pub video_id: String,
     pub frame_idx: i32,
     pub gop_id: u64,
+    pub pts: i64,
+    pub dts: i64,
     pub offset: u64,
     pub length: u64,
     pub decode_ordinal: usize,
@@ -67,6 +200,32 @@ pub struct HierarchicalCatalog {
 }
 
 impl HierarchicalCatalog {
+    #[cfg(test)]
+    pub(crate) fn from_records_for_test(records: Vec<HierarchicalRecordMeta>) -> Self {
+        let mut by_id = HashMap::with_capacity(records.len());
+        let mut targets = HashMap::with_capacity(records.len());
+        let mut gop_records = HashMap::<(String, u64), Vec<u64>>::new();
+        for record in records {
+            targets.insert(
+                (record.video_id.clone(), record.frame_idx),
+                record.record_id,
+            );
+            gop_records
+                .entry((record.video_id.clone(), record.gop_id))
+                .or_default()
+                .push(record.record_id);
+            by_id.insert(record.record_id, record);
+        }
+        for record_ids in gop_records.values_mut() {
+            record_ids.sort_unstable_by_key(|record_id| by_id[record_id].decode_ordinal);
+        }
+        Self {
+            records: by_id,
+            targets,
+            gop_records,
+        }
+    }
+
     pub fn from_parquet(data: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         let reader =
             ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(data))?.build()?;
@@ -93,6 +252,8 @@ impl HierarchicalCatalog {
         let offsets = column!("record_offset", Int64Array);
         let lengths = column!("record_length", Int64Array);
         let packet_indices = column!("packet_index", Int32Array);
+        let presentation_timestamps = column!("pts", Int64Array);
+        let decode_timestamps = column!("dts", Int64Array);
         let closure_ids = column!("closure_record_ids", BinaryArray);
         let output_ordinals = column!("target_output_ordinal", Int32Array);
         let nal_length_sizes = column!("nal_length_size", Int32Array);
@@ -138,6 +299,8 @@ impl HierarchicalCatalog {
                     .value(row)
                     .try_into()
                     .map_err(|_| format!("negative GOP id at row {row}"))?,
+                pts: presentation_timestamps.value(row),
+                dts: decode_timestamps.value(row),
                 offset: parse_non_negative(offsets.value(row), "record_offset")?,
                 length: parse_non_negative(lengths.value(row), "record_length")?,
                 decode_ordinal: packet_indices
@@ -195,6 +358,14 @@ impl HierarchicalCatalog {
         }
         for record_ids in gop_records.values_mut() {
             record_ids.sort_unstable_by_key(|record_id| records[record_id].decode_ordinal);
+            if record_ids
+                .windows(2)
+                .any(|pair| records[&pair[0]].dts >= records[&pair[1]].dts)
+            {
+                return Err(
+                    "hierarchical GOP decode timestamps are not strictly increasing".into(),
+                );
+            }
         }
         Ok(Self {
             records,
@@ -286,7 +457,12 @@ impl HierarchicalCatalog {
                 record_ids: group.iter().map(|record| record.record_id).collect(),
             });
         }
-        HierarchicalLayoutIndex::new(records, closures, regions)
+        HierarchicalLayoutIndex::new_with_region_decode_mode(
+            records,
+            closures,
+            regions,
+            RegionDecodeMode::ClosureOnly,
+        )
     }
 }
 
@@ -330,6 +506,55 @@ struct PacketMeta {
 struct FrameMeta {
     pts: i64,
     frame_type: String,
+}
+
+#[derive(Debug)]
+struct ProbedVideo {
+    config: Vec<u8>,
+    nal_length_size: usize,
+    packets: Vec<PacketMeta>,
+    pts_to_ordinal: HashMap<i64, usize>,
+    packet_indices: Vec<usize>,
+    frame_types: Vec<String>,
+}
+
+fn parallel_map<T, F>(items: usize, workers: usize, operation: F) -> Result<Vec<T>, String>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T, String> + Sync,
+{
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(
+        (0..items)
+            .map(|_| None)
+            .collect::<Vec<Option<Result<T, String>>>>(),
+    );
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(items).max(1) {
+            let operation = &operation;
+            let next = &next;
+            let results = &results;
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= items {
+                    break;
+                }
+                results.lock().expect("parallel result mutex poisoned")[index] =
+                    Some(operation(index));
+            });
+        }
+    });
+    results
+        .into_inner()
+        .map_err(|_| "parallel result mutex poisoned".to_string())?
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result
+                .ok_or_else(|| format!("parallel worker did not produce item {index}"))?
+                .map_err(|error| format!("item {index}: {error}"))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -550,7 +775,12 @@ fn encode_video(
     output: &Path,
     options: &HierarchicalBuildOptions,
 ) -> Result<(), String> {
-    let x264_params = "b-pyramid=strict:open-gop=0:rc-lookahead=0:sync-lookahead=0";
+    let hierarchical_b = options.hierarchical_b;
+    let x264_params = format!(
+        "b-pyramid={}:open-gop=0:rc-lookahead={}:sync-lookahead=0",
+        hierarchical_b.pyramid.x264_value(),
+        hierarchical_b.lookahead
+    );
     let status = Command::new(&options.ffmpeg_path)
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(&video.source_path)
@@ -575,13 +805,13 @@ fn encode_video(
             "-sc_threshold",
             "0",
             "-bf",
-            "7",
+            &hierarchical_b.max_b_frames.to_string(),
             "-b_strategy",
-            "0",
+            &hierarchical_b.adaptive.to_string(),
             "-refs",
-            "1",
+            &hierarchical_b.reference_frames.to_string(),
             "-x264-params",
-            x264_params,
+            &x264_params,
             "-map_metadata",
             "-1",
             "-map_chapters",
@@ -598,6 +828,152 @@ fn encode_video(
     Ok(())
 }
 
+fn encode_reference_policy_video(
+    video: &VideoInput,
+    output: &Path,
+    options: &HierarchicalBuildOptions,
+    shared_anchor: bool,
+) -> Result<(), String> {
+    let frame_size = options.width as usize * options.height as usize * 3 / 2;
+    let mut decode = Command::new(&options.ffmpeg_path);
+    decode
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&video.source_path)
+        .args(["-an", "-frames:v"])
+        .arg(options.max_frames.to_string())
+        .args([
+            "-vf",
+            &format!(
+                "scale={}:{},setsar=1,setpts=N/({}*TB)",
+                options.width, options.height, options.fps
+            ),
+            "-r",
+            &options.fps.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = decode
+        .spawn()
+        .map_err(|error| format!("failed to start FFmpeg decode: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "FFmpeg raw-video stdout is unavailable".to_string())?;
+    let mut source = BufReader::new(stdout);
+    let mut encoder = X264Encoder::new_configured(
+        options.width as u32,
+        options.height as u32,
+        options.crf as u32,
+        options.gop_size,
+        shared_anchor,
+        options.fps as u32,
+        &options.preset,
+    )?;
+    let raw_path = output.with_extension("policy.h264");
+    let mut raw = File::create(&raw_path)
+        .map_err(|error| format!("failed to create {}: {error}", raw_path.display()))?;
+    let mut frame = vec![0u8; frame_size];
+    let mut frame_index = 0u32;
+    loop {
+        let mut filled = 0usize;
+        while filled < frame_size {
+            let count = source
+                .read(&mut frame[filled..])
+                .map_err(|error| format!("failed to read decoded frame: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            filled += count;
+        }
+        if filled == 0 {
+            break;
+        }
+        if filled != frame_size {
+            let _ = std::fs::remove_file(&raw_path);
+            return Err(format!(
+                "partial decoded frame for {}: {filled}/{frame_size} bytes",
+                video.video_id
+            ));
+        }
+        let encoded = encoder
+            .try_encode_frame(&frame, frame_index % options.gop_size == 0)
+            .map_err(|error| format!("x264 failed at frame {frame_index}: {error}"))?;
+        raw.write_all(&encoded)
+            .map_err(|error| format!("failed to write raw H.264: {error}"))?;
+        frame_index += 1;
+    }
+    loop {
+        let encoded = encoder.try_flush()?;
+        if encoded.is_empty() {
+            break;
+        }
+        raw.write_all(&encoded)
+            .map_err(|error| format!("failed to flush raw H.264: {error}"))?;
+    }
+    raw.flush()
+        .map_err(|error| format!("failed to flush {}: {error}", raw_path.display()))?;
+    let decode_output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for FFmpeg decode: {error}"))?;
+    if !decode_output.status.success() {
+        let _ = std::fs::remove_file(&raw_path);
+        return Err(format!(
+            "FFmpeg decode failed for {}: {}",
+            video.source_path.display(),
+            String::from_utf8_lossy(&decode_output.stderr)
+        ));
+    }
+    if frame_index == 0 {
+        let _ = std::fs::remove_file(&raw_path);
+        return Err(format!("no source frames decoded for {}", video.video_id));
+    }
+    let remux = Command::new(&options.ffmpeg_path)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-r",
+        ])
+        .arg(options.fps.to_string())
+        .args(["-i"])
+        .arg(&raw_path)
+        .args(["-an", "-c:v", "copy", "-movflags", "+faststart"])
+        .arg(output)
+        .output()
+        .map_err(|error| format!("failed to start FFmpeg remux: {error}"))?;
+    let _ = std::fs::remove_file(&raw_path);
+    if !remux.status.success() {
+        return Err(format!(
+            "FFmpeg remux failed for {}: {}",
+            video.video_id,
+            String::from_utf8_lossy(&remux.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn encode_video_for_policy(
+    video: &VideoInput,
+    output: &Path,
+    options: &HierarchicalBuildOptions,
+) -> Result<(), String> {
+    match options.dependency_policy {
+        DependencyPolicy::HierarchicalB => encode_video(video, output, options),
+        DependencyPolicy::ChainedP => encode_reference_policy_video(video, output, options, false),
+        DependencyPolicy::SharedAnchor => {
+            encode_reference_policy_video(video, output, options, true)
+        }
+    }
+}
+
 fn validate_encoded_frame_count(
     video_id: &str,
     packets: usize,
@@ -610,6 +986,58 @@ fn validate_encoded_frame_count(
         ));
     }
     Ok(())
+}
+
+fn probe_video(
+    video: &VideoInput,
+    encoded_path: &Path,
+    options: &HierarchicalBuildOptions,
+) -> Result<ProbedVideo, String> {
+    let packets = probe_packets(&options.ffprobe_path, encoded_path)?;
+    let frames = probe_frames(&options.ffprobe_path, encoded_path)?;
+    validate_encoded_frame_count(
+        &video.video_id,
+        packets.len(),
+        frames.len(),
+        options.max_frames as usize,
+    )?;
+    let (config, nal_length_size) =
+        avcc_to_annex_b(&probe_extradata(&options.ffprobe_path, encoded_path)?)?;
+    let mut frame_by_pts = HashMap::new();
+    for frame in frames {
+        if frame_by_pts.insert(frame.pts, frame.frame_type).is_some() {
+            return Err(format!("duplicate decoded PTS {}", frame.pts));
+        }
+    }
+    let mut display_pts = packets.iter().map(|packet| packet.pts).collect::<Vec<_>>();
+    display_pts.sort_unstable();
+    display_pts.dedup();
+    if display_pts.len() != packets.len() {
+        return Err(format!("video {} has duplicate packet PTS", video.video_id));
+    }
+    let pts_to_ordinal = display_pts
+        .iter()
+        .enumerate()
+        .map(|(ordinal, pts)| (*pts, ordinal))
+        .collect::<HashMap<_, _>>();
+    let mut packet_indices = vec![0usize; packets.len()];
+    let mut frame_types = vec![String::new(); packets.len()];
+    for (packet_index, packet) in packets.iter().enumerate() {
+        let ordinal = pts_to_ordinal[&packet.pts];
+        packet_indices[ordinal] = packet_index;
+        frame_types[ordinal] = frame_by_pts
+            .get(&packet.pts)
+            .ok_or_else(|| format!("missing decoded frame for PTS {}", packet.pts))?
+            .clone();
+    }
+    Ok(ProbedVideo {
+        config,
+        nal_length_size,
+        packets,
+        pts_to_ordinal,
+        packet_indices,
+        frame_types,
+    })
 }
 
 fn derive_closures(
@@ -680,6 +1108,88 @@ fn derive_closures(
         }
     }
     Ok((closures, gop_ids))
+}
+
+fn derive_shared_anchor_closures(
+    frame_types: &[String],
+    packet_indices: &[usize],
+) -> Result<(Vec<Vec<usize>>, Vec<usize>), String> {
+    if frame_types.len() != packet_indices.len() {
+        return Err("shared-Anchor closure inputs have different lengths".to_string());
+    }
+    let anchors = frame_types
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, value)| (value == "I").then_some(ordinal))
+        .collect::<Vec<_>>();
+    if anchors.first().copied() != Some(0) {
+        return Err("shared-Anchor stream does not begin with an I frame".to_string());
+    }
+    if frame_types
+        .iter()
+        .any(|value| !matches!(value.as_str(), "I" | "P"))
+    {
+        return Err("shared-Anchor stream must contain only I/P frames".to_string());
+    }
+    let mut closures = vec![Vec::new(); frame_types.len()];
+    let mut gop_ids = vec![0usize; frame_types.len()];
+    for (gop_id, start) in anchors.iter().copied().enumerate() {
+        let stop = anchors
+            .get(gop_id + 1)
+            .copied()
+            .unwrap_or(frame_types.len());
+        for target in start..stop {
+            gop_ids[target] = gop_id;
+            let mut closure = if target == start {
+                vec![start]
+            } else {
+                vec![start, target]
+            };
+            closure.sort_unstable_by_key(|ordinal| packet_indices[*ordinal]);
+            closures[target] = closure;
+        }
+    }
+    Ok((closures, gop_ids))
+}
+
+fn validate_closures(
+    closures: &[Vec<usize>],
+    gop_ids: &[usize],
+    packet_indices: &[usize],
+) -> Result<(), String> {
+    if closures.len() != gop_ids.len() || closures.len() != packet_indices.len() {
+        return Err("closure validation inputs have different lengths".to_string());
+    }
+    for (target, closure) in closures.iter().enumerate() {
+        if closure.is_empty() || !closure.contains(&target) {
+            return Err(format!("target {target} is absent from its closure"));
+        }
+        let mut previous_packet = None;
+        for dependency in closure {
+            if *dependency >= closures.len() {
+                return Err(format!(
+                    "target {target} references missing frame {dependency}"
+                ));
+            }
+            if gop_ids[*dependency] != gop_ids[target] {
+                return Err(format!("target {target} has a cross-GOP dependency"));
+            }
+            let packet = packet_indices[*dependency];
+            if previous_packet.is_some_and(|value| value >= packet) {
+                return Err(format!("target {target} closure is not in decode order"));
+            }
+            previous_packet = Some(packet);
+        }
+    }
+    Ok(())
+}
+
+fn percentile(sorted: &[usize], quantile: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = ((sorted.len() - 1) as f64 * quantile).ceil() as usize;
+    sorted[rank.min(sorted.len() - 1)] as f64
 }
 
 fn write_index(path: &Path, rows: &[RecordRow]) -> Result<(), Box<dyn std::error::Error>> {
@@ -759,15 +1269,35 @@ fn write_index(path: &Path, rows: &[RecordRow]) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-pub fn build_hierarchical_chunk(
+pub fn build_vclasp_chunk_internal(
     videos: &[VideoInput],
     options: &HierarchicalBuildOptions,
 ) -> Result<HierarchicalBuildStats, Box<dyn std::error::Error>> {
+    let total_started = Instant::now();
     if videos.is_empty() {
         return Err("video list is empty".into());
     }
-    if options.gop_size < 8 || options.max_frames == 0 || options.fps == 0 {
-        return Err("gop_size must be at least 8 and frame/fps limits must be positive".into());
+    if options.gop_size < 2 || options.max_frames == 0 || options.fps == 0 || options.workers == 0 {
+        return Err(
+            "gop_size must be at least 2 and frame/fps/worker limits must be positive".into(),
+        );
+    }
+    if options.dependency_policy == DependencyPolicy::HierarchicalB {
+        options.hierarchical_b.validate(options.gop_size)?;
+    } else if options.hierarchical_b != HierarchicalBConfig::default() {
+        return Err(
+            "hierarchical-B encoder parameters are only valid for dependency_policy=hierarchical_b"
+                .into(),
+        );
+    }
+    if options.dependency_policy == DependencyPolicy::SharedAnchor
+        && options.gop_size > MAX_ANCHOR_P_GROUP_FRAMES
+    {
+        return Err(format!(
+            "shared_anchor gop_size {} exceeds x264 reference limit {}",
+            options.gop_size, MAX_ANCHOR_P_GROUP_FRAMES
+        )
+        .into());
     }
     let parent = options
         .output_path
@@ -778,33 +1308,58 @@ pub fn build_hierarchical_chunk(
         std::fs::create_dir_all(directory)?;
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let prefix = format!(".hierarchical-{}-{nonce}", std::process::id());
+    let prefix = format!(".vclasp-{}-{nonce}", std::process::id());
     let payload_path = parent.join(format!("{prefix}.payload"));
     let index_path = parent.join(format!("{prefix}.parquet"));
+    let encoded_paths = (0..videos.len())
+        .map(|video_index| match &options.baseline_mp4_dir {
+            Some(directory) => directory.join(format!("{video_index:06}.mp4")),
+            None => parent.join(format!("{prefix}-{video_index}.mp4")),
+        })
+        .collect::<Vec<_>>();
     let mut payload = File::create(&payload_path)?;
     let mut rows = Vec::new();
     let mut canonical_config = None;
     let mut canonical_nal_length_size = None;
     let mut payload_cursor = 0u64;
     let mut max_closure_records = 0usize;
+    let mut closure_lengths = Vec::new();
+    let mut gops = 0usize;
+    let mut i_frames = 0usize;
+    let mut p_frames = 0usize;
+    let mut b_frames = 0usize;
+    let mut max_b_run = 0usize;
+    let mut encode_seconds = 0.0;
+    let mut au_parse_seconds = 0.0;
+    let mut closure_construction_seconds = 0.0;
+    let mut closure_validation_seconds = 0.0;
+    let mut payload_copy_seconds = 0.0;
+    let mut index_serialization_seconds = 0.0;
+    let mut chunk_write_seconds = 0.0;
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        for (video_index, video) in videos.iter().enumerate() {
-            let encoded_path = match &options.baseline_mp4_dir {
-                Some(directory) => directory.join(format!("{video_index:06}.mp4")),
-                None => parent.join(format!("{prefix}-{video_index}.mp4")),
-            };
-            encode_video(video, &encoded_path, options)?;
-            let packets = probe_packets(&options.ffprobe_path, &encoded_path)?;
-            let frames = probe_frames(&options.ffprobe_path, &encoded_path)?;
-            validate_encoded_frame_count(
-                &video.video_id,
-                packets.len(),
-                frames.len(),
-                options.max_frames as usize,
-            )?;
-            let (config, nal_length_size) =
-                avcc_to_annex_b(&probe_extradata(&options.ffprobe_path, &encoded_path)?)?;
+        let stage_started = Instant::now();
+        parallel_map(videos.len(), options.workers, |video_index| {
+            encode_video_for_policy(&videos[video_index], &encoded_paths[video_index], options)
+        })?;
+        encode_seconds = stage_started.elapsed().as_secs_f64();
+
+        let stage_started = Instant::now();
+        let probed = parallel_map(videos.len(), options.workers, |video_index| {
+            probe_video(&videos[video_index], &encoded_paths[video_index], options)
+        })?;
+        au_parse_seconds = stage_started.elapsed().as_secs_f64();
+
+        for (video_index, (video, probed)) in videos.iter().zip(probed).enumerate() {
+            let encoded_path = &encoded_paths[video_index];
+            let ProbedVideo {
+                config,
+                nal_length_size,
+                packets,
+                pts_to_ordinal,
+                packet_indices,
+                frame_types,
+            } = probed;
             if canonical_config
                 .as_ref()
                 .is_some_and(|value| value != &config)
@@ -818,36 +1373,39 @@ pub fn build_hierarchical_chunk(
             }
             canonical_config.get_or_insert(config);
             canonical_nal_length_size.get_or_insert(nal_length_size);
-
-            let mut frame_by_pts = HashMap::new();
-            for frame in frames {
-                if frame_by_pts.insert(frame.pts, frame.frame_type).is_some() {
-                    return Err(format!("duplicate decoded PTS {}", frame.pts).into());
+            let mut current_b_run = 0usize;
+            for frame_type in &frame_types {
+                match frame_type.as_str() {
+                    "I" => {
+                        i_frames += 1;
+                        current_b_run = 0;
+                    }
+                    "P" => {
+                        p_frames += 1;
+                        current_b_run = 0;
+                    }
+                    "B" => {
+                        b_frames += 1;
+                        current_b_run += 1;
+                        max_b_run = max_b_run.max(current_b_run);
+                    }
+                    _ => {}
                 }
             }
-            let mut display_pts = packets.iter().map(|packet| packet.pts).collect::<Vec<_>>();
-            display_pts.sort_unstable();
-            display_pts.dedup();
-            if display_pts.len() != packets.len() {
-                return Err(format!("video {} has duplicate packet PTS", video.video_id).into());
-            }
-            let pts_to_ordinal = display_pts
-                .iter()
-                .enumerate()
-                .map(|(ordinal, pts)| (*pts, ordinal))
-                .collect::<HashMap<_, _>>();
-            let mut packet_indices = vec![0usize; packets.len()];
-            let mut frame_types = vec![String::new(); packets.len()];
-            for (packet_index, packet) in packets.iter().enumerate() {
-                let ordinal = pts_to_ordinal[&packet.pts];
-                packet_indices[ordinal] = packet_index;
-                frame_types[ordinal] = frame_by_pts
-                    .get(&packet.pts)
-                    .ok_or_else(|| format!("missing decoded frame for PTS {}", packet.pts))?
-                    .clone();
-            }
-            let (closures, gop_ids) = derive_closures(&frame_types, &packet_indices)?;
+            let stage_started = Instant::now();
+            let (closures, gop_ids) = if options.dependency_policy == DependencyPolicy::SharedAnchor
+            {
+                derive_shared_anchor_closures(&frame_types, &packet_indices)?
+            } else {
+                derive_closures(&frame_types, &packet_indices)?
+            };
+            closure_construction_seconds += stage_started.elapsed().as_secs_f64();
+            let stage_started = Instant::now();
+            validate_closures(&closures, &gop_ids, &packet_indices)?;
+            closure_validation_seconds += stage_started.elapsed().as_secs_f64();
+            gops += gop_ids.iter().max().map_or(0, |value| value + 1);
 
+            let stage_started = Instant::now();
             let mut source = OpenOptions::new().read(true).open(&encoded_path)?;
             let mut global_record_ids = vec![0i64; packets.len()];
             let base_record_id = rows.len() as i64;
@@ -862,6 +1420,7 @@ pub fn build_hierarchical_chunk(
                 payload.write_all(&bytes)?;
                 let closure = &closures[ordinal];
                 max_closure_records = max_closure_records.max(closure.len());
+                closure_lengths.push(closure.len());
                 let mut closure_bytes = Vec::with_capacity(closure.len() * 8);
                 for dependency in closure {
                     closure_bytes.extend_from_slice(&global_record_ids[*dependency].to_le_bytes());
@@ -882,7 +1441,7 @@ pub fn build_hierarchical_chunk(
                     record_length: packet.size as i64,
                     frame_idx: ordinal as i32,
                     codec_config_id: 0,
-                    dependency_kind: "hierarchical_b".to_string(),
+                    dependency_kind: options.dependency_policy.dependency_kind().to_string(),
                     record_id: base_record_id + packet_index as i64,
                     packet_index: packet_index as i32,
                     gop_id: gop_ids[ordinal] as i32,
@@ -895,12 +1454,15 @@ pub fn build_hierarchical_chunk(
                 });
                 payload_cursor += packet.size;
             }
+            payload_copy_seconds += stage_started.elapsed().as_secs_f64();
             if options.baseline_mp4_dir.is_none() {
-                std::fs::remove_file(&encoded_path)?;
+                std::fs::remove_file(encoded_path)?;
             }
         }
         payload.flush()?;
+        let stage_started = Instant::now();
         write_index(&index_path, &rows)?;
+        index_serialization_seconds += stage_started.elapsed().as_secs_f64();
         let index = std::fs::read(&index_path)?;
         let mut payload_reader = File::open(&payload_path)?;
         let created_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
@@ -912,6 +1474,7 @@ pub fn build_hierarchical_chunk(
             created_at,
             ..ChunkWriteConfig::default()
         };
+        let stage_started = Instant::now();
         chunk::write_chunk_from_parts(
             &options.output_path,
             canonical_config
@@ -922,6 +1485,7 @@ pub fn build_hierarchical_chunk(
             &index,
             &config,
         )?;
+        chunk_write_seconds += stage_started.elapsed().as_secs_f64();
         Ok(())
     })();
 
@@ -930,8 +1494,17 @@ pub fn build_hierarchical_chunk(
         .unwrap_or(0);
     let _ = std::fs::remove_file(&payload_path);
     let _ = std::fs::remove_file(&index_path);
+    if options.baseline_mp4_dir.is_none() {
+        for encoded_path in &encoded_paths {
+            let _ = std::fs::remove_file(encoded_path);
+        }
+    }
     result?;
+    closure_lengths.sort_unstable();
+    let mean_closure_records =
+        closure_lengths.iter().sum::<usize>() as f64 / closure_lengths.len().max(1) as f64;
     Ok(HierarchicalBuildStats {
+        workers: options.workers,
         videos: videos.len(),
         records: rows.len(),
         targets: rows.len(),
@@ -939,12 +1512,47 @@ pub fn build_hierarchical_chunk(
         index_bytes,
         chunk_bytes: std::fs::metadata(&options.output_path)?.len(),
         max_closure_records,
+        mean_closure_records,
+        median_closure_records: percentile(&closure_lengths, 0.5),
+        p95_closure_records: percentile(&closure_lengths, 0.95),
+        gops,
+        i_frames,
+        p_frames,
+        b_frames,
+        max_b_run,
+        total_seconds: total_started.elapsed().as_secs_f64(),
+        encode_seconds,
+        au_parse_seconds,
+        closure_construction_seconds,
+        closure_validation_seconds,
+        payload_copy_seconds,
+        index_serialization_seconds,
+        chunk_write_seconds,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn parallel_map_preserves_input_order_and_worker_bound() {
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let values = parallel_map(24, 4, |index| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis((index % 3) as u64));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(index * 2)
+        })
+        .unwrap();
+        assert_eq!(values, (0..24).map(|index| index * 2).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) <= 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn parses_avcc_configuration() {
@@ -967,6 +1575,101 @@ mod tests {
         assert_eq!(closures[1], vec![0, 4, 2, 1]);
         assert_eq!(closures[2], vec![0, 4, 2]);
         assert_eq!(gops, vec![0; 5]);
+    }
+
+    #[test]
+    fn parses_registered_dependency_policies() {
+        assert_eq!(
+            DependencyPolicy::parse("hierarchical_b").unwrap(),
+            DependencyPolicy::HierarchicalB
+        );
+        assert_eq!(
+            DependencyPolicy::parse("chained_p").unwrap(),
+            DependencyPolicy::ChainedP
+        );
+        assert_eq!(
+            DependencyPolicy::parse("shared_anchor").unwrap(),
+            DependencyPolicy::SharedAnchor
+        );
+        assert!(DependencyPolicy::parse("uniform").is_err());
+    }
+
+    #[test]
+    fn validates_hierarchical_b_parameters_before_encoding() {
+        HierarchicalBConfig::default().validate(16).unwrap();
+        HierarchicalBConfig {
+            max_b_frames: 3,
+            pyramid: BFramePyramid::Strict,
+            adaptive: 2,
+            lookahead: 16,
+            reference_frames: 3,
+        }
+        .validate(16)
+        .unwrap();
+        assert!(HierarchicalBConfig {
+            max_b_frames: 16,
+            ..HierarchicalBConfig::default()
+        }
+        .validate(16)
+        .is_err());
+        assert!(HierarchicalBConfig {
+            max_b_frames: 7,
+            adaptive: 2,
+            lookahead: 7,
+            ..HierarchicalBConfig::default()
+        }
+        .validate(16)
+        .is_err());
+        assert!(HierarchicalBConfig {
+            reference_frames: 0,
+            ..HierarchicalBConfig::default()
+        }
+        .validate(16)
+        .is_err());
+    }
+
+    #[test]
+    fn shared_anchor_closure_contains_only_anchor_and_target() {
+        let types = ["I", "P", "P", "P", "I", "P"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let packet_indices = vec![0, 1, 2, 3, 4, 5];
+        let (closures, gops) = derive_shared_anchor_closures(&types, &packet_indices).unwrap();
+        assert_eq!(
+            closures,
+            vec![
+                vec![0],
+                vec![0, 1],
+                vec![0, 2],
+                vec![0, 3],
+                vec![4],
+                vec![4, 5]
+            ]
+        );
+        assert_eq!(gops, vec![0, 0, 0, 0, 1, 1]);
+        validate_closures(&closures, &gops, &packet_indices).unwrap();
+    }
+
+    #[test]
+    fn shared_anchor_closure_rejects_b_frames() {
+        let types = ["I", "B", "P"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let error = derive_shared_anchor_closures(&types, &[0, 2, 1]).unwrap_err();
+        assert!(error.contains("only I/P"));
+    }
+
+    #[test]
+    fn validates_closure_membership_gop_and_decode_order() {
+        let closures = vec![vec![0], vec![0, 1], vec![0, 1, 2]];
+        let gops = vec![0, 0, 0];
+        let packets = vec![0, 1, 2];
+        validate_closures(&closures, &gops, &packets).unwrap();
+        assert!(validate_closures(&[vec![0], vec![0]], &gops[..2], &packets[..2]).is_err());
+        assert!(validate_closures(&[vec![0], vec![0, 1]], &[0, 1], &packets[..2]).is_err());
+        assert!(validate_closures(&[vec![0], vec![1, 0]], &gops[..2], &packets[..2]).is_err());
     }
 
     #[test]

@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::planner::{self, RangePlan, RecordRange};
 
+pub const FIXED_GAP_REFERENCE_BYTES: u64 = 16 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessUnitRecord {
     pub record_id: u64,
@@ -56,7 +58,7 @@ pub struct HierarchicalCostModel {
     pub io_concurrency: usize,
     /// Optional calibrated fixed overhead for a wave containing 1..N Range
     /// GETs. Values exclude transfer time and must be monotone. An empty
-    /// vector falls back to the max-per-range screening model.
+    /// vector retains the legacy max-per-range screening model.
     pub wave_request_overhead_ns: Vec<f64>,
     /// Outcome-free uncertainty band for plan selection. Candidates inside
     /// the band are tie-broken by request count, fetched bytes, and decode
@@ -169,6 +171,65 @@ impl HierarchicalCostModel {
             total_ns,
         }
     }
+
+    /// Score an execution shape that is produced outside the sparse-span
+    /// enumerator, such as a monotonic live-decoder suffix. This keeps all
+    /// production actions on the same calibrated request/byte/decode model.
+    pub fn estimate_execution(
+        &self,
+        ranges: &[(u64, u64)],
+        access_units_submitted: usize,
+        include_decode_fixed: bool,
+    ) -> f64 {
+        let ranges = ranges
+            .iter()
+            .map(|(offset, length)| RangePlan {
+                offset: *offset,
+                length: *length,
+                records: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let io_ns = self.io_ns(&ranges);
+        let decode_ns = if access_units_submitted == 0 {
+            0.0
+        } else {
+            f64::from(include_decode_fixed) * self.decode_fixed_ns
+                + access_units_submitted as f64 * self.decode_access_unit_ns
+        };
+        io_ns + decode_ns - self.fetch_decode_overlap * io_ns.min(decode_ns)
+    }
+
+    /// Score a request window whose physical ranges are fetched as one union
+    /// while independent decode jobs run under a bounded slot budget.
+    pub fn estimate_parallel_window_execution(
+        &self,
+        ranges: &[(u64, u64)],
+        decode_jobs: &[usize],
+        decode_concurrency: usize,
+    ) -> f64 {
+        let ranges = ranges
+            .iter()
+            .map(|(offset, length)| RangePlan {
+                offset: *offset,
+                length: *length,
+                records: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let io_ns = self.io_ns(&ranges);
+        let mut decode_service = decode_jobs
+            .iter()
+            .filter(|access_units| **access_units > 0)
+            .map(|access_units| {
+                self.decode_fixed_ns + *access_units as f64 * self.decode_access_unit_ns
+            })
+            .collect::<Vec<_>>();
+        decode_service.sort_by(|left, right| right.total_cmp(left));
+        let decode_ns = decode_service
+            .chunks(decode_concurrency.max(1))
+            .map(|wave| wave.iter().copied().fold(0.0, f64::max))
+            .sum::<f64>();
+        io_ns + decode_ns - self.fetch_decode_overlap * io_ns.min(decode_ns)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -239,7 +300,7 @@ impl HierarchicalLayoutIndex {
         access_units_submitted: usize,
         max_merge_gap_bytes: Option<u64>,
         model: &HierarchicalCostModel,
-    ) -> Result<HierarchicalPlanEstimate, String> {
+    ) -> Result<(HierarchicalPlanEstimate, HierarchicalPlanEstimate), String> {
         let mut ordered = records.to_vec();
         ordered.sort_unstable_by_key(|record| (record.offset, record.record_id));
         if ordered.is_empty() {
@@ -293,9 +354,22 @@ impl HierarchicalLayoutIndex {
             .iter()
             .map(|candidate| candidate.4)
             .fold(f64::INFINITY, f64::min);
+        let fixed_threshold = max_merge_gap_bytes
+            .map(|maximum| maximum.min(FIXED_GAP_REFERENCE_BYTES))
+            .unwrap_or(FIXED_GAP_REFERENCE_BYTES);
+        let fixed_optional_cuts = gaps
+            .iter()
+            .take_while(|(gap, _)| *gap > fixed_threshold)
+            .count();
+        let fixed = candidates[fixed_optional_cuts];
         let selected = candidates
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|candidate| candidate.4 <= minimum + model.selection_tolerance_ns)
+            // Selection tolerance may trade a small predicted latency increase
+            // for fewer requests, but it must never make the calibrated choice
+            // worse than the registered Fixed 16 KiB reference in model space.
+            .filter(|candidate| candidate.4 <= fixed.4)
             .min_by(|left, right| {
                 left.1
                     .cmp(&right.1)
@@ -303,42 +377,50 @@ impl HierarchicalLayoutIndex {
                     .then_with(|| left.4.total_cmp(&right.4))
             })
             .expect("empirical sparse planner has candidates");
-        let mut cuts = mandatory_cuts;
-        cuts.extend(gaps.iter().take(selected.0).map(|(_, index)| *index));
-        let mut ranges = Vec::with_capacity(selected.1);
-        let mut begin = 0usize;
-        for index in 0..ordered.len() {
-            if index + 1 != ordered.len() && !cuts.contains(&index) {
-                continue;
+
+        let estimate = |candidate: (usize, usize, u64, f64, f64),
+                        merge_threshold_bytes: Option<u64>| {
+            let mut cuts = mandatory_cuts.clone();
+            cuts.extend(gaps.iter().take(candidate.0).map(|(_, index)| *index));
+            let mut ranges = Vec::with_capacity(candidate.1);
+            let mut begin = 0usize;
+            for index in 0..ordered.len() {
+                if index + 1 != ordered.len() && !cuts.contains(&index) {
+                    continue;
+                }
+                let segment = &ordered[begin..=index];
+                let offset = segment[0].offset;
+                let end = segment.last().unwrap().offset + segment.last().unwrap().length;
+                ranges.push(RangePlan {
+                    offset,
+                    length: end - offset,
+                    records: segment
+                        .iter()
+                        .map(|record| planner::PlannedRecord {
+                            record_id: record.record_id,
+                            relative_offset: record.offset - offset,
+                            length: record.length,
+                        })
+                        .collect(),
+                });
+                begin = index + 1;
             }
-            let segment = &ordered[begin..=index];
-            let offset = segment[0].offset;
-            let end = segment.last().unwrap().offset + segment.last().unwrap().length;
-            ranges.push(RangePlan {
-                offset,
-                length: end - offset,
-                records: segment
-                    .iter()
-                    .map(|record| planner::PlannedRecord {
-                        record_id: record.record_id,
-                        relative_offset: record.offset - offset,
-                        length: record.length,
-                    })
-                    .collect(),
-            });
-            begin = index + 1;
-        }
-        Ok(HierarchicalPlanEstimate {
-            mode: HierarchicalReadMode::SparseClosure,
-            merge_threshold_bytes: None,
-            ranges,
-            useful_bytes,
-            fetched_bytes: selected.2,
-            access_units_submitted,
-            io_ns: selected.3,
-            decode_ns,
-            total_ns: selected.4,
-        })
+            HierarchicalPlanEstimate {
+                mode: HierarchicalReadMode::SparseClosure,
+                merge_threshold_bytes,
+                ranges,
+                useful_bytes,
+                fetched_bytes: candidate.2,
+                access_units_submitted,
+                io_ns: candidate.3,
+                decode_ns,
+                total_ns: candidate.4,
+            }
+        };
+        Ok((
+            estimate(selected, None),
+            estimate(fixed, Some(fixed_threshold)),
+        ))
     }
 
     pub fn new(
@@ -464,6 +546,50 @@ impl HierarchicalLayoutIndex {
         )
     }
 
+    /// Return every distinct sparse-closure span partition already implied by
+    /// the current planner's gap thresholds. This inspection path disables the
+    /// empirical fast-path only while enumerating candidates; it then scores
+    /// the unchanged physical candidates with the caller's frozen model.
+    /// It never participates in online plan selection.
+    pub fn enumerate_sparse_candidates(
+        &self,
+        sample_ids: &[u64],
+        max_merge_gap_bytes: Option<u64>,
+        max_range_bytes: Option<u64>,
+        model: &HierarchicalCostModel,
+    ) -> Result<Vec<HierarchicalPlanEstimate>, String> {
+        let mut enumeration_model = model.clone();
+        enumeration_model.wave_request_overhead_ns.clear();
+        let decision = self.choose_plan(
+            sample_ids,
+            max_merge_gap_bytes,
+            max_range_bytes,
+            &enumeration_model,
+        )?;
+        let mut candidates = decision
+            .alternatives
+            .into_iter()
+            .filter(|candidate| candidate.mode == HierarchicalReadMode::SparseClosure)
+            .map(|candidate| {
+                model.estimate(HierarchicalPlanCandidate {
+                    mode: candidate.mode,
+                    merge_threshold_bytes: candidate.merge_threshold_bytes,
+                    ranges: candidate.ranges,
+                    useful_bytes: candidate.useful_bytes,
+                    access_units_submitted: candidate.access_units_submitted,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            left.ranges
+                .len()
+                .cmp(&right.ranges.len())
+                .then_with(|| left.fetched_bytes.cmp(&right.fetched_bytes))
+                .then_with(|| left.total_ns.total_cmp(&right.total_ns))
+        });
+        Ok(candidates)
+    }
+
     pub fn choose_plan_with_resident(
         &self,
         sample_ids: &[u64],
@@ -559,8 +685,27 @@ impl HierarchicalLayoutIndex {
                 }
             }
         }
-        if let Some(candidate) = fast_sparse {
+        if let Some((candidate, fixed_reference)) = fast_sparse {
             alternatives.push(candidate);
+            // Keep the reference explicit even when it has the same physical
+            // signature as the selected plan; audit consumers distinguish the
+            // registered fallback by its merge-threshold label.
+            alternatives.push(fixed_reference);
+        } else if !sparse_records.is_empty() {
+            let fixed_threshold = max_merge_gap_bytes
+                .map(|maximum| maximum.min(FIXED_GAP_REFERENCE_BYTES))
+                .unwrap_or(FIXED_GAP_REFERENCE_BYTES);
+            let fixed_ranges =
+                planner::plan_byte_ranges(&sparse_records, Some(fixed_threshold), max_range_bytes)?;
+            // Preserve an explicitly labelled Fixed 16 KiB reference even
+            // when another enumerated threshold has the same physical ranges.
+            alternatives.push(model.estimate(HierarchicalPlanCandidate {
+                mode: HierarchicalReadMode::SparseClosure,
+                merge_threshold_bytes: Some(fixed_threshold),
+                ranges: fixed_ranges,
+                useful_bytes: sparse_useful_bytes,
+                access_units_submitted: sparse_ids.len(),
+            }));
         }
 
         let mut region_keys = closures
@@ -604,11 +749,23 @@ impl HierarchicalLayoutIndex {
                 .then_with(|| left.fetched_bytes.cmp(&right.fetched_bytes))
         });
         let minimum_total_ns = alternatives[0].total_ns;
+        let fixed_threshold = max_merge_gap_bytes
+            .map(|maximum| maximum.min(FIXED_GAP_REFERENCE_BYTES))
+            .unwrap_or(FIXED_GAP_REFERENCE_BYTES);
+        let fixed_total_ns = alternatives
+            .iter()
+            .find(|candidate| {
+                candidate.mode == HierarchicalReadMode::SparseClosure
+                    && candidate.merge_threshold_bytes == Some(fixed_threshold)
+            })
+            .map(|candidate| candidate.total_ns)
+            .unwrap_or(f64::INFINITY);
         let selected = alternatives
             .iter()
             .filter(|candidate| {
                 candidate.total_ns <= minimum_total_ns + model.selection_tolerance_ns
             })
+            .filter(|candidate| candidate.total_ns <= fixed_total_ns)
             .min_by(|left, right| {
                 left.ranges
                     .len()
@@ -641,14 +798,37 @@ impl HierarchicalLayoutIndex {
         max_range_bytes: Option<u64>,
         model: &HierarchicalCostModel,
     ) -> Result<DependencyLookaheadDecision, String> {
-        self.choose_lookahead_with_resident(
+        self.choose_lookahead_with_models(
+            batches,
+            candidates,
+            first_batch_slo_ns,
+            max_merge_gap_bytes,
+            max_range_bytes,
+            model,
+            model,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn choose_lookahead_with_models(
+        &self,
+        batches: &[Vec<u64>],
+        candidates: &[usize],
+        first_batch_slo_ns: f64,
+        max_merge_gap_bytes: Option<u64>,
+        max_range_bytes: Option<u64>,
+        throughput_model: &HierarchicalCostModel,
+        latency_model: &HierarchicalCostModel,
+    ) -> Result<DependencyLookaheadDecision, String> {
+        self.choose_lookahead_with_resident_models(
             batches,
             candidates,
             first_batch_slo_ns,
             &HashSet::new(),
             max_merge_gap_bytes,
             max_range_bytes,
-            model,
+            throughput_model,
+            latency_model,
         )
     }
 
@@ -663,7 +843,32 @@ impl HierarchicalLayoutIndex {
         max_range_bytes: Option<u64>,
         model: &HierarchicalCostModel,
     ) -> Result<DependencyLookaheadDecision, String> {
-        model.validate()?;
+        self.choose_lookahead_with_resident_models(
+            batches,
+            candidates,
+            first_batch_slo_ns,
+            resident_record_ids,
+            max_merge_gap_bytes,
+            max_range_bytes,
+            model,
+            model,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn choose_lookahead_with_resident_models(
+        &self,
+        batches: &[Vec<u64>],
+        candidates: &[usize],
+        first_batch_slo_ns: f64,
+        resident_record_ids: &HashSet<u64>,
+        max_merge_gap_bytes: Option<u64>,
+        max_range_bytes: Option<u64>,
+        throughput_model: &HierarchicalCostModel,
+        latency_model: &HierarchicalCostModel,
+    ) -> Result<DependencyLookaheadDecision, String> {
+        throughput_model.validate()?;
+        latency_model.validate()?;
         if batches.is_empty() || batches.iter().any(Vec::is_empty) {
             return Err("lookahead selection requires non-empty logical batches".to_string());
         }
@@ -746,7 +951,7 @@ impl HierarchicalLayoutIndex {
                 resident_record_ids,
                 max_merge_gap_bytes,
                 max_range_bytes,
-                model,
+                throughput_model,
             )?;
             let plan = decision.selected;
             let (first_required, first_batch_access_units) = match plan.mode {
@@ -774,11 +979,11 @@ impl HierarchicalLayoutIndex {
             }
             let first_batch_fetched_bytes =
                 first_ranges.iter().map(|range| range.length).sum::<u64>();
-            let first_batch_io_ns = model.io_ns(&first_ranges);
-            let first_batch_decode_ns = model.decode_fixed_ns
-                + first_batch_access_units as f64 * model.decode_access_unit_ns;
+            let first_batch_io_ns = latency_model.io_ns(&first_ranges);
+            let first_batch_decode_ns = latency_model.decode_fixed_ns
+                + first_batch_access_units as f64 * latency_model.decode_access_unit_ns;
             let first_batch_total_ns = first_batch_io_ns + first_batch_decode_ns
-                - model.fetch_decode_overlap * first_batch_io_ns.min(first_batch_decode_ns);
+                - latency_model.fetch_decode_overlap * first_batch_io_ns.min(first_batch_decode_ns);
             let predicted_samples_per_second =
                 logical_samples as f64 * 1e9 / plan.total_ns.max(f64::EPSILON);
             estimates.push(DependencyLookaheadEstimate {
@@ -1032,6 +1237,69 @@ mod tests {
     }
 
     #[test]
+    fn empirical_selection_is_never_predicted_worse_than_fixed_16k() {
+        let model = HierarchicalCostModel {
+            request_latency_ns: 0.0,
+            bandwidth_bytes_per_ns: 1.0,
+            io_concurrency: 8,
+            wave_request_overhead_ns: vec![
+                10_000.0, 15_000.0, 18_500.0, 19_000.0, 19_500.0, 20_000.0, 20_500.0, 21_000.0,
+            ],
+            // A large uncertainty band must not permit a tie-break beyond the
+            // registered Fixed 16 KiB reference.
+            selection_tolerance_ns: 1_000_000.0,
+            decode_fixed_ns: 0.0,
+            decode_access_unit_ns: 0.0,
+            fetch_decode_overlap: 0.0,
+        };
+        let decision = index().choose_plan(&[10, 11], None, None, &model).unwrap();
+        let fixed = decision
+            .alternatives
+            .iter()
+            .find(|candidate| {
+                candidate.mode == HierarchicalReadMode::SparseClosure
+                    && candidate.merge_threshold_bytes == Some(FIXED_GAP_REFERENCE_BYTES)
+            })
+            .expect("empirical planner must expose its Fixed 16 KiB reference");
+
+        assert!(decision.selected.total_ns <= fixed.total_ns);
+    }
+
+    #[test]
+    fn range_cap_preserves_fixed_16k_reference_and_safety() {
+        let model = HierarchicalCostModel {
+            request_latency_ns: 0.0,
+            bandwidth_bytes_per_ns: 1.0,
+            io_concurrency: 8,
+            wave_request_overhead_ns: vec![
+                10_000.0, 15_000.0, 18_500.0, 19_000.0, 19_500.0, 20_000.0, 20_500.0, 21_000.0,
+            ],
+            selection_tolerance_ns: 1_000_000.0,
+            decode_fixed_ns: 0.0,
+            decode_access_unit_ns: 0.0,
+            fetch_decode_overlap: 0.0,
+        };
+        let decision = index()
+            .choose_plan(&[10, 11], None, Some(4 * 1024), &model)
+            .unwrap();
+        let fixed = decision
+            .alternatives
+            .iter()
+            .find(|candidate| {
+                candidate.mode == HierarchicalReadMode::SparseClosure
+                    && candidate.merge_threshold_bytes == Some(FIXED_GAP_REFERENCE_BYTES)
+            })
+            .expect("range-capped planner must expose its Fixed 16 KiB reference");
+
+        assert!(decision.selected.total_ns <= fixed.total_ns);
+        assert!(decision
+            .selected
+            .ranges
+            .iter()
+            .all(|range| range.length <= 4 * 1024));
+    }
+
+    #[test]
     fn rejects_closure_that_crosses_gop_boundary() {
         let records = vec![
             AccessUnitRecord {
@@ -1117,5 +1385,42 @@ mod tests {
             .choose_lookahead(&[vec![10], vec![11]], &[2], 1_000.0, None, None, &model)
             .unwrap_err();
         assert!(error.contains("include 1"));
+    }
+
+    #[test]
+    fn lookahead_uses_tail_model_only_for_latency_admission() {
+        let expected = HierarchicalCostModel {
+            request_latency_ns: 10_000.0,
+            bandwidth_bytes_per_ns: 1.0,
+            io_concurrency: 1,
+            wave_request_overhead_ns: Vec::new(),
+            selection_tolerance_ns: 0.0,
+            decode_fixed_ns: 0.0,
+            decode_access_unit_ns: 0.0,
+            fetch_decode_overlap: 0.0,
+        };
+        let mut tail = expected.clone();
+        tail.request_latency_ns *= 100.0;
+        tail.bandwidth_bytes_per_ns /= 100.0;
+        let batches = vec![vec![10], vec![11]];
+
+        let decision = index()
+            .choose_lookahead_with_models(
+                &batches,
+                &[1, 2],
+                1_000_000.0,
+                None,
+                None,
+                &expected,
+                &tail,
+            )
+            .unwrap();
+
+        assert_eq!(decision.selected.lookahead_batches, 1);
+        assert!(!decision.selected_under_slo);
+        assert!(
+            decision.alternatives[1].predicted_samples_per_second
+                > decision.alternatives[0].predicted_samples_per_second
+        );
     }
 }

@@ -1,144 +1,284 @@
 # VClasp Core
 
-VClasp is a Rust library for reading predictive video from object storage at
-ML-sample granularity. It resolves codec dependencies, turns the required
-access units into byte ranges, coalesces those ranges for the storage backend,
-and decodes only the required records.
+VClasp Core is a Rust library for dependency-aware access to predictively
+encoded video on local filesystems and S3-compatible object stores. It turns an
+already-sampled window of logical video targets into codec closures, physical
+byte spans, bounded Range GETs, and ordered RGB outputs.
 
-This repository contains the reusable library and Python bindings. Benchmark
-drivers, baseline ports, deployment recipes, and released result tables live in
-[`vclasp-artifact`](https://github.com/AntiO2/vclasp-artifact).
+The caller never labels a request as sequential, random, Zipf, or same-video.
+VClasp derives dependency reuse and physical locality from the request window
+and the chunk index, then compares legal execution plans with one
+request/byte/decode cost model. The supplied model is a safe bootstrap:
+post-execution measurements update it online after an accuracy gate, without
+backend names or workload labels.
 
-> **Release status:** `0.1.0` is the first public format and API. The repository
-> remains private until the release license is selected.
+## What is in this repository
 
-## What VClasp provides
+- Rust ingestion, access-unit parsing, closure construction, and validation;
+- one-copy chunk payload and embedded Parquet target index;
+- exact and coalesced span planning;
+- bounded local and S3-compatible reads through `object_store`;
+- libavcodec decode with exact logical-order restoration;
+- bounded encoded-AU and live-decoder state;
+- Python bindings through PyO3;
+- unit and integration tests.
 
-- a self-describing chunk with H.264 payloads and a Parquet record index;
-- dependency-closure resolution for logical frame and clip requests;
-- exact byte-range planning and configurable range coalescing;
-- local, S3-compatible, and AIStore transports with bounded concurrency;
-- libavcodec-backed selective decode and logical-order restoration;
-- Rust APIs for data-plane integration and PyO3 bindings for ML loaders.
+Paper runners, cluster deployment, baseline ports, datasets, and result files
+belong in the separate reproducibility artifact, not this reusable core.
 
-## Quick start
+See the [API guide](docs/API.md) for application examples, the
+[setup guide](docs/SETUP_AND_RUNBOOK.md) for environment details, and the
+[source guide](src/README.md) for the code structure.
 
-### 1. Install native dependencies
+## Requirements
 
-Ubuntu 22.04/24.04:
+Verified on Ubuntu x86-64 with Rust 1.96, Python 3.12, and FFmpeg 6.x.
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
   build-essential pkg-config clang libclang-dev \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  libx264-dev flatbuffers-compiler ffmpeg
+  libx264-dev flatbuffers-compiler ffmpeg python3-dev
+
+pkg-config --modversion libavcodec libavformat libavutil libswscale
 ```
-
-### 2. Run the Rust planner example
-
-```bash
-cargo run --example plan_ranges
-```
-
-The public planner accepts physical record extents and returns the contiguous
-ranges to fetch plus each requested record's location inside its range:
-
-```rust
-use vclasp::{plan_byte_ranges, RecordRange};
-
-let records = vec![
-    RecordRange { record_id: 1, offset: 0, length: 1024 },
-    RecordRange { record_id: 2, offset: 4096, length: 1024 },
-];
-let ranges = plan_byte_ranges(&records, Some(4096), None)?;
-# Ok::<(), String>(())
-```
-
-### 3. Install the Python extension
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip maturin
-maturin develop --release --features ffmpeg
-python -c 'import vclasp; print(vclasp.__version__)'
-```
-
-Then plan ranges without moving dependency or planning logic into Python:
-
-```python
-import vclasp
-
-ranges = vclasp.plan_byte_ranges(
-    [(1, 0, 1024), (2, 4096, 1024)],
-    merge_threshold_bytes=4096,
-)
-print(ranges)
-```
-
-See [Public API](docs/API.md) for chunk ingestion, local execution, S3
-execution, return schemas, and configuration fields.
-
-## Repository layout
-
-```text
-src/
-  format/       chunk header, Parquet index, generated FlatBuffer bindings
-  codec/        x264 ingestion adapter and libavcodec decode
-  ingest/       source-video ingestion and closure-index construction
-  planning/     closure representations, span planning, cost policies
-  execution/    batch schedulers, deduplication, ordering, caches
-  storage/      local, S3-compatible, and AIStore backends
-native/         small C bridge for controlled x264 reference behavior
-schemas/        VClasp on-disk FlatBuffer schema
-object-store-transport/  standalone Rust/C Range GET transport crate
-examples/       minimal Rust and Python examples
-```
-
-The filesystem is grouped by responsibility while the Rust facade keeps the
-short public paths `vclasp::chunk`, `vclasp::index`, and the crate-root planner
-types.
-
-## Chunk format
-
-VClasp `0.1.0` writes format version 1 with FlatBuffer identifier `VCL1` and
-header magic `VCLASP`:
-
-```text
-[u32 header length]
-[FlatBuffer header]
-[codec configuration bytes]
-[encoded access-unit payload]
-[Parquet record and closure index]
-```
-
-This is the first public format. Pre-release research chunks are not accepted;
-regenerate them with the public VClasp builder. No compatibility code or schema
-is shipped for internal prototype formats.
 
 ## Build and test
 
 ```bash
-cargo fmt --check
-cargo test --release --no-default-features
 cargo test --release --features ffmpeg
-cargo test --manifest-path object-store-transport/Cargo.toml
+cargo build --release --features ffmpeg
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m pip install -e .
+python -m pytest
 ```
 
-Fixture-backed codec tests are ignored unless `VCLASP_TEST_CHUNK` points to a
-format-v1 VClasp chunk. Full setup and troubleshooting are in
-[Setup and development](docs/SETUP_AND_RUNBOOK.md).
+Fixture-backed decode tests are ignored unless `VCLASP_TEST_CHUNK` is set. The
+default suite does not require private datasets.
 
-## Scope and stability
+[CI](.github/workflows/ci.yml) checks Rust/Python formatting, compilation, and
+unit tests. Rust and Python tests run as independent parallel jobs with local
+temporary files; no object-store service is required. See
+[Contributing](CONTRIBUTING.md#validate-the-change) for the matching commands.
 
-The supported `0.1` surface is the chunk reader/writer, range planner,
-object-store transport, `build_chunk`, and the Local/S3/AIStore batch
-executors. Research policy classes remain available for artifact reproduction
-but are explicitly marked experimental in the API guide.
+New chunks use FlatBuffer identifier `VCSP`, header magic `VClasp`, and format
+version 1. Earlier pre-release chunks must be rebuilt; the reader does not
+accept their format identifiers.
+
+## Python quick start
+
+### 1. Build a chunk
+
+Python supplies paths and immutable encoding parameters; Rust performs video
+decode, controlled H.264 encode, AU parsing, closure construction, validation,
+index serialization, and chunk writing.
+
+```python
+from pathlib import Path
+import vclasp
+
+videos = [
+    ("video-0001", "class-a", "/data/class-a/video-0001.mp4"),
+    ("video-0002", "class-b", "/data/class-b/video-0002.mp4"),
+]
+
+vclasp.build_vclasp_chunk(
+    videos=videos,
+    output_path="dataset.vclasp",
+    gop_size=16,
+    max_frames=512,
+    width=320,
+    height=240,
+    fps=25,
+    crf=23,
+    preset="veryfast",
+    workers=8,
+    dependency_policy="hierarchical_b",
+    max_b_frames=7,
+    b_pyramid="strict",
+    b_adapt=0,
+    rc_lookahead=0,
+    reference_frames=1,
+)
+```
+
+`dependency_policy` registers the encoded stream's actual dependency graph in
+the embedded closure catalog:
+
+- `hierarchical_b` uses a closed I/P/B GOP. Its parameters control the maximum
+  B-frame run, strict/disabled B-pyramid, adaptive B placement, lookahead, and
+  reference-frame count;
+- `chained_p` uses a controlled no-B `I -> P1 -> P2 -> ...` stream;
+- `shared_anchor` stores one I anchor per GOP and makes each P target depend
+  directly on that anchor.
+
+All policies use the same reader and planner. `shared_anchor` is limited to
+groups of at most 17 frames by x264's short-term reference capacity. It is an
+optional storage/performance policy, not a workload-specific reader.
+Hierarchical-B defaults reproduce the current experimental contract:
+`max_b_frames=7`, `b_pyramid="strict"`, `b_adapt=0`,
+`rc_lookahead=0`, and `reference_frames=1`. Open GOPs are intentionally not
+exposed because the closure index currently requires every dependency to
+remain within one GOP.
+
+### 2. Read an already-sampled request window
+
+A request is `(sample_id, video_id, frame_index)`. A window is a list of
+logical batches whose IDs and order have already been chosen by the application
+or data loader. Visibility permits cross-batch deduplication and state reuse;
+it never permits VClasp to change sample order.
+
+`VClaspChunk.video_ids()` and `VClaspChunk.frame_indices(video_id)` enumerate
+the valid logical targets directly from the embedded closure catalog.
+
+```python
+cost_model = {
+    "request_latency_ns": 200_000.0,
+    "bandwidth_bytes_per_ns": 1.0,
+    "io_concurrency": 8.0,
+    "selection_tolerance_ns": 10_000.0,
+    "decode_fixed_ns": 50_000.0,
+    "decode_access_unit_ns": 150_000.0,
+    "fetch_decode_overlap": 0.0,
+    # Runtime feedback is enabled by default. Set this to 0 only for a
+    # static-model control.
+    "runtime_feedback_enabled": 1.0,
+}
+
+reader = vclasp.VClaspSession.local(
+    "dataset.vclasp",
+    cost_model,
+    [],                         # optional calibrated request-wave overheads
+    decoder_threads=1,
+    global_decode_concurrency=8,
+    resident_encoded_bytes=8 << 20,
+    resident_read_ahead_bytes=64 << 10,
+    resident_cursor_capacity=8,
+)
+
+window = [
+    [(0, "video-0001", 7), (1, "video-0002", 31)],
+    [(2, "video-0001", 8), (3, "video-0002", 47)],
+]
+
+pipeline = reader.pipeline(
+    max_outstanding_batches=8,
+    max_outstanding_targets=256,
+)
+```
+
+Training should run its sampler producer and model consumer concurrently:
+
+```python
+from threading import Thread
+
+def produce():
+    try:
+        for batch in data_sampler:
+            pipeline.submit(batch)
+    finally:
+        pipeline.close()
+
+producer = Thread(target=produce)
+producer.start()
+while (item := pipeline.take()) is not None:
+    sequence, frames, stats, mode, predicted_ns, residence_ns = item
+    train_step(frames)
+producer.join()
+```
+
+`submit()` blocks when the declared batch or target capacity is full. Execution
+may complete out of order, but `take()` returns submission order and drains all
+admitted work after `close()`. This bounds prefetched state while overlapping
+sampling, object I/O, decode, and model compute.
+
+Use `execute(batch)` as the synchronous `L=1` convenience form and
+`execute_window` when an application already owns one finite request window.
+
+For S3-compatible storage, create one process-wide `VClaspSession`.
+Concurrent callers submit logical targets to that session; they do not select
+planner workers, cache partitions, or workload identities. The configured
+caller count bounds an admission cohort. `max_inflight_windows` independently
+bounds overlapping physical execution.
+Concurrent calls are jointly admitted within each cohort; the session restores
+each call's original batch boundaries and output order.
+
+`submit` and `submit_window` remain lower-level one-shot handle APIs.
+Visibility is supplied by already-sampled work, not inferred from a workload
+name.
+Select local or AIStore transport with
+`VClaspSession.local(...)` or `VClaspSession.aistore(...)`; execution preserves
+the same request-window and output-order contract.
+
+## Execution contract
+
+The production path is:
+
+```text
+request window
+  -> target lookup
+  -> sufficient closure union
+  -> physical span candidates
+  -> costed closure / region / resident-cursor choice
+  -> bounded range reads
+  -> discard transfer-only gaps
+  -> codec-order decode
+  -> restore duplicates, batches, and logical order
+```
+
+Resident decoder state is selected only when both conditions hold:
+
+1. registered closures prove a future consumer in the visible window; and
+2. its monotonic suffix is cheaper than ordinary window execution under the
+   same current cost model and resource limits.
+
+The encoded-byte budget and live-cursor count are separate resources. FFmpeg's
+private DPB allocation is not serializable or directly byte-accounted, so
+process RSS should also be measured in memory-sensitive deployments.
+
+Historical Prefix, Pair, and Normalized implementations live under
+`src/controls/` solely for mechanism tests. They are absent from the default
+Python module, are not alternative production readers, and are never selected
+from a workload name. Diagnostic hooks require the explicit
+`experiment-controls` feature; the paper artifact pins the experiment source
+and configuration used for reproduction.
+
+See [execution architecture](docs/execution_architecture.md) for the detailed
+planner, cache, and fallback invariants. See
+[runtime cost feedback](docs/runtime_cost_feedback.md) for the online update
+model, safety gate, telemetry, and diagnostic runner. The
+[final architecture audit](docs/final_architecture_audit.md) maps every
+production invariant to its code and verification evidence.
+
+## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and checks
+required for a pull request. The main checks are:
+
+```bash
+cargo test --features ffmpeg --lib
+cargo test --release --features ffmpeg
+cargo fmt --check
+```
+
+Do not add benchmark-name branches to the core. New execution choices must be
+derived from logical targets, registered codec dependencies, physical extents,
+runtime observations, and explicit resource budgets.
+
+## Community and security
+
+Use the [issue templates](https://github.com/AntiO2/vclasp/issues/new/choose)
+to report bugs, propose features, or provide reproducible performance results.
+Participation follows our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
+Coding agents should also read [AGENTS.md](AGENTS.md).
 
 ## License
 
-The current `LICENSE` is a release-staging notice and grants no redistribution
-rights. It must be replaced with the selected open-source license before the
-repository is made public.
+VClasp is licensed under the
+[GNU Affero General Public License v3.0](LICENSE), using the SPDX identifier
+`AGPL-3.0-only`. Linked third-party components retain their own licenses.

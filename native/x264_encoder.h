@@ -7,6 +7,9 @@ typedef struct x264_encoder_s VClaspX264Encoder;
 
 VClaspX264Encoder* vclasp_encoder_open(int width, int height, int crf,
                                   int gop_size, int anchor_p);
+VClaspX264Encoder* vclasp_encoder_open_configured(
+    int width, int height, int crf, int gop_size, int anchor_p,
+    int fps, const char *preset);
 
 VClaspX264Encoder* vclasp_encoder_open_two_level(int width, int height, int crf,
                                             int gop_size, int page_size);

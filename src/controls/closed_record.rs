@@ -1,9 +1,16 @@
+//! Closed-record executors used by representation and mechanism controls.
+//!
+//! This module implements the historical Prefix and Pair controls retained for
+//! reproducible ablations.  It is not the VClasp production request path.  The
+//! production reader is [`crate::hierarchical_scheduler::HierarchicalBatchExecutor`],
+//! whose `execute` method selects an action from request and layout geometry.
+
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::adaptive_planner::{PlanCandidate, PlanMode};
 use crate::backend::{CompletedRange, StorageBackend};
+use crate::controls::adaptive::{PlanCandidate, PlanMode};
 use crate::decoder;
 use crate::planner::{ByteCache, PlannedRecord, RangePlan, RecordRange};
 use crate::representation::{

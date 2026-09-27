@@ -14,7 +14,6 @@ fn main() {
 
     let mut build = cc::Build::new();
     build.file("native/x264_encoder.c");
-    build.include("native");
     if std::env::var_os("VCLASP_PATCHED_X264").is_some() {
         build.define("VCLASP_PATCHED_X264", None);
         println!("cargo:rustc-cfg=vclasp_patched_x264");

@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::adaptive_planner::{self, PlanCandidate, PlanMode};
 use crate::backend::{CompletedRange, StorageBackend};
+use crate::controls::adaptive::{self, PlanCandidate, PlanMode};
 use crate::decoder;
 use crate::hierarchical_layout::{
     AccessUnitRecord, DependencyLookaheadDecision, GopRegion, HierarchicalCostModel,
@@ -2060,36 +2060,38 @@ mod tests {
     fn shared_anchor_cache_survives_across_executors_and_delta_churn() {
         let shared = planner::shared_byte_cache(8);
         let slots = decoder::shared_decoder_slots(1);
-        let first = NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
-            Vec::new(),
-            Box::new(crate::backend::NoopBackend),
-            None,
-            None,
-            shared.clone(),
-            4,
-            0,
-            1,
-            DecodeSchedule::Repeated,
-            slots.clone(),
-            1,
-            1,
-        )
-        .unwrap();
-        let second = NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
-            Vec::new(),
-            Box::new(crate::backend::NoopBackend),
-            None,
-            None,
-            shared,
-            4,
-            0,
-            1,
-            DecodeSchedule::Repeated,
-            slots,
-            1,
-            1,
-        )
-        .unwrap();
+        let mut first =
+            NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
+                Vec::new(),
+                Box::new(crate::backend::NoopBackend),
+                None,
+                None,
+                shared.clone(),
+                4,
+                0,
+                1,
+                DecodeSchedule::Repeated,
+                slots.clone(),
+                1,
+                1,
+            )
+            .unwrap();
+        let mut second =
+            NormalizedBatchExecutor::new_with_decode_schedule_and_slots_and_anchor_cache(
+                Vec::new(),
+                Box::new(crate::backend::NoopBackend),
+                None,
+                None,
+                shared,
+                4,
+                0,
+                1,
+                DecodeSchedule::Repeated,
+                slots,
+                1,
+                1,
+            )
+            .unwrap();
 
         first.anchor_cache.lock().unwrap().put(99, vec![1; 8]);
         first.delta_cache.lock().unwrap().put(1, vec![2; 4]);
@@ -2250,23 +2252,22 @@ impl NormalizedBatchExecutor {
             .map(|(_, record)| record.clone())
             .collect::<Vec<_>>();
         let useful_bytes = planner::unique_covered_bytes(&records)?;
-        let mut candidates =
-            adaptive_planner::plans_for_thresholds(&records, self.max_range_bytes)?
-                .into_iter()
-                .map(|(threshold, plans)| {
-                    Ok(PlanCandidate {
-                        mode: PlanMode::Normalized {
-                            merge_threshold_bytes: threshold,
-                        },
-                        range_lengths: plans.iter().map(|plan| plan.length).collect(),
-                        useful_bytes,
-                        anchor_decodes,
-                        delta_decodes,
-                        prefix_frames: 0,
-                        prefix_resets: 0,
-                    })
+        let mut candidates = adaptive::plans_for_thresholds(&records, self.max_range_bytes)?
+            .into_iter()
+            .map(|(threshold, plans)| {
+                Ok(PlanCandidate {
+                    mode: PlanMode::Normalized {
+                        merge_threshold_bytes: threshold,
+                    },
+                    range_lengths: plans.iter().map(|plan| plan.length).collect(),
+                    useful_bytes,
+                    anchor_decodes,
+                    delta_decodes,
+                    prefix_frames: 0,
+                    prefix_resets: 0,
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let group_plans = planner::plan_group_spans(&grouped_records, self.max_range_bytes)?;
         candidates.push(PlanCandidate {
             mode: PlanMode::NormalizedGroupSpan,

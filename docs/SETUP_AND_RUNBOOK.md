@@ -46,13 +46,16 @@ pytest -q tests/test_logical_scheduler.py
 ```
 
 Do not copy or rename the compiled shared library manually; `maturin` installs
-the correctly named extension into the active environment.
+the correctly named extension into the active environment. In particular, a
+root-level `vclasp.so` shadows the installed extension when Python starts in
+the checkout and can silently run stale code. Diagnostic builds belong outside
+the source tree and must be identified by SHA-256.
 
 ## Format schema
 
-The source schema is `schemas/vclasp_chunk.fbs`. The checked-in Rust binding is
-`src/format/chunk_schema.rs`. Both must use file identifier `VCL1`. The runtime
-header also validates magic `VCLASP` and format version 1.
+The source schema is `schemas/chunk_v1.fbs`. The checked-in Rust binding is
+`src/format/chunk_schema.rs`. Both must use file identifier `VCSP`. The runtime
+header also validates magic `VClasp` and format version 1.
 
 This first public release intentionally has no reader for pre-release research
 chunks. Any schema change after `0.1.0` must increment the format version and
@@ -89,4 +92,5 @@ Anchor-P fixture test uses `VCLASP_ANCHOR_P_TEST_CHUNK`.
 2. The Python wheel builds with `maturin build --release --features ffmpeg`.
 3. Examples run from a clean clone.
 4. No prototype format identifier or compatibility schema is present.
-5. The selected open-source license replaces the staging notice.
+5. Package metadata declares `AGPL-3.0-only` and the repository contains the
+   complete GNU AGPLv3 license text.

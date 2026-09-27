@@ -47,7 +47,8 @@ static void setup_picture(x264_picture_t *pic, const uint8_t *yuv,
 
 static VClaspX264Encoder* vclasp_encoder_open_common(int width, int height, int crf,
                                                int gop_size, int reference_mode,
-                                               int page_size)
+                                               int page_size, int fps,
+                                               const char *preset)
 {
     VClaspX264Encoder *enc = calloc(1, sizeof(VClaspX264Encoder));
     if (!enc) return NULL;
@@ -61,7 +62,10 @@ static VClaspX264Encoder* vclasp_encoder_open_common(int width, int height, int 
     enc->checkpoint_pts = -1;
 
     x264_param_t param;
-    x264_param_default_preset(&param, "veryfast", NULL);
+    if (x264_param_default_preset(&param, preset ? preset : "veryfast", NULL) < 0) {
+        free(enc);
+        return NULL;
+    }
 
     param.i_width        = width;
     param.i_height       = height;
@@ -113,10 +117,10 @@ static VClaspX264Encoder* vclasp_encoder_open_common(int width, int height, int 
     param.b_interlaced = 0;
 
     param.b_vfr_input = 0;
-    param.i_fps_num  = 30;
+    param.i_fps_num  = fps > 0 ? fps : 30;
     param.i_fps_den  = 1;
     param.i_timebase_num = 1;
-    param.i_timebase_den = 30;
+    param.i_timebase_den = fps > 0 ? fps : 30;
 
     x264_param_apply_profile(&param, "baseline");
 
@@ -133,7 +137,15 @@ VClaspX264Encoder* vclasp_encoder_open(int width, int height, int crf,
                                   int gop_size, int anchor_p)
 {
     return vclasp_encoder_open_common(width, height, crf, gop_size,
-                                   anchor_p ? 1 : 0, 0);
+                                   anchor_p ? 1 : 0, 0, 30, "veryfast");
+}
+
+VClaspX264Encoder* vclasp_encoder_open_configured(
+    int width, int height, int crf, int gop_size, int anchor_p,
+    int fps, const char *preset)
+{
+    return vclasp_encoder_open_common(width, height, crf, gop_size,
+                                   anchor_p ? 1 : 0, 0, fps, preset);
 }
 
 VClaspX264Encoder* vclasp_encoder_open_two_level(int width, int height, int crf,
@@ -141,7 +153,8 @@ VClaspX264Encoder* vclasp_encoder_open_two_level(int width, int height, int crf,
 {
     if (page_size < 2 || gop_size < page_size || gop_size % page_size != 0)
         return NULL;
-    return vclasp_encoder_open_common(width, height, crf, gop_size, 2, page_size);
+    return vclasp_encoder_open_common(width, height, crf, gop_size, 2, page_size,
+                                   30, "veryfast");
 }
 
 VClaspX264Encoder* vclasp_encoder_open_page_session(int width, int height, int crf,
@@ -149,7 +162,8 @@ VClaspX264Encoder* vclasp_encoder_open_page_session(int width, int height, int c
 {
     if (keyint < 2)
         return NULL;
-    return vclasp_encoder_open_common(width, height, crf, keyint, 3, 0);
+    return vclasp_encoder_open_common(width, height, crf, keyint, 3, 0,
+                                   30, "veryfast");
 }
 
 int vclasp_encoder_encode_frame(VClaspX264Encoder* enc, const uint8_t* yuv,

@@ -7,7 +7,7 @@ use object_store::{ClientOptions, GetOptions, ObjectStore, ObjectStoreExt};
 use std::collections::BTreeMap;
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -26,6 +26,34 @@ pub struct CompletedRange {
     pub started_ns: u64,
     pub first_byte_ns: u64,
     pub completed_ns: u64,
+    pub physical_requests: usize,
+    pub physical_fetched_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectStorePressure {
+    pub max_concurrency: usize,
+    pub active_requests: usize,
+    pub outstanding_requests: usize,
+    pub queued_requests: usize,
+    pub service_time_ns_ewma: u64,
+}
+
+struct OutstandingRequestGuard {
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl OutstandingRequestGuard {
+    fn new(outstanding: Arc<AtomicUsize>) -> Self {
+        outstanding.fetch_add(1, Ordering::AcqRel);
+        Self { outstanding }
+    }
+}
+
+impl Drop for OutstandingRequestGuard {
+    fn drop(&mut self) {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// One persistent object GET with bounded producer/consumer buffering.
@@ -66,6 +94,8 @@ pub struct S3ObjectStoreClient {
     store: Arc<dyn ObjectStore>,
     runtime: Arc<tokio::runtime::Runtime>,
     request_budget: Arc<Semaphore>,
+    outstanding_requests: Arc<AtomicUsize>,
+    service_time_ns_ewma: Arc<AtomicU64>,
     max_concurrency: usize,
 }
 
@@ -106,8 +136,24 @@ impl S3ObjectStoreClient {
             store: Arc::new(store),
             runtime: Arc::new(runtime),
             request_budget: Arc::new(Semaphore::new(max_concurrency)),
+            outstanding_requests: Arc::new(AtomicUsize::new(0)),
+            service_time_ns_ewma: Arc::new(AtomicU64::new(0)),
             max_concurrency,
         })
+    }
+
+    pub fn pressure_snapshot(&self) -> ObjectStorePressure {
+        let active_requests = self
+            .max_concurrency
+            .saturating_sub(self.request_budget.available_permits());
+        let outstanding_requests = self.outstanding_requests.load(Ordering::Acquire);
+        ObjectStorePressure {
+            max_concurrency: self.max_concurrency,
+            active_requests,
+            outstanding_requests,
+            queued_requests: outstanding_requests.saturating_sub(active_requests),
+            service_time_ns_ewma: self.service_time_ns_ewma.load(Ordering::Acquire),
+        }
     }
 
     fn validate(ranges: &[ObjectRange]) -> Result<(), Box<dyn std::error::Error>> {
@@ -156,12 +202,14 @@ impl S3ObjectStoreClient {
         }
         let store = Arc::clone(&self.store);
         let request_budget = Arc::clone(&self.request_budget);
+        let outstanding = OutstandingRequestGuard::new(Arc::clone(&self.outstanding_requests));
         let runtime = Arc::clone(&self.runtime);
         let key = ObjectPath::from(object_key);
         let (sender, receiver) = tokio::sync::mpsc::channel(buffered_chunks);
         let bytes_received = Arc::new(AtomicU64::new(0));
         let task_bytes_received = Arc::clone(&bytes_received);
         self.runtime.spawn(async move {
+            let _outstanding = outstanding;
             let result = async {
                 let _permit = request_budget
                     .acquire_owned()
@@ -198,6 +246,8 @@ impl S3ObjectStoreClient {
         Self::validate(ranges)?;
         let store = Arc::clone(&self.store);
         let request_budget = Arc::clone(&self.request_budget);
+        let outstanding_requests = Arc::clone(&self.outstanding_requests);
+        let service_time_ns_ewma = Arc::clone(&self.service_time_ns_ewma);
         let requested = ranges.to_vec();
         let max_concurrency = self.max_concurrency;
         let started = Instant::now();
@@ -213,7 +263,9 @@ impl S3ObjectStoreClient {
                 };
                 let store = Arc::clone(&store);
                 let request_budget = Arc::clone(&request_budget);
+                let outstanding = OutstandingRequestGuard::new(Arc::clone(&outstanding_requests));
                 requests.spawn(async move {
+                    let _outstanding = outstanding;
                     let _permit = request_budget.acquire_owned().await.map_err(|error| {
                         object_store::Error::Generic {
                             store: "S3ObjectStoreClient",
@@ -252,6 +304,8 @@ impl S3ObjectStoreClient {
                     }
                     Ok::<_, object_store::Error>(CompletedRange {
                         index,
+                        physical_requests: 1,
+                        physical_fetched_bytes: bytes.len() as u64,
                         bytes,
                         started_ns: range_started,
                         first_byte_ns,
@@ -267,6 +321,24 @@ impl S3ObjectStoreClient {
             }
             while let Some(completed) = requests.join_next().await {
                 let completed = completed??;
+                let sample = completed.completed_ns.saturating_sub(completed.started_ns);
+                let mut previous = service_time_ns_ewma.load(Ordering::Acquire);
+                loop {
+                    let next = if previous == 0 {
+                        sample
+                    } else {
+                        previous.saturating_mul(7).saturating_add(sample) / 8
+                    };
+                    match service_time_ns_ewma.compare_exchange_weak(
+                        previous,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => previous = observed,
+                    }
+                }
                 // Refill the bounded queue before invoking a potentially
                 // expensive decode callback. This preserves transport/decode
                 // overlap while honoring the planner's input order.
@@ -318,12 +390,15 @@ impl S3ObjectStoreClient {
 
         let store = Arc::clone(&self.store);
         let request_budget = Arc::clone(&self.request_budget);
+        let outstanding_requests = Arc::clone(&self.outstanding_requests);
         let fetched = self.runtime.block_on(async move {
             let mut tasks = JoinSet::new();
             for (object_key, entries) in grouped {
                 let store = Arc::clone(&store);
                 let request_budget = Arc::clone(&request_budget);
+                let outstanding = OutstandingRequestGuard::new(Arc::clone(&outstanding_requests));
                 tasks.spawn(async move {
+                    let _outstanding = outstanding;
                     // Bound independent objects. The vectored-read call retains
                     // object_store's own documented per-object scheduling.
                     let _permit = request_budget.acquire_owned().await.map_err(|error| {
@@ -614,7 +689,59 @@ mod tests {
         assert!(Arc::ptr_eq(&client.store, &clone.store));
         assert!(Arc::ptr_eq(&client.runtime, &clone.runtime));
         assert!(Arc::ptr_eq(&client.request_budget, &clone.request_budget));
+        assert!(Arc::ptr_eq(
+            &client.outstanding_requests,
+            &clone.outstanding_requests
+        ));
+        assert!(Arc::ptr_eq(
+            &client.service_time_ns_ewma,
+            &clone.service_time_ns_ewma
+        ));
         assert_eq!(client.request_budget.available_permits(), 3);
+    }
+
+    #[test]
+    fn pressure_snapshot_separates_active_and_queued_requests() {
+        let client = S3ObjectStoreClient::new(
+            "http://127.0.0.1:1".to_string(),
+            "test-bucket".to_string(),
+            "access".to_string(),
+            "secret".to_string(),
+            "us-east-1".to_string(),
+            1,
+        )
+        .expect("client construction must not contact the endpoint");
+        let active = OutstandingRequestGuard::new(Arc::clone(&client.outstanding_requests));
+        let permit = client
+            .runtime
+            .block_on(Arc::clone(&client.request_budget).acquire_owned())
+            .unwrap();
+        let queued = OutstandingRequestGuard::new(Arc::clone(&client.outstanding_requests));
+
+        assert_eq!(
+            client.pressure_snapshot(),
+            ObjectStorePressure {
+                max_concurrency: 1,
+                active_requests: 1,
+                outstanding_requests: 2,
+                queued_requests: 1,
+                service_time_ns_ewma: 0,
+            }
+        );
+
+        drop(queued);
+        drop(permit);
+        drop(active);
+        assert_eq!(
+            client.pressure_snapshot(),
+            ObjectStorePressure {
+                max_concurrency: 1,
+                active_requests: 0,
+                outstanding_requests: 0,
+                queued_requests: 0,
+                service_time_ns_ewma: 0,
+            }
+        );
     }
 
     #[test]

@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::backend::StorageBackend;
+use crate::controls::closed_record::{ClosedRecordBatchExecutor, ClosedRecordDescriptor};
+use crate::controls::normalized::{DecodeSchedule, NormalizedBatchExecutor, NormalizedDescriptor};
 use crate::decoder;
-use crate::normalized_scheduler::{DecodeSchedule, NormalizedBatchExecutor, NormalizedDescriptor};
-use crate::pair_scheduler::{ClosedRecordBatchExecutor, ClosedRecordDescriptor};
 use crate::representation::{
     BatchStats, DependencyClosure, DependencyKind, LogicalRequest, OuterPlanner, PhysicalRecord,
     Representation, SampleRepresentations,

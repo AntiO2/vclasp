@@ -2,7 +2,7 @@
 name = "vclasp"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+license = "AGPL-3.0-only"
 description = "Codec-closure planning and selective video decode for object storage"
 repository = "https://github.com/AntiO2/vclasp"
 readme = "README.md"
@@ -35,6 +35,10 @@ ffmpeg-next = { version = "6.1", default-features = false, features = ["codec", 
 [features]
 default = []
 ffmpeg = ["dep:ffmpeg-next"]
+experiment-controls = ["ffmpeg"]
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

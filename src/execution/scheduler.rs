@@ -14,6 +14,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 #[cfg(feature = "ffmpeg")]
+use pyo3::prelude::*;
+#[cfg(feature = "ffmpeg")]
+use pyo3::types::PyBytes;
+
+#[cfg(feature = "ffmpeg")]
 use crate::chunk;
 #[cfg(feature = "ffmpeg")]
 use crate::decoder;
@@ -279,6 +284,13 @@ pub struct SchedulerStats {
     pub decode_batches: usize,
     pub total_frames: usize,
     pub max_fetch_records: usize,
+    // legacy compatibility
+    pub coalesced_gets: usize,
+    pub uncoalesced_gets: usize,
+    pub bytes_read: u64,
+    pub uncoalesced_bytes: u64,
+    pub records_read: usize,
+    pub max_batch_size: usize,
     pub resolve_ns: u64,
     pub plan_ns: u64,
     pub fetch_wall_ns: u64,
@@ -479,6 +491,12 @@ impl LogicalScheduler {
             decode_batches: 0,
             total_frames: 0,
             max_fetch_records: 0,
+            coalesced_gets: 0,
+            uncoalesced_gets: 0,
+            bytes_read: 0,
+            uncoalesced_bytes: 0,
+            records_read: 0,
+            max_batch_size: 0,
             resolve_ns: 0,
             plan_ns: 0,
             fetch_wall_ns: 0,
@@ -546,8 +564,8 @@ impl LogicalScheduler {
                 )?;
 
                 stats.decode_batches += 1;
-                stats.records_decoded += count;
-                stats.max_fetch_records = stats.max_fetch_records.max(count);
+                stats.records_read += count;
+                stats.max_batch_size = stats.max_batch_size.max(count);
                 stats.total_frames += frames.len();
 
                 for &(pos, sample_id, frame_idx, rec_idx) in cluster_slice {
@@ -709,7 +727,7 @@ impl LogicalScheduler {
         if let Some(thresh) = self.merge_threshold {
             let mut i = 0usize;
             while i < unique.len() {
-                let lo = unique[i].0;
+                let mut lo = unique[i].0;
                 let mut hi = lo + unique[i].1;
                 let mut indices = vec![i];
                 let mut j = i + 1;
@@ -771,6 +789,12 @@ impl LogicalScheduler {
             decode_batches: 0,
             total_frames: 0,
             max_fetch_records: 0,
+            coalesced_gets: plans.len(),
+            uncoalesced_gets: unique_records,
+            bytes_read: 0,
+            uncoalesced_bytes: useful_bytes,
+            records_read: unique_records,
+            max_batch_size: 0,
             resolve_ns,
             plan_ns,
             fetch_wall_ns: 0,
@@ -903,6 +927,8 @@ impl LogicalScheduler {
                     stats.fetch_service_ns_sum += completed_ns.saturating_sub(range_started);
                     completed_ranges[index] = Some(crate::backend::CompletedRange {
                         index,
+                        physical_requests: 1,
+                        physical_fetched_bytes: bytes.len() as u64,
                         bytes,
                         started_ns: range_started,
                         first_byte_ns: completed_ns,
@@ -943,6 +969,10 @@ impl LogicalScheduler {
             })
             .collect::<Result<Vec<_>, _>>()?;
         stats.reorder_ns = reorder_started.elapsed().as_nanos() as u64;
+        // Sync legacy stats fields
+        stats.bytes_read = stats.fetched_bytes;
+        stats.uncoalesced_bytes = stats.useful_bytes;
+        stats.records_read = stats.records_decoded;
         stats.total_ns = total_started.elapsed().as_nanos() as u64;
         let measured_pipeline_ns = stats
             .total_ns
@@ -1020,9 +1050,12 @@ mod tests {
             for index in (0..ranges.len()).rev() {
                 let range_started = started.elapsed().as_nanos() as u64;
                 let (offset, length) = ranges[index];
+                let bytes = self.read_byte_range(offset, length)?;
                 callback(CompletedRange {
                     index,
-                    bytes: self.read_byte_range(offset, length)?,
+                    physical_requests: 1,
+                    physical_fetched_bytes: bytes.len() as u64,
+                    bytes,
                     started_ns: range_started,
                     first_byte_ns: started.elapsed().as_nanos() as u64,
                     completed_ns: started.elapsed().as_nanos() as u64,
@@ -1092,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schedule_rejects_missing_records() {
+    fn test_legacy_schedule_rejects_missing_records() {
         let reader = open_smoke_chunk();
         if reader.is_none() {
             return;
@@ -1109,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schedule_rejects_out_of_range_frame() {
+    fn test_legacy_schedule_rejects_out_of_range_frame() {
         let reader = open_smoke_chunk();
         if reader.is_none() {
             return;

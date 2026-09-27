@@ -1,4 +1,4 @@
-namespace vclasp.format;
+namespace vclasp;
 
 table ChunkHeader {
   magic:string;
@@ -15,4 +15,4 @@ table ChunkHeader {
 }
 
 root_type ChunkHeader;
-file_identifier "VCL1";
+file_identifier "VCSP";

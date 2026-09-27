@@ -1,0 +1,30 @@
+name: Performance report
+description: Share a reproducible slowdown or resource-usage issue.
+title: "[Performance]: "
+body:
+  - type: textarea
+    id: result
+    attributes:
+      label: Measurements
+      description: Report latency or throughput, units, repetitions, and the compared versions. Attach small machine-readable summaries when possible.
+    validations:
+      required: true
+  - type: textarea
+    id: request
+    attributes:
+      label: Requests and input
+      description: Describe targets per clip/batch, order, visible window, video dimensions, chunk layout, and codec parameters. State how the trace can be reproduced.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Execution setup
+      description: Include commit, build profile, CPU/RAM, backend and network, I/O/decode concurrency, cache state and budget, warmup, and measured interval. Remove secrets and private endpoints.
+    validations:
+      required: true
+  - type: textarea
+    id: attribution
+    attributes:
+      label: Supporting counters
+      description: If available, include GET count, fetched bytes, submitted AUs, CPU time, peak memory, and correctness checks. Leave unavailable metrics unspecified.

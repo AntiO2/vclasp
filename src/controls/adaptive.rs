@@ -1,8 +1,10 @@
 use std::collections::HashSet;
 
-use crate::normalized_scheduler::NormalizedDescriptor;
-use crate::normalized_scheduler::{NormalizedBatchExecutor, NormalizedFrame};
-use crate::pair_scheduler::{ClosedRecordBatchExecutor, ClosedRecordDescriptor, ClosedRecordFrame};
+use crate::controls::closed_record::{
+    ClosedRecordBatchExecutor, ClosedRecordDescriptor, ClosedRecordFrame,
+};
+use crate::controls::normalized::NormalizedDescriptor;
+use crate::controls::normalized::{NormalizedBatchExecutor, NormalizedFrame};
 use crate::planner::{self, RangePlan, RecordRange};
 use crate::representation::BatchStats;
 
