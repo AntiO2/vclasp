@@ -42,6 +42,12 @@ branch or fork. Keep each pull request focused on one change and use an
 existing checkout when practical. Additional worktrees are optional, not a
 requirement of this project.
 
+Only **Squash and merge** is allowed. Merge commits and rebase merges are
+disabled in repository settings. Do not merge PRs automatically or bypass branch
+protection. After a PR is squash-merged, fetch `origin/main` and start the next
+PR branch from that revision; do not keep pushing follow-up work to the merged
+PR branch. Check the remote PR state before every submission.
+
 Describe the problem, the resulting behavior, and the checks you ran. Call out
 any public API or file-format change, including whether existing chunks must
 be rebuilt. Preserve unrelated work in the working tree.
@@ -97,7 +103,7 @@ Run the checks relevant to the files you changed:
 ```bash
 cargo fmt --all --check
 cargo fmt --manifest-path object-store-transport/Cargo.toml --all --check
-python -m ruff format --check tests examples
+python -m ruff format --check tests examples scripts/ci
 cargo build --locked --features ffmpeg --lib --examples
 cargo test --locked --features ffmpeg --lib --test rust_session_api
 cargo test --locked --manifest-path object-store-transport/Cargo.toml --lib
@@ -106,15 +112,23 @@ python -m pytest
 git diff --check
 ```
 
-GitHub Actions runs four independent checks: **Format**, **Build**, **Rust unit
-tests**, and **Python unit tests**. The Rust and Python test jobs run in parallel
-on separate runners. CI installs the native CPU codec dependencies; it does not
+GitHub Actions runs **Format** independently. **Build** compiles the FFmpeg-enabled
+core and public API tests, the transport tests, and the Python extension. It
+publishes the executables and extension as one artifact. **Rust unit tests** and
+**Python unit tests** both depend only on **Build** and run in parallel on separate
+runners. Neither test job invokes Cargo or maturin; Python imports the prebuilt
+extension directly, so Rust tests do not wait for wheel packaging. CI installs
+build dependencies only in **Build** and codec runtime libraries in test jobs. It does not
 require a GPU, a dataset, or a running object store. Local-storage tests create
 their files with Rust `tempfile` or pytest `tmp_path` under the runner's temporary
 directory and remove them when the tests finish. Fixture-dependent Rust tests
 remain ignored, and Python tests marked `integration` are excluded by default.
 
-Use `cargo fmt --all` and `python -m ruff format tests examples` to apply the
+This CI covers the production FFmpeg configuration and unit tests. The additional
+default-feature, example, and experiment-control checks above remain local
+development checks. Wheel packaging is not part of this unit-test workflow.
+
+Use `cargo fmt --all` and `python -m ruff format tests examples scripts/ci` to apply the
 formatting checked by CI. CI pins Rust and Python in
 [the workflow](.github/workflows/ci.yml) and Python development tools in
 [requirements-dev.txt](requirements-dev.txt).

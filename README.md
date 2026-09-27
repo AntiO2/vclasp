@@ -60,8 +60,9 @@ Fixture-backed decode tests are ignored unless `VCLASP_TEST_CHUNK` is set. The
 default suite does not require private datasets.
 
 [CI](.github/workflows/ci.yml) checks Rust/Python formatting, compilation, and
-unit tests. Rust and Python tests run as independent parallel jobs with local
-temporary files; no object-store service is required. See
+unit tests. One build publishes test executables and the Python extension;
+Rust and Python tests then run in parallel without recompilation, using local
+temporary files. No object-store service is required. See
 [Contributing](CONTRIBUTING.md#validate-the-change) for the matching commands.
 
 New chunks use FlatBuffer identifier `VCSP`, header magic `VClasp`, and format

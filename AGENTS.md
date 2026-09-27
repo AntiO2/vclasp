@@ -12,6 +12,11 @@ unless the user explicitly requests them. `main` is protected: submit changes
 through pull requests and never bypass protection or force-push it. Preserve
 unrelated and uncommitted work.
 
+This repository allows only Squash Merge. Check the remote PR state before
+pushing. Once a PR is merged, start follow-up PRs from the updated `origin/main`
+in this same checkout; do not reuse the merged PR branch or replay its commits.
+Never auto-merge a PR unless the user explicitly requests it.
+
 Before creating an issue or pull request, follow the title conventions in
 `CONTRIBUTING.md` and the repository templates. Verify the submitted title and
 body, including the full branch diff and any breaking API or format changes.
