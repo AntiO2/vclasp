@@ -1,5 +1,9 @@
 name: Set up native build dependencies
-description: Install the CPU codec toolchain used by build and unit-test jobs.
+description: Install codec build dependencies or just the runtime libraries.
+inputs:
+  runtime-only:
+    description: Skip compilers and Rust when running prebuilt tests.
+    default: "false"
 runs:
   using: composite
   steps:
@@ -7,11 +11,16 @@ runs:
       shell: bash
       run: |
         sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          build-essential pkg-config clang libclang-dev \
-          libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-          libx264-dev ffmpeg
+        if [[ "${{ inputs.runtime-only }}" == "true" ]]; then
+          sudo apt-get install -y --no-install-recommends ffmpeg
+        else
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+            libx264-dev ffmpeg
+        fi
     - name: Select Rust toolchain
+      if: inputs.runtime-only != 'true'
       shell: bash
       run: |
         rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
