@@ -12,6 +12,10 @@ unless the user explicitly requests them. `main` is protected: submit changes
 through pull requests and never bypass protection or force-push it. Preserve
 unrelated and uncommitted work.
 
+Before creating an issue or pull request, follow the title conventions in
+`CONTRIBUTING.md` and the repository templates. Verify the submitted title and
+body, including the full branch diff and any breaking API or format changes.
+
 ## Architecture
 
 - `VClaspSession` is the production request interface. Local, S3, and AIStore

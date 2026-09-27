@@ -46,6 +46,35 @@ Describe the problem, the resulting behavior, and the checks you ran. Call out
 any public API or file-format change, including whether existing chunks must
 be rebuilt. Preserve unrelated work in the working tree.
 
+## Issue and pull request titles
+
+Use a specific English summary describing the problem or change, not a task
+number, branch name, or a generic title such as "update" or "fix bugs".
+
+Issue titles keep the prefixes supplied by the issue templates:
+
+- `[Bug]: <observed problem>`
+- `[Feature]: <requested capability>`
+- `[Performance]: <operation and observed regression>`
+
+Pull request titles use `<type>(<scope>): <summary>`. The scope is optional;
+types are `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`,
+`chore`, and `revert`. Use a short imperative summary without a trailing period.
+Choose the type for the main change, and describe secondary changes in the PR
+body. For a breaking API or format change, add `!` before the colon and explain
+the migration in the PR body.
+
+Examples:
+
+- `feat(core)!: unify the session API and chunk format`
+- `fix(storage): reject ranges beyond the payload`
+- `ci: run Rust and Python unit tests in parallel`
+- `docs: document local build dependencies`
+
+Link related issues in the body using `Closes #123` only when the PR fully
+resolves them; otherwise use `Refs #123`. Check the title before opening or
+merging a PR. Squash-merge commit titles should follow the same PR convention.
+
 ## Keep the core reusable
 
 - Applications submit logical targets through `VClaspSession`; the backend is

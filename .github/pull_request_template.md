@@ -1,3 +1,6 @@
+<!-- Title: <type>(<scope>): <summary>. Scope is optional; add ! for breaking changes.
+See CONTRIBUTING.md for allowed types and examples. -->
+
 ## Change
 
 Describe the problem and resulting behavior. Link a related issue if applicable.
@@ -10,6 +13,7 @@ location.
 
 ## Review checklist
 
+- [ ] The title follows CONTRIBUTING.md, and related issues are linked in the body.
 - [ ] The change preserves target identity, duplicates, batch boundaries, and order, or explicitly documents an intended API change.
 - [ ] Relevant tests and examples are updated; documentation-only changes were checked for links and accuracy.
 - [ ] Public API, file-format, dependency, and resource-budget changes are described above, if applicable.
