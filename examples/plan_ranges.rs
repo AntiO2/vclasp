@@ -1,4 +1,4 @@
-use vclasp::{plan_ranges, RecordRange};
+use vclasp::{plan_byte_ranges, RecordRange};
 
 fn main() -> Result<(), String> {
     let records = vec![
@@ -14,7 +14,7 @@ fn main() -> Result<(), String> {
         },
     ];
 
-    let plans = plan_ranges(&records, Some(16 * 1024), None)?;
+    let plans = plan_byte_ranges(&records, Some(16 * 1024), None)?;
     assert_eq!(plans.len(), 1);
     println!(
         "planned {} range covering {} records",

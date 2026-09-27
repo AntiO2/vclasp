@@ -29,7 +29,7 @@ cargo build --release
 ### Rust
 
 ```rust
-use vclasp::{plan_ranges, PlannedRecord, RangePlan, RecordRange};
+use vclasp::{plan_byte_ranges, PlannedRecord, RangePlan, RecordRange};
 
 let records = vec![
     RecordRange { record_id: 10, offset: 4096, length: 800 },
@@ -37,7 +37,7 @@ let records = vec![
 ];
 
 // Merge positive gaps up to 16 KiB. None disables the maximum range size.
-let plans: Vec<RangePlan> = plan_ranges(&records, Some(16 * 1024), None)?;
+let plans: Vec<RangePlan> = plan_byte_ranges(&records, Some(16 * 1024), None)?;
 assert_eq!(plans.len(), 1);
 # Ok::<(), String>(())
 ```
@@ -361,7 +361,7 @@ source and configuration used for registered ablations.
 
 ## Errors and invariants
 
-- The reader accepts only FlatBuffer identifier `VCL1`, magic `VCL`, and
+- The reader accepts only FlatBuffer identifier `VCSP`, magic `VClasp`, and
   format version 1.
 - Logical duplicates and request order are preserved.
 - Positive-gap bytes may be fetched but never decoded.

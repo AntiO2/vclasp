@@ -7,7 +7,7 @@ use memmap2::Mmap;
 use crate::chunk_schema;
 use crate::index::IndexReader;
 
-pub const FORMAT_MAGIC: &str = "VCL";
+pub const FORMAT_MAGIC: &str = "VClasp";
 pub const FORMAT_VERSION: u16 = 1;
 pub const DEFAULT_CODEC: &str = "h264";
 pub const DEFAULT_WIDTH: u16 = 320;
@@ -383,4 +383,67 @@ fn validate_header(
         return Err("header.index_length must be non-zero".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_bytes(magic_value: &str, version: u16, identifier: &str) -> Vec<u8> {
+        let mut builder = flatbuffers::FlatBufferBuilder::new();
+        let magic = builder.create_string(magic_value);
+        let codec = builder.create_string(DEFAULT_CODEC);
+        let header = chunk_schema::create_chunk_header(
+            &mut builder,
+            &chunk_schema::ChunkHeaderArgs {
+                magic,
+                format_version: version,
+                codec,
+                width: DEFAULT_WIDTH,
+                height: DEFAULT_HEIGHT,
+                fps_num: DEFAULT_FPS_NUM,
+                fps_den: DEFAULT_FPS_DEN,
+                sps_pps_length: 1,
+                payload_length: 1,
+                index_length: 1,
+                created_at: 0,
+            },
+        );
+        builder.finish(header, Some(identifier));
+        builder.finished_data().to_vec()
+    }
+
+    #[test]
+    fn current_header_identity_is_explicit() {
+        let bytes = header_bytes(FORMAT_MAGIC, FORMAT_VERSION, chunk_schema::FILE_IDENTIFIER);
+        assert!(flatbuffers::buffer_has_identifier(
+            &bytes,
+            chunk_schema::FILE_IDENTIFIER,
+            false
+        ));
+        validate_header(&chunk_schema::root_as_chunk_header(&bytes)).unwrap();
+        assert_eq!(chunk_schema::FILE_IDENTIFIER, "VCSP");
+        assert_eq!(FORMAT_MAGIC, "VClasp");
+        assert_eq!(FORMAT_VERSION, 1);
+    }
+
+    #[test]
+    fn header_rejects_other_identity_or_version() {
+        let wrong_identifier = header_bytes(FORMAT_MAGIC, FORMAT_VERSION, "BAD!");
+        assert!(!flatbuffers::buffer_has_identifier(
+            &wrong_identifier,
+            chunk_schema::FILE_IDENTIFIER,
+            false
+        ));
+
+        let wrong_magic = header_bytes("INVALID", FORMAT_VERSION, chunk_schema::FILE_IDENTIFIER);
+        assert!(validate_header(&chunk_schema::root_as_chunk_header(&wrong_magic)).is_err());
+
+        let wrong_version = header_bytes(
+            FORMAT_MAGIC,
+            FORMAT_VERSION + 1,
+            chunk_schema::FILE_IDENTIFIER,
+        );
+        assert!(validate_header(&chunk_schema::root_as_chunk_header(&wrong_version)).is_err());
+    }
 }

@@ -70,9 +70,9 @@ pub mod session;
 #[path = "execution/simd.rs"]
 mod simd;
 
-pub use planner::{
-    plan_byte_ranges as plan_ranges, unique_covered_bytes, PlannedRecord, RangePlan, RecordRange,
-};
+pub use planner::{plan_byte_ranges, unique_covered_bytes, PlannedRecord, RangePlan, RecordRange};
+// Keep the research crate spelling as an alias; plan_byte_ranges is the public name.
+pub use planner::plan_byte_ranges as plan_ranges;
 
 /// Python-facing VClasp chunk reader.
 #[pyclass]
@@ -1534,9 +1534,9 @@ impl ByteCache {
     }
 }
 
-#[pyfunction]
+#[pyfunction(name = "plan_byte_ranges")]
 #[pyo3(signature = (records, merge_threshold_bytes=None, max_range_bytes=None))]
-fn plan_byte_ranges(
+fn plan_byte_ranges_py(
     records: Vec<(u64, u64, u64)>,
     merge_threshold_bytes: Option<u64>,
     max_range_bytes: Option<u64>,
@@ -6528,6 +6528,6 @@ fn vclasp(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_vclasp_chunk_profiled, m)?)?;
     #[cfg(feature = "experiment-controls")]
     m.add_function(wrap_pyfunction!(write_chunk_from_files, m)?)?;
-    m.add_function(wrap_pyfunction!(plan_byte_ranges, m)?)?;
+    m.add_function(wrap_pyfunction!(plan_byte_ranges_py, m)?)?;
     Ok(())
 }

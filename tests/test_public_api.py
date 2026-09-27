@@ -30,6 +30,13 @@ def test_production_executors_share_one_request_interface():
         assert "inspect_sparse_candidates" not in methods
 
 
+def test_public_entry_points_are_explicit():
+    assert callable(vclasp.build_vclasp_chunk)
+    assert callable(vclasp.plan_byte_ranges)
+    assert callable(vclasp.VClaspSession.local)
+    assert callable(vclasp.VClaspSession.aistore)
+
+
 def test_historical_readers_are_not_public_module_members():
     historical = {
         "LocalVClaspExecutor",

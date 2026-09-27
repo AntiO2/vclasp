@@ -54,8 +54,8 @@ the source tree and must be identified by SHA-256.
 ## Format schema
 
 The source schema is `schemas/chunk_v1.fbs`. The checked-in Rust binding is
-`src/format/chunk_schema.rs`. Both must use file identifier `VCL1`. The runtime
-header also validates magic `VCL` and format version 1.
+`src/format/chunk_schema.rs`. Both must use file identifier `VCSP`. The runtime
+header also validates magic `VClasp` and format version 1.
 
 This first public release intentionally has no reader for pre-release research
 chunks. Any schema change after `0.1.0` must increment the format version and

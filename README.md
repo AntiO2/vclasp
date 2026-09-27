@@ -28,7 +28,7 @@ belong in the separate reproducibility artifact, not this reusable core.
 
 ## Requirements
 
-Verified on Ubuntu x86-64 with Rust stable, Python 3.12, and FFmpeg 6.x.
+Verified on Ubuntu x86-64 with Rust 1.96, Python 3.12, and FFmpeg 6.x.
 
 ```bash
 sudo apt-get update
@@ -45,12 +45,18 @@ pkg-config --modversion libavcodec libavformat libavutil libswscale
 ```bash
 cargo test --release --features ffmpeg
 cargo build --release --features ffmpeg
-cp target/release/libvclasp.so vclasp.so
-PYTHONPATH="$PWD" python -c 'import vclasp; print(vclasp.__file__)'
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e . pytest
+python -m pytest tests/test_public_api.py
 ```
 
 Fixture-backed decode tests are ignored unless `VCLASP_TEST_CHUNK` is set. The
 default suite does not require private datasets.
+
+New chunks use FlatBuffer identifier `VCSP`, header magic `VClasp`, and format
+version 1. Earlier pre-release chunks must be rebuilt; the reader does not
+accept their format identifiers.
 
 ## Python quick start
 
