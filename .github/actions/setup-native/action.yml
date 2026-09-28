@@ -7,18 +7,28 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Install FFmpeg and x264 development packages
+    - name: Install native build tools
       shell: bash
       run: |
         sudo apt-get update
-        if [[ "${{ inputs.runtime-only }}" == "true" ]]; then
-          sudo apt-get install -y --no-install-recommends ffmpeg
-        else
+        if [[ "${{ inputs.runtime-only }}" != "true" ]]; then
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config clang libclang-dev \
-            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-            libx264-dev ffmpeg
+            build-essential pkg-config clang libclang-dev
         fi
+    - uses: mamba-org/setup-micromamba@f457c30a868e4760d3a6fcea5f25dc655b8edf39 # v3
+      id: native-env
+      with:
+        environment-file: environment/ci-native.yml
+        environment-name: vclasp-native
+        cache-environment: true
+    - name: Select codec libraries
+      shell: bash
+      run: |
+        native="${{ steps.native-env.outputs.environment-path }}"
+        echo "PKG_CONFIG_PATH=$native/lib/pkgconfig" >> "$GITHUB_ENV"
+        echo "VCLASP_NATIVE_LIB=$native/lib" >> "$GITHUB_ENV"
+        echo "$native/bin" >> "$GITHUB_PATH"
+        test -f "$native/lib/pkgconfig/libavcodec.pc"
     - name: Select Rust toolchain
       if: inputs.runtime-only != 'true'
       shell: bash

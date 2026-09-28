@@ -1,0 +1,8 @@
+name: vclasp-native
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - ffmpeg=7.1.1
+  - x264

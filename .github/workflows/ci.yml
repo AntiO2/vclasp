@@ -41,7 +41,7 @@ jobs:
           cargo fmt --all --check
           cargo fmt --manifest-path object-store-transport/Cargo.toml --all --check
       - name: Check Python formatting
-        run: python -m ruff format --check tests examples scripts/ci
+        run: python -m ruff format --check tests examples scripts/ci scripts/doctor.py
 
   build:
     name: Build
@@ -58,6 +58,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: unit-test-build
+      - name: Check codec toolchain
+        run: python scripts/doctor.py
       - name: Compile Rust tests and Python extension
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
@@ -91,6 +93,7 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: |
+          export LD_LIBRARY_PATH="$VCLASP_NATIVE_LIB"
           tar -xf "$RUNNER_TEMP/test-build/unit-test-artifacts.tar" -C "$RUNNER_TEMP/test-build"
           "$RUNNER_TEMP/test-build/rust-tests/vclasp"
           "$RUNNER_TEMP/test-build/rust-tests/rust_session_api"
@@ -125,4 +128,6 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
           PYTHONPATH: ${{ runner.temp }}/test-build/python
-        run: python -m pytest --basetemp "$RUNNER_TEMP/pytest"
+        run: |
+          export LD_LIBRARY_PATH="$VCLASP_NATIVE_LIB"
+          python -m pytest --basetemp "$RUNNER_TEMP/pytest"

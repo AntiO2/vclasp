@@ -20,12 +20,15 @@ Install the native dependencies listed in the [setup guide](docs/SETUP_AND_RUNBO
 Then, from the repository root:
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
+micromamba create -f environment/ci-native.yml
+micromamba activate vclasp-native
+export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig"
+export PATH="$CONDA_PREFIX/bin:$PATH"
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" python scripts/doctor.py
 python -m pip install -r requirements-dev.txt
 python -m pip install -e .
-cargo test --locked --features ffmpeg --lib --test rust_session_api
-python -m pytest
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" cargo test --locked --features ffmpeg --lib --test rust_session_api
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" python -m pytest
 ```
 
 The Python extension is built with the `ffmpeg` feature by `pyproject.toml`.
@@ -128,7 +131,7 @@ This CI covers the production FFmpeg configuration and unit tests. The additiona
 default-feature, example, and experiment-control checks above remain local
 development checks. Wheel packaging is not part of this unit-test workflow.
 
-Use `cargo fmt --all` and `python -m ruff format tests examples scripts/ci` to apply the
+Use `cargo fmt --all` and `python -m ruff format tests examples scripts/ci scripts/doctor.py` to apply the
 formatting checked by CI. CI pins Rust and Python in
 [the workflow](.github/workflows/ci.yml) and Python development tools in
 [requirements-dev.txt](requirements-dev.txt).

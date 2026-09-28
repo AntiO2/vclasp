@@ -32,28 +32,35 @@ See the [API guide](docs/API.md) for application examples, the
 
 ## Requirements
 
-Verified on Ubuntu x86-64 with Rust 1.96, Python 3.12, and FFmpeg 6.x.
+Verified on Ubuntu x86-64 with Rust 1.96, Python 3.12, and FFmpeg 7.1.
+The planner/index build needs no FFmpeg or x264 installation. Media-enabled
+builds require FFmpeg 7.1 development libraries and x264 from one prefix.
+The commands below use micromamba; `conda env create -f` works with the same
+environment file.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y \
-  build-essential pkg-config clang libclang-dev \
-  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  libx264-dev flatbuffers-compiler ffmpeg python3-dev
+sudo apt-get install -y build-essential pkg-config clang libclang-dev python3-dev
+cargo test --no-default-features
 
-pkg-config --modversion libavcodec libavformat libavutil libswscale
+# For codec-enabled builds, select a consistent FFmpeg 7.1/x264 prefix.
+micromamba create -f environment/ci-native.yml
+micromamba activate vclasp-native
+export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig"
+export PATH="$CONDA_PREFIX/bin:$PATH"
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" python scripts/doctor.py
 ```
 
 ## Build and test
 
 ```bash
-cargo test --release --features ffmpeg
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" cargo test --release --features ffmpeg
 cargo build --release --features ffmpeg
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-dev.txt
 python -m pip install -e .
-python -m pytest
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" python -m pytest
 ```
 
 Fixture-backed decode tests are ignored unless `VCLASP_TEST_CHUNK` is set. The
