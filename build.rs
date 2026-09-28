@@ -4,47 +4,43 @@ fn main() {
     println!("cargo:rerun-if-env-changed=VCLASP_PATCHED_X264");
     println!("cargo:rustc-check-cfg=cfg(vclasp_patched_x264)");
 
-    // Use pkg-config CLI to get x264 include path.
-    let cflags = std::process::Command::new("pkg-config")
-        .args(["--cflags", "x264"])
-        .output()
-        .expect("pkg-config not found; install pkg-config")
-        .stdout;
-    let cflags = String::from_utf8_lossy(&cflags).trim().to_string();
+    // The default reader/planner build has no native codec dependency.
+    if std::env::var_os("CARGO_FEATURE_FFMPEG").is_none() {
+        return;
+    }
 
+    for (library, expected_major) in [
+        ("libavcodec", 61),
+        ("libavformat", 61),
+        ("libavutil", 59),
+        ("libswscale", 8),
+    ] {
+        let found = pkg_config::Config::new()
+            .probe(library)
+            .unwrap_or_else(|error| panic!("{library} development files are required: {error}"));
+        let actual_major = found.version.split('.').next().unwrap_or_default();
+        assert_eq!(
+            actual_major,
+            expected_major.to_string(),
+            "{library} {} is incompatible with ffmpeg-next 7.1; expected major {expected_major}. Use one consistent FFmpeg 7.1 development/runtime installation (check PKG_CONFIG_PATH).",
+            found.version
+        );
+    }
+
+    let x264 = pkg_config::Config::new()
+        .probe("x264")
+        .unwrap_or_else(|error| panic!("x264 development files are required: {error}"));
     let mut build = cc::Build::new();
     build.file("native/x264_encoder.c");
+    for path in &x264.include_paths {
+        build.include(path);
+    }
+    for (key, value) in &x264.defines {
+        build.define(key, value.as_deref());
+    }
     if std::env::var_os("VCLASP_PATCHED_X264").is_some() {
         build.define("VCLASP_PATCHED_X264", None);
         println!("cargo:rustc-cfg=vclasp_patched_x264");
     }
-
-    // Pass -I and -D flags from pkg-config.
-    for flag in cflags.split_whitespace() {
-        if let Some(val) = flag.strip_prefix("-I") {
-            build.include(val);
-        } else if let Some(val) = flag.strip_prefix("-D") {
-            if let Some(eq_pos) = val.find('=') {
-                build.define(&val[..eq_pos], Some(&val[eq_pos + 1..]));
-            } else {
-                build.define(val, None);
-            }
-        }
-    }
-
     build.compile("x264_encoder");
-
-    // Link libx264.
-    let libs_stdout = std::process::Command::new("pkg-config")
-        .args(["--libs-only-L", "x264"])
-        .output()
-        .expect("pkg-config failed")
-        .stdout;
-    for flag in String::from_utf8_lossy(&libs_stdout).split_whitespace() {
-        if let Some(path) = flag.strip_prefix("-L") {
-            println!("cargo:rustc-link-search={}", path);
-        }
-    }
-
-    println!("cargo:rustc-link-lib=x264");
 }

@@ -3,35 +3,57 @@
 ## Supported host
 
 The verified environment is Linux x86-64, Rust stable, Python 3.9+, and
-FFmpeg/libavcodec 6.x.
+FFmpeg 7.1 (libavcodec 61, libavformat 61, libavutil 59, libswscale 8).
+Plain `cargo test --no-default-features` does not need FFmpeg or x264.
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
-  build-essential pkg-config clang libclang-dev cmake \
-  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  libx264-dev flatbuffers-compiler ffmpeg
+  build-essential pkg-config clang libclang-dev cmake flatbuffers-compiler
 
 rustc --version
 cargo --version
-pkg-config --modversion libavcodec libavformat libavutil libswscale
 flatc --version
 ```
 
-For a non-standard FFmpeg install, expose its `.pc` files through
-`PKG_CONFIG_PATH` before invoking Cargo.
+For media-enabled builds, provide FFmpeg 7.1 and x264 from the same prefix.
+Do not combine system headers with Conda runtime libraries. Use the supplied
+environment definition, or activate an existing compatible environment such as
+`vclasp-training`:
+
+```bash
+micromamba create -f environment/ci-native.yml
+micromamba activate vclasp-native
+export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig"
+export PATH="$CONDA_PREFIX/bin:$PATH"
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" python scripts/doctor.py
+```
+
+Run `scripts/doctor.py --import-extension` after installing the Python wheel.
+The script checks library major versions, the x264 entry-point symbol, and the
+FFmpeg executable. `PKG_CONFIG_PATH` selects build headers/libraries;
+`LD_LIBRARY_PATH` selects runtime libraries for a development build. Set it
+only on commands that load the extension or run linked tests; do not export it
+globally because it can affect unrelated system tools.
+For CI the equivalent dependencies are in `environment/ci-native.yml`.
 
 ## Rust build
 
 ```bash
 cargo fmt --check
 cargo test --release --no-default-features
-cargo test --release --features ffmpeg
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" cargo test --release --features ffmpeg
 cargo build --release --features ffmpeg
 ```
 
 The default suite validates format, index, closure, and span-planning logic.
-The `ffmpeg` feature adds libavcodec-backed decode and execution.
+The `ffmpeg` feature adds libavcodec-backed decode and x264-backed ingestion.
+The default build does not compile or link the native x264 bridge.
+
+On a new Linux host, first run the doctor command and build the wheel there.
+Copying a locally compiled `.so` without its matching FFmpeg/x264 libraries is
+not a supported deployment method. Check `ldd` on the built extension before
+moving it, and run the doctor and import check again on the target host.
 
 ## Python development install
 
@@ -41,8 +63,8 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements-dev.txt
 maturin develop --release --features ffmpeg
-python -c 'import vclasp; print(vclasp.__version__)'
-pytest -q tests/test_logical_scheduler.py
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" python -c 'import vclasp; print(vclasp.__version__)'
+LD_LIBRARY_PATH="$CONDA_PREFIX/lib" pytest -q tests/test_logical_scheduler.py
 ```
 
 Do not copy or rename the compiled shared library manually; `maturin` installs
