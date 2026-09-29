@@ -39,7 +39,7 @@ mod tests {
         HierarchicalBatchExecutor,
     };
     #[cfg(feature = "experiment-controls")]
-    use crate::backend::NoopBackend;
+    use crate::backend::{NoopBackend, StorageBackend};
     use crate::hierarchical_ingest::HierarchicalRecordMeta;
     #[cfg(feature = "experiment-controls")]
     use crate::hierarchical_layout::HierarchicalCostModel;
@@ -47,6 +47,54 @@ mod tests {
     #[cfg(feature = "experiment-controls")]
     use crate::runtime_feedback::RuntimeFeedbackConfig;
     use std::collections::HashMap;
+    #[cfg(feature = "experiment-controls")]
+    use std::sync::Arc;
+
+    #[cfg(feature = "experiment-controls")]
+    #[test]
+    fn concurrent_executors_share_read_only_catalog_and_layout() {
+        let mut first = record("video", 0, 0);
+        first.length = 1;
+        let catalog = Arc::new(
+            crate::hierarchical_ingest::HierarchicalCatalog::from_records_for_test(vec![first]),
+        );
+        let layout = Arc::new(catalog.to_layout_index().unwrap());
+        let backend: Arc<dyn StorageBackend> = Arc::new(NoopBackend);
+        let model = HierarchicalCostModel {
+            request_latency_ns: 1_000.0,
+            bandwidth_bytes_per_ns: 1.0,
+            io_concurrency: 1,
+            wave_request_overhead_ns: Vec::new(),
+            selection_tolerance_ns: 0.0,
+            decode_fixed_ns: 100.0,
+            decode_access_unit_ns: 10.0,
+            fetch_decode_overlap: 0.0,
+        };
+        let make = || {
+            HierarchicalBatchExecutor::new_with_shared_backend(
+                Arc::clone(&catalog),
+                Arc::clone(&layout),
+                Arc::clone(&backend),
+                vec![1],
+                model.clone(),
+                None,
+                None,
+                1,
+                1,
+                false,
+                super::ResidentStateBudget {
+                    encoded_bytes: 0,
+                    read_ahead_bytes: 0,
+                    live_cursors: 0,
+                },
+            )
+            .unwrap()
+        };
+        let first = make();
+        let second = make();
+        assert!(Arc::ptr_eq(&first.catalog, &second.catalog));
+        assert!(Arc::ptr_eq(&first.layout, &second.layout));
+    }
 
     fn record(video: &str, gop_id: u64, frame_idx: i32) -> HierarchicalRecordMeta {
         HierarchicalRecordMeta {
@@ -675,8 +723,8 @@ enum RecordSelection {
 }
 
 pub struct HierarchicalBatchExecutor {
-    catalog: HierarchicalCatalog,
-    layout: HierarchicalLayoutIndex,
+    catalog: Arc<HierarchicalCatalog>,
+    layout: Arc<HierarchicalLayoutIndex>,
     backend: Arc<dyn StorageBackend>,
     codec_config: Vec<u8>,
     bootstrap_model: HierarchicalCostModel,
@@ -1159,8 +1207,10 @@ impl HierarchicalBatchExecutor {
         batch_deadline_fences: bool,
         resident_budget: ResidentStateBudget,
     ) -> Result<Self, String> {
+        let layout = Arc::new(catalog.to_layout_index()?);
         Self::new_with_shared_backend(
-            catalog,
+            Arc::new(catalog),
+            layout,
             Arc::from(backend),
             codec_config,
             model,
@@ -1175,7 +1225,8 @@ impl HierarchicalBatchExecutor {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_shared_backend(
-        catalog: HierarchicalCatalog,
+        catalog: Arc<HierarchicalCatalog>,
+        layout: Arc<HierarchicalLayoutIndex>,
         backend: Arc<dyn StorageBackend>,
         codec_config: Vec<u8>,
         model: HierarchicalCostModel,
@@ -1189,7 +1240,6 @@ impl HierarchicalBatchExecutor {
         if codec_config.is_empty() {
             return Err("hierarchical executor requires codec configuration".to_string());
         }
-        let layout = catalog.to_layout_index()?;
         model.validate()?;
         let runtime_feedback = RuntimeCostFeedback::new(&model, RuntimeFeedbackConfig::default())?;
         if decoder_slots == 0 {

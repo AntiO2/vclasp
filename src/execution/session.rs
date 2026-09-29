@@ -648,6 +648,8 @@ impl VClaspSession {
         backend: Box<dyn crate::backend::StorageBackend>,
         config: SessionConfig,
     ) -> Result<Self, String> {
+        let layout = Arc::new(metadata.catalog.to_layout_index()?);
+        let catalog = Arc::new(metadata.catalog);
         let decode_budget = DecodeBudget::new(config.global_decode_threads);
         let total_decoder_slots = config.global_decode_threads / config.decoder_threads;
         let lane_count = config
@@ -673,7 +675,8 @@ impl VClaspSession {
                     + usize::from(lane < config.resident_state.live_cursors % lane_count),
             };
             let mut executor = HierarchicalBatchExecutor::new_with_shared_backend(
-                metadata.catalog.clone(),
+                Arc::clone(&catalog),
+                Arc::clone(&layout),
                 Arc::clone(&backend),
                 metadata.codec_config.clone(),
                 config.cost_model.clone(),
