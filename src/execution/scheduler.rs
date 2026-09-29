@@ -927,6 +927,9 @@ impl LogicalScheduler {
                     stats.fetch_service_ns_sum += completed_ns.saturating_sub(range_started);
                     completed_ranges[index] = Some(crate::backend::CompletedRange {
                         index,
+                        physical_request_id: index as u64 + 1,
+                        physical_object_offset: offset,
+                        physical_object_length: length,
                         physical_requests: 1,
                         physical_fetched_bytes: bytes.len() as u64,
                         bytes,
@@ -1053,6 +1056,9 @@ mod tests {
                 let bytes = self.read_byte_range(offset, length)?;
                 callback(CompletedRange {
                     index,
+                    physical_request_id: index as u64 + 1,
+                    physical_object_offset: offset,
+                    physical_object_length: length,
                     physical_requests: 1,
                     physical_fetched_bytes: bytes.len() as u64,
                     bytes,

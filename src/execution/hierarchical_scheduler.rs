@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
+#[cfg(feature = "experiment-controls")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
@@ -379,6 +381,25 @@ pub struct HierarchicalIncrementalWindow {
     pub batch_ready_ns: Vec<u64>,
     pub ordered_delivery_ns: Vec<u64>,
     pub stats: HierarchicalBatchStats,
+    #[cfg(feature = "experiment-controls")]
+    pub range_events: Vec<RangeTraceEvent>,
+}
+
+#[cfg(feature = "experiment-controls")]
+#[derive(Debug, Clone)]
+pub struct RangeTraceEvent {
+    pub range_index: usize,
+    pub planned_payload_offset: u64,
+    pub planned_length: u64,
+    pub physical_request_id: u64,
+    pub physical_object_offset: u64,
+    pub physical_object_length: u64,
+    pub started_ns: u64,
+    pub first_byte_ns: u64,
+    pub completed_ns: u64,
+    pub physical_requests: usize,
+    pub fetched_bytes: u64,
+    pub consumer_sample_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -753,6 +774,8 @@ pub struct HierarchicalBatchExecutor {
     last_cursor_candidate_count: usize,
     last_cursor_selected_count: usize,
     last_cursor_policy_ns: u64,
+    #[cfg(feature = "experiment-controls")]
+    range_trace_enabled: Option<Arc<AtomicBool>>,
 }
 
 struct StreamingGopState {
@@ -1284,7 +1307,15 @@ impl HierarchicalBatchExecutor {
             last_cursor_candidate_count: 0,
             last_cursor_selected_count: 0,
             last_cursor_policy_ns: 0,
+            #[cfg(feature = "experiment-controls")]
+            range_trace_enabled: None,
         })
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn with_range_trace_enabled(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.range_trace_enabled = Some(enabled);
+        self
     }
 
     pub(crate) fn with_runtime_feedback_config(
@@ -2793,6 +2824,8 @@ impl HierarchicalBatchExecutor {
                 batch_ready_ns: vec![ready; batches.len()],
                 ordered_delivery_ns: vec![ready; batches.len()],
                 stats,
+                #[cfg(feature = "experiment-controls")]
+                range_events: Vec::new(),
             })
         })();
         self.active_window_liveness = None;
@@ -2933,6 +2966,42 @@ impl HierarchicalBatchExecutor {
                 record_ranges.insert(record.record_id, covering);
             }
         }
+        #[cfg(feature = "experiment-controls")]
+        let capture_range_events = self
+            .range_trace_enabled
+            .as_ref()
+            .is_some_and(|enabled| enabled.load(Ordering::Relaxed));
+        #[cfg(feature = "experiment-controls")]
+        let range_consumers = if capture_range_events {
+            let mut consumers = vec![HashSet::new(); ranges.len()];
+            for (targets, records) in batches.iter().zip(&batch_records) {
+                for (target, record) in targets.iter().zip(records) {
+                    let required_ids = if record_selection == RecordSelection::Closure {
+                        record.closure_record_ids.clone()
+                    } else {
+                        selected_groups[&(record.video_id.clone(), record.gop_id)]
+                            .iter()
+                            .map(|selected| selected.record_id)
+                            .collect()
+                    };
+                    for record_id in required_ids {
+                        for &range_index in &record_ranges[&record_id] {
+                            consumers[range_index].insert(target.sample_id);
+                        }
+                    }
+                }
+            }
+            consumers
+                .into_iter()
+                .map(|ids| {
+                    let mut ids = ids.into_iter().collect::<Vec<_>>();
+                    ids.sort_unstable();
+                    ids
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         struct IncrementalDecodeTask {
             batch_index: usize,
@@ -3016,6 +3085,12 @@ impl HierarchicalBatchExecutor {
         let mut range_service_ns_sum = 0u64;
         let mut range_intervals = Vec::with_capacity(ranges.len());
         let mut range_timing_samples = 0usize;
+        #[cfg(feature = "experiment-controls")]
+        let mut range_events = if capture_range_events {
+            vec![None; ranges.len()]
+        } else {
+            Vec::new()
+        };
         let mut assemble_ns = 0u64;
         let mut decode_ns = 0u64;
         let mut submitted_access_units = 0usize;
@@ -3100,6 +3175,24 @@ impl HierarchicalBatchExecutor {
                             break;
                         }
                         physical_ranges += completed.physical_requests;
+                        #[cfg(feature = "experiment-controls")]
+                        if capture_range_events {
+                            let (offset, length) = ranges[completed.index];
+                            range_events[completed.index] = Some(RangeTraceEvent {
+                                range_index: completed.index,
+                                planned_payload_offset: offset,
+                                planned_length: length,
+                                physical_request_id: completed.physical_request_id,
+                                physical_object_offset: completed.physical_object_offset,
+                                physical_object_length: completed.physical_object_length,
+                                started_ns: completed.started_ns,
+                                first_byte_ns: completed.first_byte_ns,
+                                completed_ns: completed.completed_ns,
+                                physical_requests: completed.physical_requests,
+                                fetched_bytes: completed.physical_fetched_bytes,
+                                consumer_sample_ids: range_consumers[completed.index].clone(),
+                            });
+                        }
                         fetched_bytes =
                             fetched_bytes.saturating_add(completed.physical_fetched_bytes);
                         fetch_ns = fetch_ns.max(completed.completed_ns);
@@ -3352,6 +3445,8 @@ impl HierarchicalBatchExecutor {
                 runtime_feedback_decode_tail_multiplier_ppm: 0,
                 mode,
             },
+            #[cfg(feature = "experiment-controls")]
+            range_events: range_events.into_iter().flatten().collect(),
         };
         self.observe_runtime_feedback(&mut result.stats);
         Ok(result)

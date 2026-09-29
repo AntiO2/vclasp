@@ -23,6 +23,9 @@ pub struct ObjectRange {
 pub struct CompletedRange {
     pub index: usize,
     pub bytes: Vec<u8>,
+    pub physical_request_id: u64,
+    pub physical_object_offset: u64,
+    pub physical_object_length: u64,
     pub started_ns: u64,
     pub first_byte_ns: u64,
     pub completed_ns: u64,
@@ -96,6 +99,7 @@ pub struct S3ObjectStoreClient {
     request_budget: Arc<Semaphore>,
     outstanding_requests: Arc<AtomicUsize>,
     service_time_ns_ewma: Arc<AtomicU64>,
+    next_request_id: Arc<AtomicU64>,
     max_concurrency: usize,
 }
 
@@ -138,6 +142,7 @@ impl S3ObjectStoreClient {
             request_budget: Arc::new(Semaphore::new(max_concurrency)),
             outstanding_requests: Arc::new(AtomicUsize::new(0)),
             service_time_ns_ewma: Arc::new(AtomicU64::new(0)),
+            next_request_id: Arc::new(AtomicU64::new(1)),
             max_concurrency,
         })
     }
@@ -248,6 +253,7 @@ impl S3ObjectStoreClient {
         let request_budget = Arc::clone(&self.request_budget);
         let outstanding_requests = Arc::clone(&self.outstanding_requests);
         let service_time_ns_ewma = Arc::clone(&self.service_time_ns_ewma);
+        let next_request_id = Arc::clone(&self.next_request_id);
         let requested = ranges.to_vec();
         let max_concurrency = self.max_concurrency;
         let started = Instant::now();
@@ -263,6 +269,7 @@ impl S3ObjectStoreClient {
                 };
                 let store = Arc::clone(&store);
                 let request_budget = Arc::clone(&request_budget);
+                let next_request_id = Arc::clone(&next_request_id);
                 let outstanding = OutstandingRequestGuard::new(Arc::clone(&outstanding_requests));
                 requests.spawn(async move {
                     let _outstanding = outstanding;
@@ -273,6 +280,7 @@ impl S3ObjectStoreClient {
                         }
                     })?;
                     let range_started = started.elapsed().as_nanos() as u64;
+                    let physical_request_id = next_request_id.fetch_add(1, Ordering::Relaxed);
                     let key = ObjectPath::from(range.object_key);
                     let end = range.offset + range.length;
                     let options = GetOptions::new().with_range(Some(range.offset..end));
@@ -304,6 +312,9 @@ impl S3ObjectStoreClient {
                     }
                     Ok::<_, object_store::Error>(CompletedRange {
                         index,
+                        physical_request_id,
+                        physical_object_offset: range.offset,
+                        physical_object_length: range.length,
                         physical_requests: 1,
                         physical_fetched_bytes: bytes.len() as u64,
                         bytes,
@@ -697,6 +708,7 @@ mod tests {
             &client.service_time_ns_ewma,
             &clone.service_time_ns_ewma
         ));
+        assert!(Arc::ptr_eq(&client.next_request_id, &clone.next_request_id));
         assert_eq!(client.request_budget.available_permits(), 3);
     }
 

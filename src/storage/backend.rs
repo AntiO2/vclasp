@@ -44,6 +44,9 @@ pub trait StorageBackend: Send + Sync {
             let bytes = self.read_byte_range(offset, length)?;
             callback(CompletedRange {
                 index,
+                physical_request_id: index as u64 + 1,
+                physical_object_offset: offset,
+                physical_object_length: length,
                 physical_requests: 1,
                 physical_fetched_bytes: bytes.len() as u64,
                 bytes,
@@ -549,6 +552,9 @@ fn execute_broker_window(
                 .send(Ok(CompletedRange {
                     index: member.range_index,
                     bytes: completed.bytes[relative..end].to_vec(),
+                    physical_request_id: completed.physical_request_id,
+                    physical_object_offset: completed.physical_object_offset,
+                    physical_object_length: completed.physical_object_length,
                     started_ns: completed.started_ns,
                     first_byte_ns: completed.first_byte_ns,
                     completed_ns: completed.completed_ns,
@@ -726,6 +732,9 @@ impl StorageBackend for S3Backend {
                 for (index, bytes) in buffers.into_iter().enumerate() {
                     callback(CompletedRange {
                         index,
+                        physical_request_id: 0,
+                        physical_object_offset: 0,
+                        physical_object_length: 0,
                         physical_requests: usize::from(index == 0),
                         physical_fetched_bytes: if index == 0 { fetched_bytes } else { 0 },
                         bytes,
@@ -1119,6 +1128,9 @@ impl StorageBackend for AIStoreGetBatchBackend {
         for (index, bytes) in buffers.into_iter().enumerate() {
             callback(CompletedRange {
                 index,
+                physical_request_id: 0,
+                physical_object_offset: 0,
+                physical_object_length: 0,
                 physical_requests: usize::from(index == 0),
                 physical_fetched_bytes: if index == 0 { fetched_bytes } else { 0 },
                 bytes,
@@ -1188,6 +1200,9 @@ mod aistore_tests {
             for completed in [
                 CompletedRange {
                     index: 1,
+                    physical_request_id: 2,
+                    physical_object_offset: 1,
+                    physical_object_length: 1,
                     physical_requests: 1,
                     physical_fetched_bytes: 1,
                     bytes: vec![1],
@@ -1197,6 +1212,9 @@ mod aistore_tests {
                 },
                 CompletedRange {
                     index: 2,
+                    physical_request_id: 3,
+                    physical_object_offset: 2,
+                    physical_object_length: 1,
                     physical_requests: 1,
                     physical_fetched_bytes: 1,
                     bytes: vec![2],
@@ -1206,6 +1224,9 @@ mod aistore_tests {
                 },
                 CompletedRange {
                     index: 0,
+                    physical_request_id: 1,
+                    physical_object_offset: 0,
+                    physical_object_length: 1,
                     physical_requests: 1,
                     physical_fetched_bytes: 1,
                     bytes: vec![0],

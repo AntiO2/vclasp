@@ -350,6 +350,16 @@ The standalone `vclasp-object-store` crate is the shared transport layer:
 It preserves input order, rejects short reads, and uses one bounded connection
 pool. It does not perform dependency resolution or decode.
 
+With `experiment-controls`, an S3-backed `VClaspSession` can call
+`start_range_trace(max_events)` before a measured interval and
+`take_range_trace()` after all work completes. The latter returns member-range
+events, the session's physical GET count, and the number of dropped events.
+Events sharing `physical_request_id` belong to one actual GET; combine their
+`consumer_sample_ids` instead of charging that GET to each member. The physical
+object offset and length may differ from a member's planned payload range when
+concurrent requests are coalesced. A nonzero dropped count makes the trace
+incomplete. This diagnostic is not part of the default reader API.
+
 ## Mechanism controls
 
 Anchor/Delta, Pair, Prefix, adaptive portfolio, materialization, and forced

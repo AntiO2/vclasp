@@ -8,6 +8,8 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+#[cfg(feature = "experiment-controls")]
+use pyo3::types::PyDict;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "ffmpeg")]
 use std::sync::Mutex;
@@ -6469,6 +6471,39 @@ impl PyVClaspSession {
         .into_iter()
         .map(|(name, value)| (name.to_string(), value))
         .collect()
+    }
+
+    /// Collect a bounded trace of physical ranges and their logical consumers.
+    #[cfg(feature = "experiment-controls")]
+    fn start_range_trace(&self, max_events: usize) -> PyResult<()> {
+        self.inner
+            .start_range_trace(max_events)
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
+    }
+
+    /// Call after submitted work finishes. Returns events, expected GETs, and dropped events.
+    #[cfg(feature = "experiment-controls")]
+    fn take_range_trace(&self, py: Python<'_>) -> PyResult<(Vec<Py<PyDict>>, usize, usize)> {
+        let (events, expected, dropped) = self.inner.take_range_trace();
+        let mut rows = Vec::with_capacity(events.len());
+        for event in events {
+            let row = PyDict::new_bound(py);
+            row.set_item("window_id", event.window_id)?;
+            row.set_item("range_index", event.range.range_index)?;
+            row.set_item("planned_payload_offset", event.range.planned_payload_offset)?;
+            row.set_item("planned_length", event.range.planned_length)?;
+            row.set_item("physical_request_id", event.range.physical_request_id)?;
+            row.set_item("physical_object_offset", event.range.physical_object_offset)?;
+            row.set_item("physical_object_length", event.range.physical_object_length)?;
+            row.set_item("started_ns", event.range.started_ns)?;
+            row.set_item("first_byte_ns", event.range.first_byte_ns)?;
+            row.set_item("completed_ns", event.range.completed_ns)?;
+            row.set_item("physical_requests", event.range.physical_requests)?;
+            row.set_item("fetched_bytes", event.range.fetched_bytes)?;
+            row.set_item("consumer_sample_ids", event.range.consumer_sample_ids)?;
+            rows.push(row.unbind());
+        }
+        Ok((rows, expected, dropped))
     }
 
     /// Execute one already-sampled request window through the same global
