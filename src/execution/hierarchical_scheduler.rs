@@ -383,6 +383,8 @@ pub struct HierarchicalIncrementalWindow {
     pub stats: HierarchicalBatchStats,
     #[cfg(feature = "experiment-controls")]
     pub range_events: Vec<RangeTraceEvent>,
+    #[cfg(feature = "experiment-controls")]
+    pub decode_events: Vec<DecodeTraceEvent>,
 }
 
 #[cfg(feature = "experiment-controls")]
@@ -399,6 +401,13 @@ pub struct RangeTraceEvent {
     pub completed_ns: u64,
     pub physical_requests: usize,
     pub fetched_bytes: u64,
+    pub consumer_sample_ids: Vec<u64>,
+}
+
+#[cfg(feature = "experiment-controls")]
+#[derive(Debug, Clone)]
+pub struct DecodeTraceEvent {
+    pub record_id: u64,
     pub consumer_sample_ids: Vec<u64>,
 }
 
@@ -775,7 +784,7 @@ pub struct HierarchicalBatchExecutor {
     last_cursor_selected_count: usize,
     last_cursor_policy_ns: u64,
     #[cfg(feature = "experiment-controls")]
-    range_trace_enabled: Option<Arc<AtomicBool>>,
+    execution_trace_enabled: Option<Arc<AtomicBool>>,
 }
 
 struct StreamingGopState {
@@ -1308,13 +1317,13 @@ impl HierarchicalBatchExecutor {
             last_cursor_selected_count: 0,
             last_cursor_policy_ns: 0,
             #[cfg(feature = "experiment-controls")]
-            range_trace_enabled: None,
+            execution_trace_enabled: None,
         })
     }
 
     #[cfg(feature = "experiment-controls")]
-    pub(crate) fn with_range_trace_enabled(mut self, enabled: Arc<AtomicBool>) -> Self {
-        self.range_trace_enabled = Some(enabled);
+    pub(crate) fn with_execution_trace_enabled(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.execution_trace_enabled = Some(enabled);
         self
     }
 
@@ -2826,6 +2835,8 @@ impl HierarchicalBatchExecutor {
                 stats,
                 #[cfg(feature = "experiment-controls")]
                 range_events: Vec::new(),
+                #[cfg(feature = "experiment-controls")]
+                decode_events: Vec::new(),
             })
         })();
         self.active_window_liveness = None;
@@ -2967,13 +2978,14 @@ impl HierarchicalBatchExecutor {
             }
         }
         #[cfg(feature = "experiment-controls")]
-        let capture_range_events = self
-            .range_trace_enabled
+        let capture_execution_events = self
+            .execution_trace_enabled
             .as_ref()
             .is_some_and(|enabled| enabled.load(Ordering::Relaxed));
         #[cfg(feature = "experiment-controls")]
-        let range_consumers = if capture_range_events {
-            let mut consumers = vec![HashSet::new(); ranges.len()];
+        let (range_consumers, record_consumers) = if capture_execution_events {
+            let mut range_consumers = vec![HashSet::new(); ranges.len()];
+            let mut record_consumers = HashMap::<u64, HashSet<u64>>::new();
             for (targets, records) in batches.iter().zip(&batch_records) {
                 for (target, record) in targets.iter().zip(records) {
                     let required_ids = if record_selection == RecordSelection::Closure {
@@ -2985,22 +2997,35 @@ impl HierarchicalBatchExecutor {
                             .collect()
                     };
                     for record_id in required_ids {
+                        record_consumers
+                            .entry(record_id)
+                            .or_default()
+                            .insert(target.sample_id);
                         for &range_index in &record_ranges[&record_id] {
-                            consumers[range_index].insert(target.sample_id);
+                            range_consumers[range_index].insert(target.sample_id);
                         }
                     }
                 }
             }
-            consumers
+            let ranges = range_consumers
                 .into_iter()
                 .map(|ids| {
                     let mut ids = ids.into_iter().collect::<Vec<_>>();
                     ids.sort_unstable();
                     ids
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let records = record_consumers
+                .into_iter()
+                .map(|(id, consumers)| {
+                    let mut consumers = consumers.into_iter().collect::<Vec<_>>();
+                    consumers.sort_unstable();
+                    (id, consumers)
+                })
+                .collect::<HashMap<_, _>>();
+            (ranges, records)
         } else {
-            Vec::new()
+            (Vec::new(), HashMap::new())
         };
 
         struct IncrementalDecodeTask {
@@ -3086,11 +3111,13 @@ impl HierarchicalBatchExecutor {
         let mut range_intervals = Vec::with_capacity(ranges.len());
         let mut range_timing_samples = 0usize;
         #[cfg(feature = "experiment-controls")]
-        let mut range_events = if capture_range_events {
+        let mut range_events = if capture_execution_events {
             vec![None; ranges.len()]
         } else {
             Vec::new()
         };
+        #[cfg(feature = "experiment-controls")]
+        let mut decode_events = Vec::new();
         let mut assemble_ns = 0u64;
         let mut decode_ns = 0u64;
         let mut submitted_access_units = 0usize;
@@ -3176,7 +3203,7 @@ impl HierarchicalBatchExecutor {
                         }
                         physical_ranges += completed.physical_requests;
                         #[cfg(feature = "experiment-controls")]
-                        if capture_range_events {
+                        if capture_execution_events {
                             let (offset, length) = ranges[completed.index];
                             range_events[completed.index] = Some(RangeTraceEvent {
                                 range_index: completed.index,
@@ -3297,12 +3324,36 @@ impl HierarchicalBatchExecutor {
                     )?;
                     assemble_ns += assemble_started.elapsed().as_nanos() as u64;
                     claimed_target_ids.extend(missing_target_ids);
+                    #[cfg(feature = "experiment-controls")]
+                    let task_decode_events = if capture_execution_events {
+                        task.records
+                            .iter()
+                            .map(|record| {
+                                Ok(DecodeTraceEvent {
+                                    record_id: record.record_id,
+                                    consumer_sample_ids: record_consumers
+                                        .get(&record.record_id)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "decode record {} has no logical consumer",
+                                                record.record_id
+                                            )
+                                        })?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?
+                    } else {
+                        Vec::new()
+                    };
                     if let Err(error) =
                         incremental_decode_pool.submit(job, total_started, event_sender.clone())
                     {
                         pipeline_error = Some(error);
                         break;
                     }
+                    #[cfg(feature = "experiment-controls")]
+                    decode_events.extend(task_decode_events);
                     active_decode_jobs += 1;
                 }
 
@@ -3447,6 +3498,8 @@ impl HierarchicalBatchExecutor {
             },
             #[cfg(feature = "experiment-controls")]
             range_events: range_events.into_iter().flatten().collect(),
+            #[cfg(feature = "experiment-controls")]
+            decode_events,
         };
         self.observe_runtime_feedback(&mut result.stats);
         Ok(result)

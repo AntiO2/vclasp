@@ -6473,20 +6473,27 @@ impl PyVClaspSession {
         .collect()
     }
 
-    /// Collect a bounded trace of physical ranges and their logical consumers.
+    /// Collect bounded physical-range and decoder-submission traces.
     #[cfg(feature = "experiment-controls")]
-    fn start_range_trace(&self, max_events: usize) -> PyResult<()> {
+    fn start_execution_trace(
+        &self,
+        max_range_events: usize,
+        max_decode_events: usize,
+    ) -> PyResult<()> {
         self.inner
-            .start_range_trace(max_events)
+            .start_execution_trace(max_range_events, max_decode_events)
             .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
     }
 
-    /// Call after submitted work finishes. Returns events, expected GETs, and dropped events.
+    /// Call after all submitted work finishes.
     #[cfg(feature = "experiment-controls")]
-    fn take_range_trace(&self, py: Python<'_>) -> PyResult<(Vec<Py<PyDict>>, usize, usize)> {
-        let (events, expected, dropped) = self.inner.take_range_trace();
-        let mut rows = Vec::with_capacity(events.len());
-        for event in events {
+    fn take_execution_trace(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(Vec<Py<PyDict>>, usize, usize, Vec<Py<PyDict>>, usize, usize)> {
+        let trace = self.inner.take_execution_trace();
+        let mut ranges = Vec::with_capacity(trace.range_events.len());
+        for event in trace.range_events {
             let row = PyDict::new_bound(py);
             row.set_item("window_id", event.window_id)?;
             row.set_item("range_index", event.range.range_index)?;
@@ -6501,9 +6508,24 @@ impl PyVClaspSession {
             row.set_item("physical_requests", event.range.physical_requests)?;
             row.set_item("fetched_bytes", event.range.fetched_bytes)?;
             row.set_item("consumer_sample_ids", event.range.consumer_sample_ids)?;
-            rows.push(row.unbind());
+            ranges.push(row.unbind());
         }
-        Ok((rows, expected, dropped))
+        let mut decodes = Vec::with_capacity(trace.decode_events.len());
+        for event in trace.decode_events {
+            let row = PyDict::new_bound(py);
+            row.set_item("window_id", event.window_id)?;
+            row.set_item("record_id", event.decode.record_id)?;
+            row.set_item("consumer_sample_ids", event.decode.consumer_sample_ids)?;
+            decodes.push(row.unbind());
+        }
+        Ok((
+            ranges,
+            trace.expected_requests,
+            trace.dropped_range_events,
+            decodes,
+            trace.expected_submitted_aus,
+            trace.dropped_decode_events,
+        ))
     }
 
     /// Execute one already-sampled request window through the same global
