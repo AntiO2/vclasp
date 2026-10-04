@@ -29,8 +29,30 @@ pub struct CompletedRange {
     pub started_ns: u64,
     pub first_byte_ns: u64,
     pub completed_ns: u64,
+    /// CLOCK_MONOTONIC start, first byte, and completion; independent of caller windows.
+    pub monotonic_timing: Option<(u64, u64, u64)>,
     pub physical_requests: usize,
     pub physical_fetched_bytes: u64,
+}
+
+/// The same clock used by Python's monotonic/perf_counter on Linux.
+pub fn monotonic_time_ns() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // The kernel writes a complete timespec when clock_gettime succeeds.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+            return None;
+        }
+        Some(time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -280,6 +302,7 @@ impl S3ObjectStoreClient {
                         }
                     })?;
                     let range_started = started.elapsed().as_nanos() as u64;
+                    let monotonic_started = monotonic_time_ns();
                     let physical_request_id = next_request_id.fetch_add(1, Ordering::Relaxed);
                     let key = ObjectPath::from(range.object_key);
                     let end = range.offset + range.length;
@@ -293,6 +316,7 @@ impl S3ObjectStoreClient {
                         }
                     })?;
                     let first_byte_ns = started.elapsed().as_nanos() as u64;
+                    let monotonic_first_byte = monotonic_time_ns();
                     let mut bytes = Vec::with_capacity(range.length as usize);
                     bytes.extend_from_slice(&first);
                     while let Some(chunk) = stream.next().await {
@@ -321,6 +345,10 @@ impl S3ObjectStoreClient {
                         started_ns: range_started,
                         first_byte_ns,
                         completed_ns: started.elapsed().as_nanos() as u64,
+                        monotonic_timing: monotonic_started
+                            .zip(monotonic_first_byte)
+                            .zip(monotonic_time_ns())
+                            .map(|((start, first), end)| (start, first, end)),
                     })
                 });
                 true

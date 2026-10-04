@@ -6510,6 +6510,7 @@ impl PyVClaspSession {
             row.set_item("started_ns", event.range.started_ns)?;
             row.set_item("first_byte_ns", event.range.first_byte_ns)?;
             row.set_item("completed_ns", event.range.completed_ns)?;
+            row.set_item("monotonic_timing", event.range.monotonic_timing)?;
             row.set_item("physical_requests", event.range.physical_requests)?;
             row.set_item("fetched_bytes", event.range.fetched_bytes)?;
             row.set_item("consumer_sample_ids", event.range.consumer_sample_ids)?;

@@ -1603,6 +1603,7 @@ mod tests {
             started_ns: 10,
             first_byte_ns: 20,
             completed_ns: 30,
+            monotonic_timing: None,
             physical_requests: 1,
             fetched_bytes: 80,
             consumer_sample_ids: vec![7, 8],

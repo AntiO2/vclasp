@@ -371,6 +371,15 @@ concurrent requests are coalesced. A submitted AU can likewise serve more than
 one logical target. A nonzero dropped count makes the corresponding trace
 incomplete. This diagnostic is not part of the default reader API.
 
+On Linux, each exact physical range event also contains `monotonic_timing`:
+the start, first-byte, and completion timestamps in nanoseconds from
+`CLOCK_MONOTONIC`. These timestamps share Python's `time.monotonic_ns()` clock
+and remain comparable across execution windows and broker consumers.
+The existing `started_ns`, `first_byte_ns`, and `completed_ns` values measure
+execution-window timing. Unsupported platforms and aggregate transport modes
+return `None` for `monotonic_timing`; those events cannot establish exact
+cross-window GET concurrency. No chunk format changes are required.
+
 ## Mechanism controls
 
 Anchor/Delta, Pair, Prefix, adaptive portfolio, materialization, and forced
