@@ -1,6 +1,10 @@
 pub use crate::hierarchical_layout::HierarchicalCostModel as CostModel;
 #[cfg(feature = "experiment-controls")]
+use crate::hierarchical_scheduler::DecodeTraceEvent;
+#[cfg(feature = "experiment-controls")]
 use crate::hierarchical_scheduler::HierarchicalAction;
+#[cfg(feature = "experiment-controls")]
+use crate::hierarchical_scheduler::RangeTraceEvent;
 pub use crate::hierarchical_scheduler::{
     HierarchicalBatchStats as ExecutionStats, HierarchicalIncrementalWindow as WindowOutput,
     HierarchicalOutput as FrameOutput, LogicalTarget as Target, ResidentStateBudget,
@@ -20,6 +24,8 @@ use memmap2::Mmap;
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
+#[cfg(feature = "experiment-controls")]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -355,6 +361,128 @@ pub struct SessionMetrics {
     pub range_max_in_flight: u64,
 }
 
+#[cfg(feature = "experiment-controls")]
+#[derive(Debug, Clone)]
+pub struct SessionRangeTraceEvent {
+    pub window_id: u64,
+    pub range: RangeTraceEvent,
+}
+
+#[cfg(feature = "experiment-controls")]
+#[derive(Debug, Clone)]
+pub struct SessionDecodeTraceEvent {
+    pub window_id: u64,
+    pub decode: DecodeTraceEvent,
+}
+
+#[cfg(feature = "experiment-controls")]
+pub struct SessionExecutionTrace {
+    pub range_events: Vec<SessionRangeTraceEvent>,
+    pub expected_requests: usize,
+    pub dropped_range_events: usize,
+    pub decode_events: Vec<SessionDecodeTraceEvent>,
+    pub expected_submitted_aus: usize,
+    pub dropped_decode_events: usize,
+}
+
+#[cfg(feature = "experiment-controls")]
+#[derive(Default)]
+struct ExecutionTraceBuffer {
+    range_events: Vec<SessionRangeTraceEvent>,
+    decode_events: Vec<SessionDecodeTraceEvent>,
+    max_range_events: usize,
+    max_decode_events: usize,
+    expected_requests: usize,
+    expected_submitted_aus: usize,
+    dropped_range_events: usize,
+    dropped_decode_events: usize,
+}
+
+#[cfg(feature = "experiment-controls")]
+struct ExecutionTraceState {
+    enabled: Arc<AtomicBool>,
+    next_window_id: AtomicU64,
+    buffer: Mutex<ExecutionTraceBuffer>,
+}
+
+#[cfg(feature = "experiment-controls")]
+impl ExecutionTraceState {
+    fn new() -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(false)),
+            next_window_id: AtomicU64::new(0),
+            buffer: Mutex::new(ExecutionTraceBuffer::default()),
+        }
+    }
+
+    fn observe(&self, window: &WindowOutput) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let window_id = self.next_window_id.fetch_add(1, Ordering::Relaxed);
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buffer.expected_requests += window.stats.physical_ranges;
+        buffer.expected_submitted_aus += window.stats.submitted_access_units;
+        for event in &window.range_events {
+            if buffer.range_events.len() < buffer.max_range_events {
+                buffer.range_events.push(SessionRangeTraceEvent {
+                    window_id,
+                    range: event.clone(),
+                });
+            } else {
+                buffer.dropped_range_events += 1;
+            }
+        }
+        for event in &window.decode_events {
+            if buffer.decode_events.len() < buffer.max_decode_events {
+                buffer.decode_events.push(SessionDecodeTraceEvent {
+                    window_id,
+                    decode: event.clone(),
+                });
+            } else {
+                buffer.dropped_decode_events += 1;
+            }
+        }
+    }
+
+    fn start(&self, max_range_events: usize, max_decode_events: usize) -> Result<(), String> {
+        if max_range_events == 0 || max_decode_events == 0 {
+            return Err("execution trace capacities must be positive".to_string());
+        }
+        self.enabled.store(false, Ordering::Relaxed);
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *buffer = ExecutionTraceBuffer {
+            max_range_events,
+            max_decode_events,
+            ..Default::default()
+        };
+        self.enabled.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn take(&self) -> SessionExecutionTrace {
+        self.enabled.store(false, Ordering::Relaxed);
+        let mut buffer = self
+            .buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        SessionExecutionTrace {
+            range_events: std::mem::take(&mut buffer.range_events),
+            expected_requests: buffer.expected_requests,
+            dropped_range_events: buffer.dropped_range_events,
+            decode_events: std::mem::take(&mut buffer.decode_events),
+            expected_submitted_aus: buffer.expected_submitted_aus,
+            dropped_decode_events: buffer.dropped_decode_events,
+        }
+    }
+}
+
 impl SessionMetrics {
     fn observe(&mut self, stats: &ExecutionStats) {
         self.completed_windows += 1;
@@ -490,6 +618,9 @@ enum Command {
         batches: Vec<Vec<Target>>,
         response: SyncSender<WindowResult>,
     },
+    Barrier {
+        response: SyncSender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -502,6 +633,8 @@ struct SessionInner {
     sender: SyncSender<Command>,
     thread: Mutex<Option<JoinHandle<()>>>,
     metrics: Arc<Mutex<SessionMetrics>>,
+    #[cfg(feature = "experiment-controls")]
+    execution_trace: Arc<ExecutionTraceState>,
 }
 
 #[derive(Clone)]
@@ -528,9 +661,20 @@ impl VClaspSession {
         if executors.is_empty() {
             return Err("VClasp session requires at least one execution lane".to_string());
         }
+        #[cfg(feature = "experiment-controls")]
+        let execution_trace = Arc::new(ExecutionTraceState::new());
+        #[cfg(feature = "experiment-controls")]
+        let executors = executors
+            .into_iter()
+            .map(|executor| {
+                executor.with_execution_trace_enabled(Arc::clone(&execution_trace.enabled))
+            })
+            .collect();
         let (sender, receiver) = mpsc::sync_channel(max_pending_calls);
         let metrics = Arc::new(Mutex::new(SessionMetrics::default()));
         let coordinator_metrics = Arc::clone(&metrics);
+        #[cfg(feature = "experiment-controls")]
+        let coordinator_execution_trace = Arc::clone(&execution_trace);
         let thread = thread::spawn(move || {
             run_admission(
                 executors,
@@ -538,6 +682,8 @@ impl VClaspSession {
                 max_callers,
                 admission_quiet,
                 coordinator_metrics,
+                #[cfg(feature = "experiment-controls")]
+                coordinator_execution_trace,
             )
         });
         Ok(Self {
@@ -545,6 +691,8 @@ impl VClaspSession {
                 sender,
                 thread: Mutex::new(Some(thread)),
                 metrics,
+                #[cfg(feature = "experiment-controls")]
+                execution_trace,
             }),
         })
     }
@@ -648,6 +796,8 @@ impl VClaspSession {
         backend: Box<dyn crate::backend::StorageBackend>,
         config: SessionConfig,
     ) -> Result<Self, String> {
+        let layout = Arc::new(metadata.catalog.to_layout_index()?);
+        let catalog = Arc::new(metadata.catalog);
         let decode_budget = DecodeBudget::new(config.global_decode_threads);
         let total_decoder_slots = config.global_decode_threads / config.decoder_threads;
         let lane_count = config
@@ -673,7 +823,8 @@ impl VClaspSession {
                     + usize::from(lane < config.resident_state.live_cursors % lane_count),
             };
             let mut executor = HierarchicalBatchExecutor::new_with_shared_backend(
-                metadata.catalog.clone(),
+                Arc::clone(&catalog),
+                Arc::clone(&layout),
                 Arc::clone(&backend),
                 metadata.codec_config.clone(),
                 config.cost_model.clone(),
@@ -739,12 +890,42 @@ impl VClaspSession {
         Ok(PendingWindow { receiver })
     }
 
+    /// Wait for previously admitted work to finish, including window accounting.
+    /// Stop concurrent producers before using this as a measurement boundary.
+    pub fn synchronize(&self) -> Result<(), String> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.inner
+            .sender
+            .send(Command::Barrier { response })
+            .map_err(|_| "VClasp session coordinator stopped".to_string())?;
+        receiver
+            .recv()
+            .map_err(|_| "VClasp session dropped barrier response".to_string())?
+    }
+
     pub fn metrics_snapshot(&self) -> SessionMetrics {
         self.inner
             .metrics
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub fn start_execution_trace(
+        &self,
+        max_range_events: usize,
+        max_decode_events: usize,
+    ) -> Result<(), String> {
+        self.inner
+            .execution_trace
+            .start(max_range_events, max_decode_events)
+    }
+
+    /// Call only after all submitted work has completed; both traces are bounded.
+    #[cfg(feature = "experiment-controls")]
+    pub fn take_execution_trace(&self) -> SessionExecutionTrace {
+        self.inner.execution_trace.take()
     }
 
     #[cfg(feature = "experiment-controls")]
@@ -886,10 +1067,18 @@ fn run_admission(
     max_callers: usize,
     admission_quiet: Duration,
     metrics: Arc<Mutex<SessionMetrics>>,
+    #[cfg(feature = "experiment-controls")] execution_trace: Arc<ExecutionTraceState>,
 ) {
     let mut lanes = executors
         .into_iter()
-        .map(|executor| ExecutionLane::spawn(executor, Arc::clone(&metrics)))
+        .map(|executor| {
+            ExecutionLane::spawn(
+                executor,
+                Arc::clone(&metrics),
+                #[cfg(feature = "experiment-controls")]
+                Arc::clone(&execution_trace),
+            )
+        })
         .collect::<Vec<_>>();
     let mut next_lane = 0usize;
     let mut deferred = VecDeque::new();
@@ -907,6 +1096,10 @@ fn run_admission(
             }
             Command::ExecuteWindow { batches, response } => {
                 SessionSubmission::Window { batches, response }
+            }
+            Command::Barrier { response } => {
+                let _ = response.send(synchronize_lanes(&lanes));
+                continue;
             }
             #[cfg(feature = "experiment-controls")]
             Command::ExecuteForced {
@@ -931,20 +1124,13 @@ fn run_admission(
         };
 
         let admission_started = Instant::now();
-        let mut submissions = vec![first_submission];
-        while submissions.len() < max_callers {
-            match receiver.recv_timeout(admission_quiet) {
-                Ok(Command::Execute { targets, response }) => {
-                    submissions.push(SessionSubmission::Batch { targets, response });
-                }
-                Ok(Command::ExecuteWindow { batches, response }) => {
-                    submissions.push(SessionSubmission::Window { batches, response });
-                }
-                Ok(other) => deferred.push_back(other),
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
+        let submissions = collect_admission_cohort(
+            first_submission,
+            &receiver,
+            max_callers,
+            admission_quiet,
+            &mut deferred,
+        );
         let admission_ns = admission_started.elapsed().as_nanos() as u64;
         let route_key = common_stream_key(&submissions);
         let lane_index = match route_key {
@@ -975,6 +1161,33 @@ fn run_admission(
             let _ = thread.join();
         }
     }
+}
+
+fn collect_admission_cohort(
+    first_submission: SessionSubmission,
+    receiver: &Receiver<Command>,
+    max_callers: usize,
+    admission_quiet: Duration,
+    deferred: &mut VecDeque<Command>,
+) -> Vec<SessionSubmission> {
+    let mut submissions = vec![first_submission];
+    while submissions.len() < max_callers {
+        match receiver.recv_timeout(admission_quiet) {
+            Ok(Command::Execute { targets, response }) => {
+                submissions.push(SessionSubmission::Batch { targets, response });
+            }
+            Ok(Command::ExecuteWindow { batches, response }) => {
+                submissions.push(SessionSubmission::Window { batches, response });
+            }
+            Ok(other) => {
+                // A barrier/control command must fence off later submissions.
+                deferred.push_back(other);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    submissions
 }
 
 fn stable_stream_lane(stream_key: &str, lane_count: usize) -> usize {
@@ -1020,6 +1233,9 @@ enum LaneCommand {
         action: HierarchicalAction,
         response: SyncSender<BatchResult>,
     },
+    Barrier {
+        response: SyncSender<()>,
+    },
     Shutdown,
 }
 
@@ -1028,8 +1244,29 @@ struct ExecutionLane {
     thread: Option<JoinHandle<()>>,
 }
 
+fn synchronize_lanes(lanes: &[ExecutionLane]) -> Result<(), String> {
+    let mut acknowledgements = Vec::with_capacity(lanes.len());
+    for lane in lanes {
+        let (response, receiver) = mpsc::sync_channel(1);
+        lane.sender
+            .send(LaneCommand::Barrier { response })
+            .map_err(|_| "VClasp execution lane stopped before barrier".to_string())?;
+        acknowledgements.push(receiver);
+    }
+    for receiver in acknowledgements {
+        receiver
+            .recv()
+            .map_err(|_| "VClasp execution lane dropped barrier response".to_string())?;
+    }
+    Ok(())
+}
+
 impl ExecutionLane {
-    fn spawn(mut executor: HierarchicalBatchExecutor, metrics: Arc<Mutex<SessionMetrics>>) -> Self {
+    fn spawn(
+        mut executor: HierarchicalBatchExecutor,
+        metrics: Arc<Mutex<SessionMetrics>>,
+        #[cfg(feature = "experiment-controls")] execution_trace: Arc<ExecutionTraceState>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let thread = thread::spawn(move || {
             while let Ok(command) = receiver.recv() {
@@ -1042,6 +1279,8 @@ impl ExecutionLane {
                         submissions,
                         admission_ns,
                         Arc::clone(&metrics),
+                        #[cfg(feature = "experiment-controls")]
+                        Arc::clone(&execution_trace),
                     ),
                     #[cfg(feature = "experiment-controls")]
                     LaneCommand::Forced {
@@ -1050,6 +1289,9 @@ impl ExecutionLane {
                         response,
                     } => {
                         let _ = response.send(executor.execute_action(&targets, action));
+                    }
+                    LaneCommand::Barrier { response } => {
+                        let _ = response.send(());
                     }
                     LaneCommand::Shutdown => break,
                 }
@@ -1067,6 +1309,7 @@ fn execute_joint(
     submissions: Vec<SessionSubmission>,
     admission_ns: u64,
     metrics: Arc<Mutex<SessionMetrics>>,
+    #[cfg(feature = "experiment-controls")] execution_trace: Arc<ExecutionTraceState>,
 ) {
     let mut batches = Vec::new();
     let mut batch_routes = Vec::new();
@@ -1103,6 +1346,8 @@ fn execute_joint(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .observe(&window.stats);
+        #[cfg(feature = "experiment-controls")]
+        execution_trace.observe(window);
     }
     distribute_joint_result_with_sent(result, submissions, admission_ns, &sent_early);
 }
@@ -1187,6 +1432,10 @@ fn distribute_joint_result_with_sent(
                             batch_ready_ns,
                             ordered_delivery_ns,
                             stats,
+                            #[cfg(feature = "experiment-controls")]
+                            range_events: Vec::new(),
+                            #[cfg(feature = "experiment-controls")]
+                            decode_events: Vec::new(),
                         }));
                     }
                 }
@@ -1229,15 +1478,185 @@ fn attribute_joint_stats(global: &ExecutionStats, logical_counts: &[usize]) -> V
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "experiment-controls")]
+    use super::ExecutionTraceState;
     use super::{
         attribute_joint_stats, common_stream_key, distribute_joint_result,
         distribute_joint_result_with_sent, stable_stream_lane, validate_registered_object_size,
         BatchResult, ExecutionStats, FrameOutput, PendingBatch, PipelineConfig, PipelineSubmitter,
         SessionSubmission, Target, VClaspPipeline, WindowOutput,
     };
+    use super::{collect_admission_cohort, Command};
+    use super::{synchronize_lanes, ExecutionLane, LaneCommand};
     use crate::decoder::DecodedRgbFrame;
+    #[cfg(feature = "experiment-controls")]
+    use crate::hierarchical_scheduler::{DecodeTraceEvent, RangeTraceEvent};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn barrier_waits_for_accounting_on_every_lane() {
+        let (arrived, arrivals) = mpsc::channel();
+        let (completed, completions) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut lanes = Vec::new();
+        let mut workers = Vec::new();
+        for index in 0..2 {
+            let (sender, receiver) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let arrived = arrived.clone();
+            let completed = completed.clone();
+            workers.push(std::thread::spawn(move || {
+                let LaneCommand::Barrier { response } = receiver.recv().unwrap() else {
+                    panic!("expected a barrier after early frame delivery");
+                };
+                arrived.send(index).unwrap();
+                // The frames are already returned, but window accounting is pending.
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                response.send(()).unwrap();
+                completed.send(index).unwrap();
+            }));
+            releases.push(release);
+            lanes.push(ExecutionLane {
+                sender,
+                thread: None,
+            });
+        }
+        let (result, results) = mpsc::channel();
+        let barrier = std::thread::spawn(move || {
+            result.send(synchronize_lanes(&lanes)).unwrap();
+        });
+        for _ in 0..2 {
+            arrivals.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        releases[0].send(()).unwrap();
+        assert_eq!(completions.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        releases[1].send(()).unwrap();
+        results
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        barrier.join().unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn barrier_reports_a_stopped_lane() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let lane = ExecutionLane {
+            sender,
+            thread: None,
+        };
+        assert!(synchronize_lanes(&[lane]).is_err());
+    }
+
+    #[test]
+    fn admission_cohort_does_not_cross_a_barrier() {
+        let (sender, receiver) = mpsc::channel();
+        let (response, _) = mpsc::sync_channel(1);
+        sender.send(Command::Barrier { response }).unwrap();
+        let (response, _) = mpsc::sync_channel(1);
+        sender
+            .send(Command::Execute {
+                targets: Vec::new(),
+                response,
+            })
+            .unwrap();
+        let (response, _) = mpsc::sync_channel(1);
+        let mut deferred = std::collections::VecDeque::new();
+        let submissions = collect_admission_cohort(
+            SessionSubmission::Batch {
+                targets: Vec::new(),
+                response,
+            },
+            &receiver,
+            8,
+            Duration::ZERO,
+            &mut deferred,
+        );
+        assert_eq!(submissions.len(), 1);
+        assert!(matches!(
+            deferred.pop_front(),
+            Some(Command::Barrier { .. })
+        ));
+        assert!(matches!(receiver.try_recv(), Ok(Command::Execute { .. })));
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    #[test]
+    fn execution_trace_preserves_consumers_and_reports_capacity_loss() {
+        let trace = ExecutionTraceState::new();
+        assert!(trace.start(0, 1).is_err());
+        trace.start(1, 1).unwrap();
+        let event = RangeTraceEvent {
+            range_index: 0,
+            planned_payload_offset: 40,
+            planned_length: 80,
+            physical_request_id: 1,
+            physical_object_offset: 100,
+            physical_object_length: 80,
+            started_ns: 10,
+            first_byte_ns: 20,
+            completed_ns: 30,
+            physical_requests: 1,
+            fetched_bytes: 80,
+            consumer_sample_ids: vec![7, 8],
+        };
+        trace.observe(&WindowOutput {
+            batches: Vec::new(),
+            batch_ready_ns: Vec::new(),
+            ordered_delivery_ns: Vec::new(),
+            stats: ExecutionStats {
+                physical_ranges: 2,
+                submitted_access_units: 2,
+                ..Default::default()
+            },
+            range_events: vec![
+                event.clone(),
+                RangeTraceEvent {
+                    range_index: 1,
+                    ..event
+                },
+            ],
+            decode_events: vec![
+                DecodeTraceEvent {
+                    record_id: 4,
+                    consumer_sample_ids: vec![7, 8],
+                },
+                DecodeTraceEvent {
+                    record_id: 5,
+                    consumer_sample_ids: vec![8],
+                },
+            ],
+        });
+        let result = trace.take();
+        assert_eq!(
+            (
+                result.range_events.len(),
+                result.expected_requests,
+                result.dropped_range_events
+            ),
+            (1, 2, 1)
+        );
+        assert_eq!(
+            (
+                result.decode_events.len(),
+                result.expected_submitted_aus,
+                result.dropped_decode_events
+            ),
+            (1, 2, 1)
+        );
+        assert_eq!(result.range_events[0].range.consumer_sample_ids, vec![7, 8]);
+        assert_eq!(
+            result.decode_events[0].decode.consumer_sample_ids,
+            vec![7, 8]
+        );
+    }
 
     #[derive(Default)]
     struct FakeSubmitter {
@@ -1460,6 +1879,10 @@ mod tests {
                 batch_ready_ns: vec![10, 30, 20],
                 ordered_delivery_ns: vec![10, 30, 30],
                 stats,
+                #[cfg(feature = "experiment-controls")]
+                range_events: Vec::new(),
+                #[cfg(feature = "experiment-controls")]
+                decode_events: Vec::new(),
             }),
             submissions,
             5,
@@ -1519,6 +1942,10 @@ mod tests {
                     fetched_bytes: 4096,
                     ..Default::default()
                 },
+                #[cfg(feature = "experiment-controls")]
+                range_events: Vec::new(),
+                #[cfg(feature = "experiment-controls")]
+                decode_events: Vec::new(),
             }),
             submissions,
             5,

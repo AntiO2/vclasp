@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
+#[cfg(feature = "experiment-controls")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
@@ -39,7 +41,7 @@ mod tests {
         HierarchicalBatchExecutor,
     };
     #[cfg(feature = "experiment-controls")]
-    use crate::backend::NoopBackend;
+    use crate::backend::{NoopBackend, StorageBackend};
     use crate::hierarchical_ingest::HierarchicalRecordMeta;
     #[cfg(feature = "experiment-controls")]
     use crate::hierarchical_layout::HierarchicalCostModel;
@@ -47,6 +49,54 @@ mod tests {
     #[cfg(feature = "experiment-controls")]
     use crate::runtime_feedback::RuntimeFeedbackConfig;
     use std::collections::HashMap;
+    #[cfg(feature = "experiment-controls")]
+    use std::sync::Arc;
+
+    #[cfg(feature = "experiment-controls")]
+    #[test]
+    fn concurrent_executors_share_read_only_catalog_and_layout() {
+        let mut first = record("video", 0, 0);
+        first.length = 1;
+        let catalog = Arc::new(
+            crate::hierarchical_ingest::HierarchicalCatalog::from_records_for_test(vec![first]),
+        );
+        let layout = Arc::new(catalog.to_layout_index().unwrap());
+        let backend: Arc<dyn StorageBackend> = Arc::new(NoopBackend);
+        let model = HierarchicalCostModel {
+            request_latency_ns: 1_000.0,
+            bandwidth_bytes_per_ns: 1.0,
+            io_concurrency: 1,
+            wave_request_overhead_ns: Vec::new(),
+            selection_tolerance_ns: 0.0,
+            decode_fixed_ns: 100.0,
+            decode_access_unit_ns: 10.0,
+            fetch_decode_overlap: 0.0,
+        };
+        let make = || {
+            HierarchicalBatchExecutor::new_with_shared_backend(
+                Arc::clone(&catalog),
+                Arc::clone(&layout),
+                Arc::clone(&backend),
+                vec![1],
+                model.clone(),
+                None,
+                None,
+                1,
+                1,
+                false,
+                super::ResidentStateBudget {
+                    encoded_bytes: 0,
+                    read_ahead_bytes: 0,
+                    live_cursors: 0,
+                },
+            )
+            .unwrap()
+        };
+        let first = make();
+        let second = make();
+        assert!(Arc::ptr_eq(&first.catalog, &second.catalog));
+        assert!(Arc::ptr_eq(&first.layout, &second.layout));
+    }
 
     fn record(video: &str, gop_id: u64, frame_idx: i32) -> HierarchicalRecordMeta {
         HierarchicalRecordMeta {
@@ -331,6 +381,34 @@ pub struct HierarchicalIncrementalWindow {
     pub batch_ready_ns: Vec<u64>,
     pub ordered_delivery_ns: Vec<u64>,
     pub stats: HierarchicalBatchStats,
+    #[cfg(feature = "experiment-controls")]
+    pub range_events: Vec<RangeTraceEvent>,
+    #[cfg(feature = "experiment-controls")]
+    pub decode_events: Vec<DecodeTraceEvent>,
+}
+
+#[cfg(feature = "experiment-controls")]
+#[derive(Debug, Clone)]
+pub struct RangeTraceEvent {
+    pub range_index: usize,
+    pub planned_payload_offset: u64,
+    pub planned_length: u64,
+    pub physical_request_id: u64,
+    pub physical_object_offset: u64,
+    pub physical_object_length: u64,
+    pub started_ns: u64,
+    pub first_byte_ns: u64,
+    pub completed_ns: u64,
+    pub physical_requests: usize,
+    pub fetched_bytes: u64,
+    pub consumer_sample_ids: Vec<u64>,
+}
+
+#[cfg(feature = "experiment-controls")]
+#[derive(Debug, Clone)]
+pub struct DecodeTraceEvent {
+    pub record_id: u64,
+    pub consumer_sample_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -675,8 +753,8 @@ enum RecordSelection {
 }
 
 pub struct HierarchicalBatchExecutor {
-    catalog: HierarchicalCatalog,
-    layout: HierarchicalLayoutIndex,
+    catalog: Arc<HierarchicalCatalog>,
+    layout: Arc<HierarchicalLayoutIndex>,
     backend: Arc<dyn StorageBackend>,
     codec_config: Vec<u8>,
     bootstrap_model: HierarchicalCostModel,
@@ -705,6 +783,8 @@ pub struct HierarchicalBatchExecutor {
     last_cursor_candidate_count: usize,
     last_cursor_selected_count: usize,
     last_cursor_policy_ns: u64,
+    #[cfg(feature = "experiment-controls")]
+    execution_trace_enabled: Option<Arc<AtomicBool>>,
 }
 
 struct StreamingGopState {
@@ -1159,8 +1239,10 @@ impl HierarchicalBatchExecutor {
         batch_deadline_fences: bool,
         resident_budget: ResidentStateBudget,
     ) -> Result<Self, String> {
+        let layout = Arc::new(catalog.to_layout_index()?);
         Self::new_with_shared_backend(
-            catalog,
+            Arc::new(catalog),
+            layout,
             Arc::from(backend),
             codec_config,
             model,
@@ -1175,7 +1257,8 @@ impl HierarchicalBatchExecutor {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_shared_backend(
-        catalog: HierarchicalCatalog,
+        catalog: Arc<HierarchicalCatalog>,
+        layout: Arc<HierarchicalLayoutIndex>,
         backend: Arc<dyn StorageBackend>,
         codec_config: Vec<u8>,
         model: HierarchicalCostModel,
@@ -1189,7 +1272,6 @@ impl HierarchicalBatchExecutor {
         if codec_config.is_empty() {
             return Err("hierarchical executor requires codec configuration".to_string());
         }
-        let layout = catalog.to_layout_index()?;
         model.validate()?;
         let runtime_feedback = RuntimeCostFeedback::new(&model, RuntimeFeedbackConfig::default())?;
         if decoder_slots == 0 {
@@ -1234,7 +1316,15 @@ impl HierarchicalBatchExecutor {
             last_cursor_candidate_count: 0,
             last_cursor_selected_count: 0,
             last_cursor_policy_ns: 0,
+            #[cfg(feature = "experiment-controls")]
+            execution_trace_enabled: None,
         })
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn with_execution_trace_enabled(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.execution_trace_enabled = Some(enabled);
+        self
     }
 
     pub(crate) fn with_runtime_feedback_config(
@@ -2743,6 +2833,10 @@ impl HierarchicalBatchExecutor {
                 batch_ready_ns: vec![ready; batches.len()],
                 ordered_delivery_ns: vec![ready; batches.len()],
                 stats,
+                #[cfg(feature = "experiment-controls")]
+                range_events: Vec::new(),
+                #[cfg(feature = "experiment-controls")]
+                decode_events: Vec::new(),
             })
         })();
         self.active_window_liveness = None;
@@ -2883,6 +2977,56 @@ impl HierarchicalBatchExecutor {
                 record_ranges.insert(record.record_id, covering);
             }
         }
+        #[cfg(feature = "experiment-controls")]
+        let capture_execution_events = self
+            .execution_trace_enabled
+            .as_ref()
+            .is_some_and(|enabled| enabled.load(Ordering::Relaxed));
+        #[cfg(feature = "experiment-controls")]
+        let (range_consumers, record_consumers) = if capture_execution_events {
+            let mut range_consumers = vec![HashSet::new(); ranges.len()];
+            let mut record_consumers = HashMap::<u64, HashSet<u64>>::new();
+            for (targets, records) in batches.iter().zip(&batch_records) {
+                for (target, record) in targets.iter().zip(records) {
+                    let required_ids = if record_selection == RecordSelection::Closure {
+                        record.closure_record_ids.clone()
+                    } else {
+                        selected_groups[&(record.video_id.clone(), record.gop_id)]
+                            .iter()
+                            .map(|selected| selected.record_id)
+                            .collect()
+                    };
+                    for record_id in required_ids {
+                        record_consumers
+                            .entry(record_id)
+                            .or_default()
+                            .insert(target.sample_id);
+                        for &range_index in &record_ranges[&record_id] {
+                            range_consumers[range_index].insert(target.sample_id);
+                        }
+                    }
+                }
+            }
+            let ranges = range_consumers
+                .into_iter()
+                .map(|ids| {
+                    let mut ids = ids.into_iter().collect::<Vec<_>>();
+                    ids.sort_unstable();
+                    ids
+                })
+                .collect::<Vec<_>>();
+            let records = record_consumers
+                .into_iter()
+                .map(|(id, consumers)| {
+                    let mut consumers = consumers.into_iter().collect::<Vec<_>>();
+                    consumers.sort_unstable();
+                    (id, consumers)
+                })
+                .collect::<HashMap<_, _>>();
+            (ranges, records)
+        } else {
+            (Vec::new(), HashMap::new())
+        };
 
         struct IncrementalDecodeTask {
             batch_index: usize,
@@ -2966,6 +3110,14 @@ impl HierarchicalBatchExecutor {
         let mut range_service_ns_sum = 0u64;
         let mut range_intervals = Vec::with_capacity(ranges.len());
         let mut range_timing_samples = 0usize;
+        #[cfg(feature = "experiment-controls")]
+        let mut range_events = if capture_execution_events {
+            vec![None; ranges.len()]
+        } else {
+            Vec::new()
+        };
+        #[cfg(feature = "experiment-controls")]
+        let mut decode_events = Vec::new();
         let mut assemble_ns = 0u64;
         let mut decode_ns = 0u64;
         let mut submitted_access_units = 0usize;
@@ -3050,6 +3202,24 @@ impl HierarchicalBatchExecutor {
                             break;
                         }
                         physical_ranges += completed.physical_requests;
+                        #[cfg(feature = "experiment-controls")]
+                        if capture_execution_events {
+                            let (offset, length) = ranges[completed.index];
+                            range_events[completed.index] = Some(RangeTraceEvent {
+                                range_index: completed.index,
+                                planned_payload_offset: offset,
+                                planned_length: length,
+                                physical_request_id: completed.physical_request_id,
+                                physical_object_offset: completed.physical_object_offset,
+                                physical_object_length: completed.physical_object_length,
+                                started_ns: completed.started_ns,
+                                first_byte_ns: completed.first_byte_ns,
+                                completed_ns: completed.completed_ns,
+                                physical_requests: completed.physical_requests,
+                                fetched_bytes: completed.physical_fetched_bytes,
+                                consumer_sample_ids: range_consumers[completed.index].clone(),
+                            });
+                        }
                         fetched_bytes =
                             fetched_bytes.saturating_add(completed.physical_fetched_bytes);
                         fetch_ns = fetch_ns.max(completed.completed_ns);
@@ -3154,12 +3324,36 @@ impl HierarchicalBatchExecutor {
                     )?;
                     assemble_ns += assemble_started.elapsed().as_nanos() as u64;
                     claimed_target_ids.extend(missing_target_ids);
+                    #[cfg(feature = "experiment-controls")]
+                    let task_decode_events = if capture_execution_events {
+                        task.records
+                            .iter()
+                            .map(|record| {
+                                Ok(DecodeTraceEvent {
+                                    record_id: record.record_id,
+                                    consumer_sample_ids: record_consumers
+                                        .get(&record.record_id)
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "decode record {} has no logical consumer",
+                                                record.record_id
+                                            )
+                                        })?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?
+                    } else {
+                        Vec::new()
+                    };
                     if let Err(error) =
                         incremental_decode_pool.submit(job, total_started, event_sender.clone())
                     {
                         pipeline_error = Some(error);
                         break;
                     }
+                    #[cfg(feature = "experiment-controls")]
+                    decode_events.extend(task_decode_events);
                     active_decode_jobs += 1;
                 }
 
@@ -3302,6 +3496,10 @@ impl HierarchicalBatchExecutor {
                 runtime_feedback_decode_tail_multiplier_ppm: 0,
                 mode,
             },
+            #[cfg(feature = "experiment-controls")]
+            range_events: range_events.into_iter().flatten().collect(),
+            #[cfg(feature = "experiment-controls")]
+            decode_events,
         };
         self.observe_runtime_feedback(&mut result.stats);
         Ok(result)

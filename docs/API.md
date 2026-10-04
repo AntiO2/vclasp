@@ -190,6 +190,14 @@ concurrency budget.
 Concurrent calls to either method share one admission stream and one physical
 plan; callers do not need to coordinate which API shape their peers use.
 
+`execute` can return frames before the containing physical window finishes
+accounting. After stopping producers and consuming their results, call
+`session.synchronize()` before reading session counters or changing execution
+trace phases. This barrier waits for all earlier commands on every execution
+lane, including metric and trace updates; it preserves resident reader state.
+`metrics_snapshot()` itself remains a nonblocking snapshot. The same barrier
+is available on the Python session and releases the GIL while waiting.
+
 ### Python session
 
 The chunk catalog is the source of truth for valid logical targets:
@@ -349,6 +357,19 @@ The standalone `vclasp-object-store` crate is the shared transport layer:
 
 It preserves input order, rejects short reads, and uses one bounded connection
 pool. It does not perform dependency resolution or decode.
+
+With `experiment-controls`, an S3-backed `VClaspSession` can call
+`start_execution_trace(max_range_events, max_decode_events)` before a measured
+interval and `take_execution_trace()` after all work completes. The latter
+returns member-range events and actual submitted AU records, with independent
+expected counts and dropped-event counts, in the order
+`(ranges, GETs, dropped_ranges, AUs, submitted_AUs, dropped_AUs)`.
+Events sharing `physical_request_id` belong to one actual GET; combine their
+`consumer_sample_ids` instead of charging that GET to each member. The physical
+object offset and length may differ from a member's planned payload range when
+concurrent requests are coalesced. A submitted AU can likewise serve more than
+one logical target. A nonzero dropped count makes the corresponding trace
+incomplete. This diagnostic is not part of the default reader API.
 
 ## Mechanism controls
 

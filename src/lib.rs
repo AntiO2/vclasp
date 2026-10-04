@@ -8,6 +8,8 @@
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+#[cfg(feature = "experiment-controls")]
+use pyo3::types::PyDict;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "ffmpeg")]
 use std::sync::Mutex;
@@ -6442,6 +6444,11 @@ impl PyVClaspSession {
         })
     }
 
+    fn synchronize(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.synchronize())
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
     fn metrics_snapshot(&self) -> std::collections::HashMap<String, u64> {
         let metrics = self.inner.metrics_snapshot();
         [
@@ -6469,6 +6476,61 @@ impl PyVClaspSession {
         .into_iter()
         .map(|(name, value)| (name.to_string(), value))
         .collect()
+    }
+
+    /// Collect bounded physical-range and decoder-submission traces.
+    #[cfg(feature = "experiment-controls")]
+    fn start_execution_trace(
+        &self,
+        max_range_events: usize,
+        max_decode_events: usize,
+    ) -> PyResult<()> {
+        self.inner
+            .start_execution_trace(max_range_events, max_decode_events)
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
+    }
+
+    /// Call after all submitted work finishes.
+    #[cfg(feature = "experiment-controls")]
+    fn take_execution_trace(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<(Vec<Py<PyDict>>, usize, usize, Vec<Py<PyDict>>, usize, usize)> {
+        let trace = self.inner.take_execution_trace();
+        let mut ranges = Vec::with_capacity(trace.range_events.len());
+        for event in trace.range_events {
+            let row = PyDict::new_bound(py);
+            row.set_item("window_id", event.window_id)?;
+            row.set_item("range_index", event.range.range_index)?;
+            row.set_item("planned_payload_offset", event.range.planned_payload_offset)?;
+            row.set_item("planned_length", event.range.planned_length)?;
+            row.set_item("physical_request_id", event.range.physical_request_id)?;
+            row.set_item("physical_object_offset", event.range.physical_object_offset)?;
+            row.set_item("physical_object_length", event.range.physical_object_length)?;
+            row.set_item("started_ns", event.range.started_ns)?;
+            row.set_item("first_byte_ns", event.range.first_byte_ns)?;
+            row.set_item("completed_ns", event.range.completed_ns)?;
+            row.set_item("physical_requests", event.range.physical_requests)?;
+            row.set_item("fetched_bytes", event.range.fetched_bytes)?;
+            row.set_item("consumer_sample_ids", event.range.consumer_sample_ids)?;
+            ranges.push(row.unbind());
+        }
+        let mut decodes = Vec::with_capacity(trace.decode_events.len());
+        for event in trace.decode_events {
+            let row = PyDict::new_bound(py);
+            row.set_item("window_id", event.window_id)?;
+            row.set_item("record_id", event.decode.record_id)?;
+            row.set_item("consumer_sample_ids", event.decode.consumer_sample_ids)?;
+            decodes.push(row.unbind());
+        }
+        Ok((
+            ranges,
+            trace.expected_requests,
+            trace.dropped_range_events,
+            decodes,
+            trace.expected_submitted_aus,
+            trace.dropped_decode_events,
+        ))
     }
 
     /// Execute one already-sampled request window through the same global

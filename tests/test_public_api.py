@@ -16,6 +16,7 @@ def test_production_executors_share_one_request_interface():
             "submit_window",
             "pipeline",
             "metrics_snapshot",
+            "synchronize",
         } <= methods
         assert "execute_forced" not in methods
         assert "execute_partitioned" not in methods
