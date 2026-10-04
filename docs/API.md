@@ -190,6 +190,14 @@ concurrency budget.
 Concurrent calls to either method share one admission stream and one physical
 plan; callers do not need to coordinate which API shape their peers use.
 
+`execute` can return frames before the containing physical window finishes
+accounting. After stopping producers and consuming their results, call
+`session.synchronize()` before reading session counters or changing execution
+trace phases. This barrier waits for all earlier commands on every execution
+lane, including metric and trace updates; it preserves resident reader state.
+`metrics_snapshot()` itself remains a nonblocking snapshot. The same barrier
+is available on the Python session and releases the GIL while waiting.
+
 ### Python session
 
 The chunk catalog is the source of truth for valid logical targets:

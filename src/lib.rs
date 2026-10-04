@@ -6444,6 +6444,11 @@ impl PyVClaspSession {
         })
     }
 
+    fn synchronize(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.synchronize())
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
+    }
+
     fn metrics_snapshot(&self) -> std::collections::HashMap<String, u64> {
         let metrics = self.inner.metrics_snapshot();
         [

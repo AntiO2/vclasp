@@ -618,6 +618,9 @@ enum Command {
         batches: Vec<Vec<Target>>,
         response: SyncSender<WindowResult>,
     },
+    Barrier {
+        response: SyncSender<Result<(), String>>,
+    },
     Shutdown,
 }
 
@@ -887,6 +890,19 @@ impl VClaspSession {
         Ok(PendingWindow { receiver })
     }
 
+    /// Wait for previously admitted work to finish, including window accounting.
+    /// Stop concurrent producers before using this as a measurement boundary.
+    pub fn synchronize(&self) -> Result<(), String> {
+        let (response, receiver) = mpsc::sync_channel(1);
+        self.inner
+            .sender
+            .send(Command::Barrier { response })
+            .map_err(|_| "VClasp session coordinator stopped".to_string())?;
+        receiver
+            .recv()
+            .map_err(|_| "VClasp session dropped barrier response".to_string())?
+    }
+
     pub fn metrics_snapshot(&self) -> SessionMetrics {
         self.inner
             .metrics
@@ -1081,6 +1097,10 @@ fn run_admission(
             Command::ExecuteWindow { batches, response } => {
                 SessionSubmission::Window { batches, response }
             }
+            Command::Barrier { response } => {
+                let _ = response.send(synchronize_lanes(&lanes));
+                continue;
+            }
             #[cfg(feature = "experiment-controls")]
             Command::ExecuteForced {
                 targets,
@@ -1104,20 +1124,13 @@ fn run_admission(
         };
 
         let admission_started = Instant::now();
-        let mut submissions = vec![first_submission];
-        while submissions.len() < max_callers {
-            match receiver.recv_timeout(admission_quiet) {
-                Ok(Command::Execute { targets, response }) => {
-                    submissions.push(SessionSubmission::Batch { targets, response });
-                }
-                Ok(Command::ExecuteWindow { batches, response }) => {
-                    submissions.push(SessionSubmission::Window { batches, response });
-                }
-                Ok(other) => deferred.push_back(other),
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
+        let submissions = collect_admission_cohort(
+            first_submission,
+            &receiver,
+            max_callers,
+            admission_quiet,
+            &mut deferred,
+        );
         let admission_ns = admission_started.elapsed().as_nanos() as u64;
         let route_key = common_stream_key(&submissions);
         let lane_index = match route_key {
@@ -1148,6 +1161,33 @@ fn run_admission(
             let _ = thread.join();
         }
     }
+}
+
+fn collect_admission_cohort(
+    first_submission: SessionSubmission,
+    receiver: &Receiver<Command>,
+    max_callers: usize,
+    admission_quiet: Duration,
+    deferred: &mut VecDeque<Command>,
+) -> Vec<SessionSubmission> {
+    let mut submissions = vec![first_submission];
+    while submissions.len() < max_callers {
+        match receiver.recv_timeout(admission_quiet) {
+            Ok(Command::Execute { targets, response }) => {
+                submissions.push(SessionSubmission::Batch { targets, response });
+            }
+            Ok(Command::ExecuteWindow { batches, response }) => {
+                submissions.push(SessionSubmission::Window { batches, response });
+            }
+            Ok(other) => {
+                // A barrier/control command must fence off later submissions.
+                deferred.push_back(other);
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    submissions
 }
 
 fn stable_stream_lane(stream_key: &str, lane_count: usize) -> usize {
@@ -1193,12 +1233,32 @@ enum LaneCommand {
         action: HierarchicalAction,
         response: SyncSender<BatchResult>,
     },
+    Barrier {
+        response: SyncSender<()>,
+    },
     Shutdown,
 }
 
 struct ExecutionLane {
     sender: mpsc::Sender<LaneCommand>,
     thread: Option<JoinHandle<()>>,
+}
+
+fn synchronize_lanes(lanes: &[ExecutionLane]) -> Result<(), String> {
+    let mut acknowledgements = Vec::with_capacity(lanes.len());
+    for lane in lanes {
+        let (response, receiver) = mpsc::sync_channel(1);
+        lane.sender
+            .send(LaneCommand::Barrier { response })
+            .map_err(|_| "VClasp execution lane stopped before barrier".to_string())?;
+        acknowledgements.push(receiver);
+    }
+    for receiver in acknowledgements {
+        receiver
+            .recv()
+            .map_err(|_| "VClasp execution lane dropped barrier response".to_string())?;
+    }
+    Ok(())
 }
 
 impl ExecutionLane {
@@ -1229,6 +1289,9 @@ impl ExecutionLane {
                         response,
                     } => {
                         let _ = response.send(executor.execute_action(&targets, action));
+                    }
+                    LaneCommand::Barrier { response } => {
+                        let _ = response.send(());
                     }
                     LaneCommand::Shutdown => break,
                 }
@@ -1423,11 +1486,106 @@ mod tests {
         BatchResult, ExecutionStats, FrameOutput, PendingBatch, PipelineConfig, PipelineSubmitter,
         SessionSubmission, Target, VClaspPipeline, WindowOutput,
     };
+    use super::{collect_admission_cohort, Command};
+    use super::{synchronize_lanes, ExecutionLane, LaneCommand};
     use crate::decoder::DecodedRgbFrame;
     #[cfg(feature = "experiment-controls")]
     use crate::hierarchical_scheduler::{DecodeTraceEvent, RangeTraceEvent};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn barrier_waits_for_accounting_on_every_lane() {
+        let (arrived, arrivals) = mpsc::channel();
+        let (completed, completions) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut lanes = Vec::new();
+        let mut workers = Vec::new();
+        for index in 0..2 {
+            let (sender, receiver) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let arrived = arrived.clone();
+            let completed = completed.clone();
+            workers.push(std::thread::spawn(move || {
+                let LaneCommand::Barrier { response } = receiver.recv().unwrap() else {
+                    panic!("expected a barrier after early frame delivery");
+                };
+                arrived.send(index).unwrap();
+                // The frames are already returned, but window accounting is pending.
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                response.send(()).unwrap();
+                completed.send(index).unwrap();
+            }));
+            releases.push(release);
+            lanes.push(ExecutionLane {
+                sender,
+                thread: None,
+            });
+        }
+        let (result, results) = mpsc::channel();
+        let barrier = std::thread::spawn(move || {
+            result.send(synchronize_lanes(&lanes)).unwrap();
+        });
+        for _ in 0..2 {
+            arrivals.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        releases[0].send(()).unwrap();
+        assert_eq!(completions.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
+        assert!(matches!(results.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        releases[1].send(()).unwrap();
+        results
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        barrier.join().unwrap();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn barrier_reports_a_stopped_lane() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let lane = ExecutionLane {
+            sender,
+            thread: None,
+        };
+        assert!(synchronize_lanes(&[lane]).is_err());
+    }
+
+    #[test]
+    fn admission_cohort_does_not_cross_a_barrier() {
+        let (sender, receiver) = mpsc::channel();
+        let (response, _) = mpsc::sync_channel(1);
+        sender.send(Command::Barrier { response }).unwrap();
+        let (response, _) = mpsc::sync_channel(1);
+        sender
+            .send(Command::Execute {
+                targets: Vec::new(),
+                response,
+            })
+            .unwrap();
+        let (response, _) = mpsc::sync_channel(1);
+        let mut deferred = std::collections::VecDeque::new();
+        let submissions = collect_admission_cohort(
+            SessionSubmission::Batch {
+                targets: Vec::new(),
+                response,
+            },
+            &receiver,
+            8,
+            Duration::ZERO,
+            &mut deferred,
+        );
+        assert_eq!(submissions.len(), 1);
+        assert!(matches!(
+            deferred.pop_front(),
+            Some(Command::Barrier { .. })
+        ));
+        assert!(matches!(receiver.try_recv(), Ok(Command::Execute { .. })));
+    }
 
     #[cfg(feature = "experiment-controls")]
     #[test]
