@@ -468,17 +468,21 @@ impl ExecutionTraceState {
 
     fn take(&self) -> SessionExecutionTrace {
         self.enabled.store(false, Ordering::Relaxed);
+        self.drain()
+    }
+
+    fn drain(&self) -> SessionExecutionTrace {
         let mut buffer = self
             .buffer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         SessionExecutionTrace {
             range_events: std::mem::take(&mut buffer.range_events),
-            expected_requests: buffer.expected_requests,
-            dropped_range_events: buffer.dropped_range_events,
+            expected_requests: std::mem::take(&mut buffer.expected_requests),
+            dropped_range_events: std::mem::take(&mut buffer.dropped_range_events),
             decode_events: std::mem::take(&mut buffer.decode_events),
-            expected_submitted_aus: buffer.expected_submitted_aus,
-            dropped_decode_events: buffer.dropped_decode_events,
+            expected_submitted_aus: std::mem::take(&mut buffer.expected_submitted_aus),
+            dropped_decode_events: std::mem::take(&mut buffer.dropped_decode_events),
         }
     }
 }
@@ -926,6 +930,12 @@ impl VClaspSession {
     #[cfg(feature = "experiment-controls")]
     pub fn take_execution_trace(&self) -> SessionExecutionTrace {
         self.inner.execution_trace.take()
+    }
+
+    /// Drain complete observed windows without disabling capture.
+    #[cfg(feature = "experiment-controls")]
+    pub fn drain_execution_trace(&self) -> SessionExecutionTrace {
+        self.inner.execution_trace.drain()
     }
 
     #[cfg(feature = "experiment-controls")]
@@ -1608,7 +1618,7 @@ mod tests {
             fetched_bytes: 80,
             consumer_sample_ids: vec![7, 8],
         };
-        trace.observe(&WindowOutput {
+        let window = WindowOutput {
             batches: Vec::new(),
             batch_ready_ns: Vec::new(),
             ordered_delivery_ns: Vec::new(),
@@ -1634,8 +1644,9 @@ mod tests {
                     consumer_sample_ids: vec![8],
                 },
             ],
-        });
-        let result = trace.take();
+        };
+        trace.observe(&window);
+        let result = trace.drain();
         assert_eq!(
             (
                 result.range_events.len(),
@@ -1657,6 +1668,15 @@ mod tests {
             result.decode_events[0].decode.consumer_sample_ids,
             vec![7, 8]
         );
+        assert!(trace.enabled.load(super::Ordering::Relaxed));
+        assert_eq!(trace.drain().expected_requests, 0);
+        trace.observe(&window);
+        let final_result = trace.take();
+        assert_eq!(final_result.expected_requests, 2);
+        assert_eq!(final_result.expected_submitted_aus, 2);
+        assert_eq!(final_result.range_events[0].window_id, 1);
+        assert!(!trace.enabled.load(super::Ordering::Relaxed));
+        assert_eq!(trace.take().expected_requests, 0);
     }
 
     #[derive(Default)]

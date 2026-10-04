@@ -371,6 +371,15 @@ concurrent requests are coalesced. A submitted AU can likewise serve more than
 one logical target. A nonzero dropped count makes the corresponding trace
 incomplete. This diagnostic is not part of the default reader API.
 
+To stream long runs, Python can call `take_execution_trace(stop=False)` while
+work continues; Rust uses `drain_execution_trace()`. Each drain atomically
+returns complete observed windows, resets their counts and frees buffer capacity,
+while preserving capture and unique window IDs. Sum expected and dropped counts
+across drains, and combine shared physical request consumers across all drains.
+After synchronizing the reader, perform a final default `take_execution_trace()`
+to stop capture. A window larger than the configured capacity can still lose
+events, which must invalidate the run.
+
 On Linux, each exact physical range event also contains `monotonic_timing`:
 the start, first-byte, and completion timestamps in nanoseconds from
 `CLOCK_MONOTONIC`. These timestamps share Python's `time.monotonic_ns()` clock

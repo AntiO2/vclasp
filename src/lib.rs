@@ -6490,13 +6490,19 @@ impl PyVClaspSession {
             .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
     }
 
-    /// Call after all submitted work finishes.
+    /// Drain complete windows; stop capture after all work finishes by default.
     #[cfg(feature = "experiment-controls")]
+    #[pyo3(signature = (stop=true))]
     fn take_execution_trace(
         &self,
         py: Python<'_>,
+        stop: bool,
     ) -> PyResult<(Vec<Py<PyDict>>, usize, usize, Vec<Py<PyDict>>, usize, usize)> {
-        let trace = self.inner.take_execution_trace();
+        let trace = if stop {
+            self.inner.take_execution_trace()
+        } else {
+            self.inner.drain_execution_trace()
+        };
         let mut ranges = Vec::with_capacity(trace.range_events.len());
         for event in trace.range_events {
             let row = PyDict::new_bound(py);
