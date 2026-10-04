@@ -1399,6 +1399,11 @@ impl HierarchicalBatchExecutor {
         Arc::clone(&self.decode_budget)
     }
 
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn backend_handle(&self) -> Arc<dyn StorageBackend> {
+        Arc::clone(&self.backend)
+    }
+
     pub(crate) fn with_shared_decode_budget(
         mut self,
         decode_budget: Arc<DecodeBudget>,

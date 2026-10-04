@@ -704,6 +704,20 @@ pub struct S3ObjectStoreReader {
     inner: backend::S3ObjectStoreClient,
 }
 
+#[cfg(feature = "experiment-controls")]
+fn object_store_pressure_to_python(
+    py: Python<'_>,
+    pressure: backend::ObjectStorePressure,
+) -> PyResult<Py<PyDict>> {
+    let row = PyDict::new_bound(py);
+    row.set_item("max_concurrency", pressure.max_concurrency)?;
+    row.set_item("active_requests", pressure.active_requests)?;
+    row.set_item("outstanding_requests", pressure.outstanding_requests)?;
+    row.set_item("queued_requests", pressure.queued_requests)?;
+    row.set_item("service_time_ns_ewma", pressure.service_time_ns_ewma)?;
+    Ok(row.unbind())
+}
+
 /// Thin Python adapter over the Rust mmap backend for label-free storage probes.
 #[pyclass]
 pub struct LocalRangeReader {
@@ -1378,6 +1392,10 @@ impl S3RangeReader {
 
 #[pymethods]
 impl S3ObjectStoreReader {
+    #[cfg(feature = "experiment-controls")]
+    fn pressure_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        object_store_pressure_to_python(py, self.inner.pressure_snapshot())
+    }
     #[new]
     #[pyo3(signature = (endpoint, bucket, access_key_id, secret_access_key,
                         region="us-east-1".to_string(), max_concurrency=8))]
@@ -6505,6 +6523,19 @@ impl PyVClaspSession {
                 row.set_item("completed_jobs", state.completed_jobs)?;
                 row.set_item("acquisition_wait_ns", state.acquisition_wait_ns)?;
                 Ok(row.unbind())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    fn io_activity(&self, py: Python<'_>) -> PyResult<Vec<Option<Py<PyDict>>>> {
+        self.inner
+            .io_activity()
+            .into_iter()
+            .map(|pressure| {
+                pressure
+                    .map(|value| object_store_pressure_to_python(py, value))
+                    .transpose()
             })
             .collect()
     }

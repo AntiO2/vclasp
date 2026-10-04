@@ -641,6 +641,8 @@ struct SessionInner {
     execution_trace: Arc<ExecutionTraceState>,
     #[cfg(feature = "experiment-controls")]
     decode_budgets: Vec<Arc<DecodeBudget>>,
+    #[cfg(feature = "experiment-controls")]
+    backends: Vec<Arc<dyn crate::backend::StorageBackend>>,
 }
 
 #[derive(Clone)]
@@ -681,6 +683,17 @@ impl VClaspSession {
             handles
         };
         #[cfg(feature = "experiment-controls")]
+        let backends = {
+            let mut handles = Vec::new();
+            for executor in &executors {
+                let handle = executor.backend_handle();
+                if !handles.iter().any(|other| Arc::ptr_eq(other, &handle)) {
+                    handles.push(handle);
+                }
+            }
+            handles
+        };
+        #[cfg(feature = "experiment-controls")]
         let executors = executors
             .into_iter()
             .map(|executor| {
@@ -712,6 +725,8 @@ impl VClaspSession {
                 execution_trace,
                 #[cfg(feature = "experiment-controls")]
                 decode_budgets,
+                #[cfg(feature = "experiment-controls")]
+                backends,
             }),
         })
     }
@@ -959,6 +974,15 @@ impl VClaspSession {
             .decode_budgets
             .iter()
             .map(|budget| budget.snapshot())
+            .collect()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn io_activity(&self) -> Vec<Option<crate::backend::ObjectStorePressure>> {
+        self.inner
+            .backends
+            .iter()
+            .map(|backend| backend.object_store_pressure())
             .collect()
     }
 

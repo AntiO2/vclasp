@@ -390,6 +390,16 @@ and capacity waits. Configuration validation does not acquire a decode permit.
 Lifetime peaks include initialization and warmup and must not be subtracted to
 infer measurement-phase peaks; preserve the timestamped samples instead.
 
+The diagnostic `io_activity()` method samples each distinct session backend.
+S3 entries report the shared transport's `active_requests`,
+`outstanding_requests`, `queued_requests`, configured `max_concurrency`, and
+service-time EWMA. `S3ObjectStoreReader.pressure_snapshot()` exposes the same
+transport measurement for baseline adapters. Active counts represent held I/O
+permits; queued counts represent outstanding transport tasks awaiting those
+permits. They exclude planner and broker admission queues. Fields are read
+independently and can briefly disagree during transitions. Local backends
+return `None`; a missing gauge is not interpreted as zero activity.
+
 On Linux, each exact physical range event also contains `monotonic_timing`:
 the start, first-byte, and completion timestamps in nanoseconds from
 `CLOCK_MONOTONIC`. These timestamps share Python's `time.monotonic_ns()` clock
