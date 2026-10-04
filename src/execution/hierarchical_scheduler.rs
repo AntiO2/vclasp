@@ -1394,6 +1394,11 @@ impl HierarchicalBatchExecutor {
         feedback.apply_tail_to(&self.bootstrap_model)
     }
 
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn decode_budget_handle(&self) -> Arc<DecodeBudget> {
+        Arc::clone(&self.decode_budget)
+    }
+
     pub(crate) fn with_shared_decode_budget(
         mut self,
         decode_budget: Arc<DecodeBudget>,
@@ -1405,7 +1410,7 @@ impl HierarchicalBatchExecutor {
         // Validate the requested weight before any worker starts. The permit
         // is immediately released and only establishes that the shared budget
         // can admit one cursor operation.
-        drop(decode_budget.acquire(cursor_decoder_threads)?);
+        decode_budget.validate(cursor_decoder_threads)?;
         self.decode_budget = decode_budget;
         self.cursor_decoder_threads = cursor_decoder_threads;
         Ok(self)
@@ -1424,7 +1429,7 @@ impl HierarchicalBatchExecutor {
         if cursor_decoder_threads == 0 {
             return Err("cursor decoder threads must be positive".to_string());
         }
-        drop(decode_budget.acquire(cursor_decoder_threads)?);
+        decode_budget.validate(cursor_decoder_threads)?;
         self.incremental_decode_pool = IncrementalDecodePool::new_with_shared_cursor(
             Arc::clone(&decoder_slots),
             Arc::clone(&decode_budget),

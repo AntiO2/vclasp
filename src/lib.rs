@@ -6490,6 +6490,25 @@ impl PyVClaspSession {
             .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
     }
 
+    /// Sample distinct shared decode budgets without coordinator admission.
+    #[cfg(feature = "experiment-controls")]
+    fn decoder_activity(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        self.inner
+            .decode_activity()
+            .into_iter()
+            .map(|state| {
+                let row = PyDict::new_bound(py);
+                row.set_item("active_jobs", state.active_jobs)?;
+                row.set_item("queued_jobs", state.queued_jobs)?;
+                row.set_item("available_threads", state.available_threads)?;
+                row.set_item("lifetime_peak_active_jobs", state.peak_active_jobs)?;
+                row.set_item("completed_jobs", state.completed_jobs)?;
+                row.set_item("acquisition_wait_ns", state.acquisition_wait_ns)?;
+                Ok(row.unbind())
+            })
+            .collect()
+    }
+
     /// Drain complete windows; stop capture after all work finishes by default.
     #[cfg(feature = "experiment-controls")]
     #[pyo3(signature = (stop=true))]

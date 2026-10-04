@@ -639,6 +639,8 @@ struct SessionInner {
     metrics: Arc<Mutex<SessionMetrics>>,
     #[cfg(feature = "experiment-controls")]
     execution_trace: Arc<ExecutionTraceState>,
+    #[cfg(feature = "experiment-controls")]
+    decode_budgets: Vec<Arc<DecodeBudget>>,
 }
 
 #[derive(Clone)]
@@ -667,6 +669,17 @@ impl VClaspSession {
         }
         #[cfg(feature = "experiment-controls")]
         let execution_trace = Arc::new(ExecutionTraceState::new());
+        #[cfg(feature = "experiment-controls")]
+        let decode_budgets = {
+            let mut handles = Vec::new();
+            for executor in &executors {
+                let handle = executor.decode_budget_handle();
+                if !handles.iter().any(|other| Arc::ptr_eq(other, &handle)) {
+                    handles.push(handle);
+                }
+            }
+            handles
+        };
         #[cfg(feature = "experiment-controls")]
         let executors = executors
             .into_iter()
@@ -697,6 +710,8 @@ impl VClaspSession {
                 metrics,
                 #[cfg(feature = "experiment-controls")]
                 execution_trace,
+                #[cfg(feature = "experiment-controls")]
+                decode_budgets,
             }),
         })
     }
@@ -936,6 +951,15 @@ impl VClaspSession {
     #[cfg(feature = "experiment-controls")]
     pub fn drain_execution_trace(&self) -> SessionExecutionTrace {
         self.inner.execution_trace.drain()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn decode_activity(&self) -> Vec<crate::decoder::DecodeBudgetState> {
+        self.inner
+            .decode_budgets
+            .iter()
+            .map(|budget| budget.snapshot())
+            .collect()
     }
 
     #[cfg(feature = "experiment-controls")]

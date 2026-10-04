@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ptr;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 /// Configuration for the FFmpeg decoder.
 ///
@@ -106,8 +107,18 @@ pub(crate) type SharedDecoderSlots = Arc<Vec<Mutex<DecoderPool>>>;
 
 pub(crate) struct DecodeBudget {
     capacity: usize,
-    available: Mutex<usize>,
+    available: Mutex<DecodeBudgetState>,
     wake: Condvar,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DecodeBudgetState {
+    pub available_threads: usize,
+    pub active_jobs: usize,
+    pub queued_jobs: usize,
+    pub peak_active_jobs: usize,
+    pub completed_jobs: u64,
+    pub acquisition_wait_ns: u64,
 }
 
 pub(crate) struct DecodePermit {
@@ -120,41 +131,66 @@ impl DecodeBudget {
         assert!(capacity > 0, "decode budget must be positive");
         Arc::new(Self {
             capacity,
-            available: Mutex::new(capacity),
+            available: Mutex::new(DecodeBudgetState {
+                available_threads: capacity,
+                ..Default::default()
+            }),
             wake: Condvar::new(),
         })
     }
 
-    pub(crate) fn acquire(self: &Arc<Self>, units: usize) -> Result<DecodePermit, String> {
+    pub(crate) fn validate(&self, units: usize) -> Result<(), String> {
         if units == 0 || units > self.capacity {
             return Err(format!(
                 "decode request of {units} threads exceeds budget {}",
                 self.capacity
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn acquire(self: &Arc<Self>, units: usize) -> Result<DecodePermit, String> {
+        self.validate(units)?;
+        let started = Instant::now();
         let mut available = self
             .available
             .lock()
             .map_err(|_| "decode budget lock poisoned".to_string())?;
-        while *available < units {
+        available.queued_jobs += 1;
+        while available.available_threads < units {
             available = self
                 .wake
                 .wait(available)
                 .map_err(|_| "decode budget lock poisoned".to_string())?;
         }
-        *available -= units;
+        available.queued_jobs -= 1;
+        available.available_threads -= units;
+        available.active_jobs += 1;
+        available.peak_active_jobs = available.peak_active_jobs.max(available.active_jobs);
+        available.acquisition_wait_ns = available
+            .acquisition_wait_ns
+            .saturating_add(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         Ok(DecodePermit {
             budget: Arc::clone(self),
             units,
         })
+    }
+
+    pub(crate) fn snapshot(&self) -> DecodeBudgetState {
+        *self
+            .available
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 }
 
 impl Drop for DecodePermit {
     fn drop(&mut self) {
         if let Ok(mut available) = self.budget.available.lock() {
-            *available += self.units;
-            debug_assert!(*available <= self.budget.capacity);
+            available.available_threads += self.units;
+            available.active_jobs -= 1;
+            available.completed_jobs += 1;
+            debug_assert!(available.available_threads <= self.budget.capacity);
             self.budget.wake.notify_all();
         }
     }
@@ -1520,9 +1556,20 @@ mod tests {
 
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        let state = budget.snapshot();
+        assert_eq!(state.active_jobs, 1);
+        assert_eq!(state.queued_jobs, 1);
+        assert_eq!(state.available_threads, 0);
         drop(held);
         acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         waiter.join().unwrap();
+        let state = budget.snapshot();
+        assert_eq!(state.active_jobs, 0);
+        assert_eq!(state.queued_jobs, 0);
+        assert_eq!(state.available_threads, 2);
+        assert_eq!(state.completed_jobs, 2);
+        assert_eq!(state.peak_active_jobs, 1);
+        assert!(state.acquisition_wait_ns >= 50_000_000);
     }
 
     #[test]

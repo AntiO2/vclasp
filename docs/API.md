@@ -380,6 +380,16 @@ After synchronizing the reader, perform a final default `take_execution_trace()`
 to stop capture. A window larger than the configured capacity can still lose
 events, which must invalidate the run.
 
+The diagnostic `decoder_activity()` method samples each distinct shared decode
+budget directly, without waiting behind execution commands. Each entry reports
+`active_jobs`, `queued_jobs`, `available_threads`, `lifetime_peak_active_jobs`,
+`completed_jobs`, and cumulative `acquisition_wait_ns`. Active jobs count held
+decode permits, not FFmpeg threads or allocated decoder contexts; queue counts
+cover threads waiting to acquire those permits. Acquisition time includes mutex
+and capacity waits. Configuration validation does not acquire a decode permit.
+Lifetime peaks include initialization and warmup and must not be subtracted to
+infer measurement-phase peaks; preserve the timestamped samples instead.
+
 On Linux, each exact physical range event also contains `monotonic_timing`:
 the start, first-byte, and completion timestamps in nanoseconds from
 `CLOCK_MONOTONIC`. These timestamps share Python's `time.monotonic_ns()` clock
