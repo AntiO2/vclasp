@@ -660,6 +660,8 @@ struct SessionInner {
     decode_budgets: Vec<Arc<DecodeBudget>>,
     #[cfg(feature = "experiment-controls")]
     backends: Vec<Arc<dyn crate::backend::StorageBackend>>,
+    #[cfg(feature = "experiment-controls")]
+    cache_observations: Vec<crate::planner::CacheObservation>,
 }
 
 #[derive(Clone)]
@@ -711,9 +713,12 @@ impl VClaspSession {
             handles
         };
         #[cfg(feature = "experiment-controls")]
+        let mut cache_observations = Vec::new();
+        #[cfg(feature = "experiment-controls")]
         let executors = executors
             .into_iter()
-            .map(|executor| {
+            .map(|mut executor| {
+                cache_observations.push(executor.cache_observation());
                 executor.with_execution_trace_enabled(Arc::clone(&execution_trace.enabled))
             })
             .collect();
@@ -744,6 +749,8 @@ impl VClaspSession {
                 decode_budgets,
                 #[cfg(feature = "experiment-controls")]
                 backends,
+                #[cfg(feature = "experiment-controls")]
+                cache_observations,
             }),
         })
     }
@@ -983,6 +990,20 @@ impl VClaspSession {
     #[cfg(feature = "experiment-controls")]
     pub fn drain_execution_trace(&self) -> SessionExecutionTrace {
         self.inner.execution_trace.drain()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn cache_activity(&self) -> Vec<crate::planner::CacheObservationState> {
+        self.inner
+            .cache_observations
+            .iter()
+            .map(|observation| {
+                observation
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+            .collect()
     }
 
     #[cfg(feature = "experiment-controls")]

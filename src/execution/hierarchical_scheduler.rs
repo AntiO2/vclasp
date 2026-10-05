@@ -1351,6 +1351,11 @@ impl HierarchicalBatchExecutor {
     }
 
     #[cfg(feature = "experiment-controls")]
+    pub(crate) fn cache_observation(&mut self) -> planner::CacheObservation {
+        self.encoded_cache.observe()
+    }
+
+    #[cfg(feature = "experiment-controls")]
     pub(crate) fn with_execution_trace_enabled(mut self, enabled: Arc<AtomicBool>) -> Self {
         self.execution_trace_enabled = Some(enabled);
         self

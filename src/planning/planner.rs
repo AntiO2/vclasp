@@ -151,10 +151,30 @@ pub fn plan_group_spans(
     Ok(plans)
 }
 
+#[cfg(feature = "experiment-controls")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheObservationState {
+    pub alive: bool,
+    pub capacity_bytes: usize,
+    pub payload_bytes: usize,
+    pub payload_capacity_bytes: usize,
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub sequence: u64,
+}
+
+#[cfg(feature = "experiment-controls")]
+pub type CacheObservation = Arc<Mutex<CacheObservationState>>;
+
 #[derive(Debug)]
 pub struct ByteCache {
     capacity_bytes: usize,
     resident_bytes: usize,
+    payload_capacity_bytes: usize,
+    #[cfg(feature = "experiment-controls")]
+    observation: Option<CacheObservation>,
     entries: HashMap<u64, Vec<u8>>,
     lru: VecDeque<u64>,
     hits: u64,
@@ -173,11 +193,45 @@ impl ByteCache {
         Self {
             capacity_bytes,
             resident_bytes: 0,
+            payload_capacity_bytes: 0,
+            #[cfg(feature = "experiment-controls")]
+            observation: None,
             entries: HashMap::new(),
             lru: VecDeque::new(),
             hits: 0,
             misses: 0,
             evictions: 0,
+        }
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub fn observe(&mut self) -> CacheObservation {
+        let observation = self
+            .observation
+            .get_or_insert_with(|| Arc::new(Mutex::new(CacheObservationState::default())))
+            .clone();
+        self.publish_observation();
+        observation
+    }
+
+    fn publish_observation(&self) {
+        #[cfg(feature = "experiment-controls")]
+        if let Some(observation) = &self.observation {
+            let mut state = observation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let sequence = state.sequence + 1;
+            *state = CacheObservationState {
+                alive: true,
+                capacity_bytes: self.capacity_bytes,
+                payload_bytes: self.resident_bytes,
+                payload_capacity_bytes: self.payload_capacity_bytes,
+                entries: self.entries.len(),
+                hits: self.hits,
+                misses: self.misses,
+                evictions: self.evictions,
+                sequence,
+            };
         }
     }
 
@@ -196,6 +250,7 @@ impl ByteCache {
         } else {
             self.misses += 1;
         }
+        self.publish_observation();
         value
     }
 
@@ -215,9 +270,11 @@ impl ByteCache {
     pub fn remove(&mut self, record_id: u64) -> Option<Vec<u8>> {
         let value = self.entries.remove(&record_id)?;
         self.resident_bytes -= value.len();
+        self.payload_capacity_bytes -= value.capacity();
         if let Some(position) = self.lru.iter().position(|key| *key == record_id) {
             self.lru.remove(position);
         }
+        self.publish_observation();
         Some(value)
     }
 
@@ -233,8 +290,10 @@ impl ByteCache {
                 .remove(&victim)
                 .expect("cache accounting lost resident entry during resize");
             self.resident_bytes -= removed.len();
+            self.payload_capacity_bytes -= removed.capacity();
             self.evictions += 1;
         }
+        self.publish_observation();
     }
 
     pub fn put(&mut self, record_id: u64, value: Vec<u8>) -> bool {
@@ -243,6 +302,7 @@ impl ByteCache {
         }
         if let Some(previous) = self.entries.remove(&record_id) {
             self.resident_bytes -= previous.len();
+            self.payload_capacity_bytes -= previous.capacity();
             if let Some(position) = self.lru.iter().position(|key| *key == record_id) {
                 self.lru.remove(position);
             }
@@ -257,11 +317,14 @@ impl ByteCache {
                 .remove(&victim)
                 .expect("cache accounting lost resident entry");
             self.resident_bytes -= removed.len();
+            self.payload_capacity_bytes -= removed.capacity();
             self.evictions += 1;
         }
         self.resident_bytes += value.len();
+        self.payload_capacity_bytes += value.capacity();
         self.entries.insert(record_id, value);
         self.lru.push_back(record_id);
+        self.publish_observation();
         true
     }
 
@@ -269,6 +332,8 @@ impl ByteCache {
         self.entries.clear();
         self.lru.clear();
         self.resident_bytes = 0;
+        self.payload_capacity_bytes = 0;
+        self.publish_observation();
     }
 
     pub fn stats(&self) -> HashMap<String, u64> {
@@ -283,9 +348,84 @@ impl ByteCache {
     }
 }
 
+#[cfg(feature = "experiment-controls")]
+impl Drop for ByteCache {
+    fn drop(&mut self) {
+        if let Some(observation) = &self.observation {
+            let mut state = observation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.alive = false;
+            state.payload_bytes = 0;
+            state.payload_capacity_bytes = 0;
+            state.entries = 0;
+            state.sequence += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "experiment-controls")]
+    #[test]
+    fn cache_observation_tracks_allocated_capacity_and_live_eviction() {
+        let mut cache = ByteCache::new(10);
+        let observation = cache.observe();
+        let mut payload = Vec::with_capacity(64);
+        payload.extend_from_slice(&[1; 8]);
+        assert!(cache.put(1, payload));
+        let state = observation.lock().unwrap().clone();
+        assert_eq!((state.payload_bytes, state.payload_capacity_bytes), (8, 64));
+        assert!(cache.get(1).is_some());
+        assert!(cache.put(2, vec![2; 4]));
+        let state = observation.lock().unwrap().clone();
+        assert_eq!(
+            (state.hits, state.evictions, state.payload_bytes),
+            (1, 1, 4)
+        );
+        cache.resize(0);
+        let state = observation.lock().unwrap().clone();
+        assert_eq!(
+            (
+                state.capacity_bytes,
+                state.payload_capacity_bytes,
+                state.entries
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    #[test]
+    fn observation_reads_while_worker_owns_cache_and_reports_drop() {
+        let mut cache = ByteCache::new(16);
+        let observation = cache.observe();
+        let (ready, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            cache.put(5, vec![1; 8]);
+            ready.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let state = observation.lock().unwrap().clone();
+        assert!(state.alive);
+        assert_eq!(state.payload_bytes, 8);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let state = observation.lock().unwrap().clone();
+        assert!(!state.alive);
+        assert_eq!(
+            (
+                state.payload_bytes,
+                state.payload_capacity_bytes,
+                state.entries
+            ),
+            (0, 0, 0)
+        );
+    }
 
     #[test]
     fn exact_plan_deduplicates_without_merging() {

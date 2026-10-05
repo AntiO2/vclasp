@@ -6547,6 +6547,31 @@ impl PyVClaspSession {
             .collect()
     }
 
+    /// Live encoded-cache payload and Vec capacity, independent of window accounting.
+    #[cfg(feature = "experiment-controls")]
+    fn cache_activity(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        self.inner
+            .cache_activity()
+            .into_iter()
+            .map(|state| {
+                let row = PyDict::new_bound(py);
+                row.set_item("alive", state.alive)?;
+                row.set_item("budget_payload_bytes", state.capacity_bytes)?;
+                row.set_item("resident_payload_bytes", state.payload_bytes)?;
+                row.set_item(
+                    "resident_payload_capacity_bytes",
+                    state.payload_capacity_bytes,
+                )?;
+                row.set_item("entries", state.entries)?;
+                row.set_item("cache_get_hits", state.hits)?;
+                row.set_item("cache_get_misses", state.misses)?;
+                row.set_item("evictions", state.evictions)?;
+                row.set_item("update_sequence", state.sequence)?;
+                Ok(row.unbind())
+            })
+            .collect()
+    }
+
     #[cfg(feature = "experiment-controls")]
     fn io_activity(&self, py: Python<'_>) -> PyResult<Vec<Option<Py<PyDict>>>> {
         self.inner
