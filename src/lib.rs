@@ -6547,6 +6547,29 @@ impl PyVClaspSession {
             .collect()
     }
 
+    /// Live cursor ownership and read-ahead payload, including detached execution state.
+    #[cfg(feature = "experiment-controls")]
+    fn cursor_activity(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        self.inner
+            .cursor_activity()
+            .into_iter()
+            .map(|state| {
+                let row = PyDict::new_bound(py);
+                row.set_item("live_cursors", state.live_cursors)?;
+                row.set_item("detached_cursors", state.detached_cursors)?;
+                row.set_item("prefetched_payload_bytes", state.prefetched_payload_bytes)?;
+                row.set_item(
+                    "prefetched_payload_capacity_bytes",
+                    state.prefetched_payload_capacity_bytes,
+                )?;
+                row.set_item("created_cursors", state.created_cursors)?;
+                row.set_item("destroyed_cursors", state.destroyed_cursors)?;
+                row.set_item("update_sequence", state.sequence)?;
+                Ok(row.unbind())
+            })
+            .collect()
+    }
+
     /// Live encoded-cache payload and Vec capacity, independent of window accounting.
     #[cfg(feature = "experiment-controls")]
     fn cache_activity(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {

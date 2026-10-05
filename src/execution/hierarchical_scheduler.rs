@@ -1,3 +1,9 @@
+#[cfg(feature = "experiment-controls")]
+#[path = "cursor_observation.rs"]
+mod cursor_observation;
+#[cfg(feature = "experiment-controls")]
+pub(crate) use cursor_observation::{CursorActivity, CursorObservation};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 #[cfg(feature = "experiment-controls")]
@@ -800,6 +806,8 @@ pub struct HierarchicalBatchExecutor {
     batch_deadline_fences: bool,
     encoded_cache: planner::ByteCache,
     resident_cursors: HashMap<(String, u64), StreamingGopState>,
+    #[cfg(feature = "experiment-controls")]
+    cursor_observation: CursorObservation,
     resident_state_policy: Box<dyn ResidentStatePolicy<(String, u64)>>,
     resident_cursor_capacity: usize,
     resident_encoded_budget_bytes: usize,
@@ -817,6 +825,8 @@ pub struct HierarchicalBatchExecutor {
 }
 
 struct StreamingGopState {
+    #[cfg(feature = "experiment-controls")]
+    observation: cursor_observation::CursorLease,
     cursor: decoder::MonotonicGopCursor,
     prefetched: VecDeque<(usize, Vec<u8>)>,
     prefetched_bytes: usize,
@@ -1333,6 +1343,8 @@ impl HierarchicalBatchExecutor {
             batch_deadline_fences,
             encoded_cache: planner::ByteCache::new(resident_budget.encoded_bytes),
             resident_cursors: HashMap::new(),
+            #[cfg(feature = "experiment-controls")]
+            cursor_observation: CursorObservation::default(),
             resident_state_policy: Box::new(DependencyLivenessLru::new()),
             resident_cursor_capacity: resident_budget.live_cursors,
             resident_encoded_budget_bytes: resident_budget.encoded_bytes,
@@ -1348,6 +1360,11 @@ impl HierarchicalBatchExecutor {
             #[cfg(feature = "experiment-controls")]
             execution_trace_enabled: None,
         })
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn cursor_observation(&self) -> CursorObservation {
+        self.cursor_observation.clone()
     }
 
     #[cfg(feature = "experiment-controls")]
@@ -1899,9 +1916,11 @@ impl HierarchicalBatchExecutor {
         requests: &mut [ResidentCursorRequest],
     ) -> Result<(), String> {
         for request in requests {
-            let Some(state) = request.state.take() else {
+            let Some(mut state) = request.state.take() else {
                 continue;
             };
+            #[cfg(feature = "experiment-controls")]
+            state.observation.set_detached(false);
             self.resident_cursors.insert(request.key.clone(), state);
             self.resident_state_policy.on_insert(request.key.clone());
             if let Some(candidate) = self.active_cursor_candidates.get(&request.key) {
@@ -2027,6 +2046,13 @@ impl HierarchicalBatchExecutor {
                         key.0, key.1
                     )
                 })?);
+                #[cfg(feature = "experiment-controls")]
+                request
+                    .state
+                    .as_mut()
+                    .unwrap()
+                    .observation
+                    .set_detached(true);
                 self.resident_state_policy.on_remove(&key);
                 cursor_requests.push(request);
             } else {
@@ -2087,7 +2113,9 @@ impl HierarchicalBatchExecutor {
                 }
             }
             if let Some(error) = decode_error {
-                for result in results {
+                for mut result in results {
+                    #[cfg(feature = "experiment-controls")]
+                    result.state.observation.set_detached(false);
                     self.resident_cursors
                         .insert(result.key.clone(), result.state);
                     self.resident_state_policy.on_insert(result.key.clone());
@@ -2103,6 +2131,8 @@ impl HierarchicalBatchExecutor {
                 return Err(error);
             }
             for mut result in results {
+                #[cfg(feature = "experiment-controls")]
+                result.state.observation.set_detached(false);
                 self.resident_cursors
                     .insert(result.key.clone(), result.state);
                 self.resident_state_policy.on_insert(result.key.clone());
@@ -2204,6 +2234,10 @@ impl HierarchicalBatchExecutor {
             self.resident_cursors.insert(
                 key.clone(),
                 StreamingGopState {
+                    #[cfg(feature = "experiment-controls")]
+                    observation: cursor_observation::CursorLease::new(
+                        self.cursor_observation.clone(),
+                    ),
                     cursor: decoder::MonotonicGopCursor::new(DecoderConfig {
                         num_threads: cursor_decoder_threads,
                     })
@@ -2521,6 +2555,10 @@ impl HierarchicalBatchExecutor {
                     )
                 })?;
                 for (ordinal, access_unit) in fetched_access_units {
+                    #[cfg(feature = "experiment-controls")]
+                    state
+                        .observation
+                        .add_prefetch(access_unit.len(), access_unit.capacity());
                     state.prefetched_bytes += access_unit.len();
                     self.resident_read_ahead_bytes += access_unit.len();
                     state.prefetched.push_back((ordinal, access_unit));
@@ -2531,6 +2569,10 @@ impl HierarchicalBatchExecutor {
                     .is_some_and(|(ordinal, _)| *ordinal <= request.required_max_decode_ordinal)
                 {
                     let (_, access_unit) = state.prefetched.pop_front().unwrap();
+                    #[cfg(feature = "experiment-controls")]
+                    state
+                        .observation
+                        .remove_prefetch(access_unit.len(), access_unit.capacity());
                     state.prefetched_bytes -= access_unit.len();
                     self.resident_read_ahead_bytes -= access_unit.len();
                     request.access_units.push(access_unit);
@@ -2657,6 +2699,13 @@ impl HierarchicalBatchExecutor {
                 key.0, key.1
             )
         })?);
+        #[cfg(feature = "experiment-controls")]
+        request
+            .state
+            .as_mut()
+            .unwrap()
+            .observation
+            .set_detached(true);
         self.resident_state_policy.on_remove(&key);
         let mut requests = vec![request];
         let fetch_profile = match self.fetch_resident_cursor_requests(&mut requests) {
@@ -2697,6 +2746,8 @@ impl HierarchicalBatchExecutor {
                 return Err(error);
             }
         };
+        #[cfg(feature = "experiment-controls")]
+        result.state.observation.set_detached(false);
         self.resident_cursors
             .insert(result.key.clone(), result.state);
         self.resident_state_policy.on_insert(result.key.clone());

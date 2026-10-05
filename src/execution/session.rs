@@ -662,6 +662,8 @@ struct SessionInner {
     backends: Vec<Arc<dyn crate::backend::StorageBackend>>,
     #[cfg(feature = "experiment-controls")]
     cache_observations: Vec<crate::planner::CacheObservation>,
+    #[cfg(feature = "experiment-controls")]
+    cursor_observations: Vec<crate::hierarchical_scheduler::CursorObservation>,
 }
 
 #[derive(Clone)]
@@ -715,10 +717,13 @@ impl VClaspSession {
         #[cfg(feature = "experiment-controls")]
         let mut cache_observations = Vec::new();
         #[cfg(feature = "experiment-controls")]
+        let mut cursor_observations = Vec::new();
+        #[cfg(feature = "experiment-controls")]
         let executors = executors
             .into_iter()
             .map(|mut executor| {
                 cache_observations.push(executor.cache_observation());
+                cursor_observations.push(executor.cursor_observation());
                 executor.with_execution_trace_enabled(Arc::clone(&execution_trace.enabled))
             })
             .collect();
@@ -751,6 +756,8 @@ impl VClaspSession {
                 backends,
                 #[cfg(feature = "experiment-controls")]
                 cache_observations,
+                #[cfg(feature = "experiment-controls")]
+                cursor_observations,
             }),
         })
     }
@@ -990,6 +997,20 @@ impl VClaspSession {
     #[cfg(feature = "experiment-controls")]
     pub fn drain_execution_trace(&self) -> SessionExecutionTrace {
         self.inner.execution_trace.drain()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn cursor_activity(&self) -> Vec<crate::hierarchical_scheduler::CursorActivity> {
+        self.inner
+            .cursor_observations
+            .iter()
+            .map(|observation| {
+                observation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+            })
+            .collect()
     }
 
     #[cfg(feature = "experiment-controls")]
