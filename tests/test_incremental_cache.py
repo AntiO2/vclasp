@@ -9,7 +9,7 @@ import vclasp
 pytestmark = pytest.mark.integration
 
 
-@pytest.mark.parametrize("budget", [0, 1, 8 << 20])
+@pytest.mark.parametrize("budget", [0, 1, 32 << 10, 8 << 20])
 def test_incremental_windows_reuse_encoded_aus(budget):
     chunk = os.environ.get("VCLASP_CACHE_TEST_CHUNK")
     video = os.environ.get("VCLASP_CACHE_TEST_VIDEO")
@@ -49,6 +49,6 @@ def test_incremental_windows_reuse_encoded_aus(budget):
         assert snapshots[2]["resident_encoded_misses"] == 0
         assert snapshots[2]["physical_ranges"] == snapshots[2]["fetched_bytes"] == 0
         assert snapshots[2]["submitted_access_units"] > 0
-    else:
+    elif budget <= 1:
         assert all(stats["resident_encoded_hits"] == 0 for stats in snapshots)
         assert all(stats["physical_ranges"] > 0 for stats in snapshots)
