@@ -340,6 +340,9 @@ impl VClaspPipeline {
 #[derive(Debug, Clone, Default)]
 pub struct SessionMetrics {
     pub completed_windows: u64,
+    pub resident_path_windows: u64,
+    pub stateless_path_windows: u64,
+    pub other_path_windows: u64,
     pub logical_targets: u64,
     pub physical_ranges: u64,
     pub client_requests: u64,
@@ -492,6 +495,14 @@ impl ExecutionTraceState {
 impl SessionMetrics {
     fn observe(&mut self, stats: &ExecutionStats) {
         self.completed_windows += 1;
+        match stats.mode {
+            "global_window_adaptive" => self.resident_path_windows += 1,
+            "window_closure_session"
+            | "window_closure_session_fixed16_fallback"
+            | "window_region_session"
+            | "window_session" => self.stateless_path_windows += 1,
+            _ => self.other_path_windows += 1,
+        }
         self.logical_targets += stats.logical_targets as u64;
         self.physical_ranges += stats.physical_ranges as u64;
         self.client_requests += stats.client_requests as u64;
@@ -1540,6 +1551,25 @@ fn attribute_joint_stats(global: &ExecutionStats, logical_counts: &[usize]) -> V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_counts_observed_window_paths_without_inference_from_hits() {
+        let mut metrics = super::SessionMetrics::default();
+        for mode in [
+            "global_window_adaptive",
+            "window_closure_session",
+            "unknown",
+        ] {
+            metrics.observe(&super::ExecutionStats {
+                mode,
+                ..Default::default()
+            });
+        }
+        assert_eq!(metrics.resident_path_windows, 1);
+        assert_eq!(metrics.stateless_path_windows, 1);
+        assert_eq!(metrics.other_path_windows, 1);
+        assert_eq!(metrics.completed_windows, 3);
+        assert_eq!(metrics.resident_cursor_hits, 0);
+    }
     #[test]
     fn session_cache_counters_follow_physical_windows() {
         let mut metrics = super::SessionMetrics::default();

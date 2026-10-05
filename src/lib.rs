@@ -6471,6 +6471,9 @@ impl PyVClaspSession {
         let metrics = self.inner.metrics_snapshot();
         [
             ("completed_windows", metrics.completed_windows),
+            ("resident_path_windows", metrics.resident_path_windows),
+            ("stateless_path_windows", metrics.stateless_path_windows),
+            ("other_path_windows", metrics.other_path_windows),
             ("logical_targets", metrics.logical_targets),
             ("physical_ranges", metrics.physical_ranges),
             ("client_requests", metrics.client_requests),
