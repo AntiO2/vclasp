@@ -6479,6 +6479,8 @@ impl PyVClaspSession {
             ("submitted_access_units", metrics.submitted_access_units),
             ("decoded_access_units", metrics.decoded_access_units),
             ("decode_groups", metrics.decode_groups),
+            ("resident_encoded_hits", metrics.resident_encoded_hits),
+            ("resident_encoded_misses", metrics.resident_encoded_misses),
             ("resident_cursor_hits", metrics.resident_cursor_hits),
             ("resident_cursor_misses", metrics.resident_cursor_misses),
             ("decoder_state_resets", metrics.decoder_state_resets),

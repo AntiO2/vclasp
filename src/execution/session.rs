@@ -348,6 +348,8 @@ pub struct SessionMetrics {
     pub submitted_access_units: u64,
     pub decoded_access_units: u64,
     pub decode_groups: u64,
+    pub resident_encoded_hits: u64,
+    pub resident_encoded_misses: u64,
     pub resident_cursor_hits: u64,
     pub resident_cursor_misses: u64,
     pub decoder_state_resets: u64,
@@ -498,6 +500,8 @@ impl SessionMetrics {
         self.submitted_access_units += stats.submitted_access_units as u64;
         self.decoded_access_units += stats.decoded_access_units as u64;
         self.decode_groups += stats.decode_groups as u64;
+        self.resident_encoded_hits += stats.encoded_cache_hits as u64;
+        self.resident_encoded_misses += stats.encoded_cache_misses as u64;
         self.resident_cursor_hits += stats.resident_cursor_hits as u64;
         self.resident_cursor_misses += stats.resident_cursor_misses as u64;
         self.decoder_state_resets += stats.decoder_state_resets as u64;
@@ -1536,6 +1540,22 @@ fn attribute_joint_stats(global: &ExecutionStats, logical_counts: &[usize]) -> V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_cache_counters_follow_physical_windows() {
+        let mut metrics = super::SessionMetrics::default();
+        for (hits, misses, targets) in [(0, 7, 32), (5, 2, 64)] {
+            metrics.observe(&super::ExecutionStats {
+                encoded_cache_hits: hits,
+                encoded_cache_misses: misses,
+                logical_targets: targets,
+                ..Default::default()
+            });
+        }
+        assert_eq!(metrics.completed_windows, 2);
+        assert_eq!(metrics.logical_targets, 96);
+        assert_eq!(metrics.resident_encoded_hits, 5);
+        assert_eq!(metrics.resident_encoded_misses, 9);
+    }
     #[cfg(feature = "experiment-controls")]
     use super::ExecutionTraceState;
     use super::{
