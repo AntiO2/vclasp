@@ -49,6 +49,26 @@ mod tests {
     #[cfg(feature = "experiment-controls")]
     use crate::runtime_feedback::RuntimeFeedbackConfig;
     use std::collections::HashMap;
+    #[test]
+    fn accumulated_cache_residency_is_the_last_snapshot() {
+        let mut total = super::HierarchicalBatchStats::default();
+        for bytes in [4096, 1024] {
+            let part = super::HierarchicalBatchStats {
+                encoded_cache_hits: 3,
+                encoded_cache_resident_bytes: bytes,
+                resident_read_ahead_bytes: 64,
+                resident_encoded_budget_bytes: 8192,
+                resident_cursor_capacity: 2,
+                ..Default::default()
+            };
+            super::accumulate_batch_stats(&mut total, &part);
+        }
+        assert_eq!(total.encoded_cache_hits, 6);
+        assert_eq!(total.encoded_cache_resident_bytes, 1024);
+        assert_eq!(total.resident_read_ahead_bytes, 64);
+        assert_eq!(total.resident_encoded_budget_bytes, 8192);
+        assert_eq!(total.resident_cursor_capacity, 2);
+    }
     #[cfg(feature = "experiment-controls")]
     use std::sync::Arc;
 
@@ -509,6 +529,12 @@ pub(crate) fn accumulate_batch_stats(
     total.resident_cursor_candidates += part.resident_cursor_candidates;
     total.resident_cursor_selected += part.resident_cursor_selected;
     total.cursor_policy_ns += part.cursor_policy_ns;
+    // Counters accumulate, while residency describes the final subexecution.
+    // Adding snapshots would count the same resident bytes repeatedly.
+    total.encoded_cache_resident_bytes = part.encoded_cache_resident_bytes;
+    total.resident_read_ahead_bytes = part.resident_read_ahead_bytes;
+    total.resident_encoded_budget_bytes = part.resident_encoded_budget_bytes;
+    total.resident_cursor_capacity = part.resident_cursor_capacity;
     total.resident_cursor_entries = part.resident_cursor_entries;
     total.resident_cursor_pinned_entries = part.resident_cursor_pinned_entries;
     total.resident_cursor_probationary_entries = part.resident_cursor_probationary_entries;
