@@ -353,6 +353,7 @@ pub struct SessionMetrics {
     pub decode_groups: u64,
     pub resident_encoded_hits: u64,
     pub resident_encoded_misses: u64,
+    pub resident_encoded_evictions: u64,
     pub resident_cursor_hits: u64,
     pub resident_cursor_misses: u64,
     pub decoder_state_resets: u64,
@@ -513,6 +514,7 @@ impl SessionMetrics {
         self.decode_groups += stats.decode_groups as u64;
         self.resident_encoded_hits += stats.encoded_cache_hits as u64;
         self.resident_encoded_misses += stats.encoded_cache_misses as u64;
+        self.resident_encoded_evictions += stats.encoded_cache_evictions;
         self.resident_cursor_hits += stats.resident_cursor_hits as u64;
         self.resident_cursor_misses += stats.resident_cursor_misses as u64;
         self.decoder_state_resets += stats.decoder_state_resets as u64;

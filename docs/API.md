@@ -197,6 +197,14 @@ trace phases. This barrier waits for all earlier commands on every execution
 lane, including metric and trace updates; it preserves resident reader state.
 `metrics_snapshot()` itself remains a nonblocking snapshot. The same barrier
 is available on the Python session and releases the GIL while waiting.
+Session `resident_encoded_evictions` counts actual LRU removals during completed
+physical windows, including insertion and capacity reduction. Disabled caches
+and rejected oversized AUs do not count as evictions. Subtract phase snapshots
+after synchronization to exclude warmup; this is a count, not a memory estimate.
+
+Python local, S3 and AIStore session constructors release the GIL during
+index loading and backend setup, so independent Python monitoring threads can
+observe initialization. Argument conversion and validation retain the GIL.
 
 ### Python session
 

@@ -5115,6 +5115,7 @@ fn hierarchical_stats_dict(
         ("decode_groups", stats.decode_groups as u64),
         ("resident_encoded_hits", stats.encoded_cache_hits as u64),
         ("resident_encoded_misses", stats.encoded_cache_misses as u64),
+        ("resident_encoded_evictions", stats.encoded_cache_evictions),
         ("resident_encoded_bytes", stats.encoded_cache_resident_bytes),
         ("resident_cursor_hits", stats.resident_cursor_hits as u64),
         (
@@ -6151,6 +6152,7 @@ impl PyVClaspSession {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn local(
+        py: Python<'_>,
         chunk_path: &str,
         cost_model: std::collections::HashMap<String, f64>,
         wave_request_overhead_ns: Vec<f64>,
@@ -6183,7 +6185,8 @@ impl PyVClaspSession {
             resident_cursor_capacity,
         )?;
         Ok(Self {
-            inner: session::VClaspSession::open_local(chunk_path, config)
+            inner: py
+                .allow_threads(|| session::VClaspSession::open_local(chunk_path, config))
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
         })
     }
@@ -6200,6 +6203,7 @@ impl PyVClaspSession {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn aistore(
+        py: Python<'_>,
         local_chunk_path: &str,
         object_key: String,
         endpoint: String,
@@ -6236,17 +6240,20 @@ impl PyVClaspSession {
             resident_cursor_capacity,
         )?;
         Ok(Self {
-            inner: session::VClaspSession::open_aistore(
-                local_chunk_path,
-                session::AIStoreConfig {
-                    endpoint,
-                    bucket,
-                    object_key,
-                    provider,
-                },
-                config,
-            )
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
+            inner: py
+                .allow_threads(|| {
+                    session::VClaspSession::open_aistore(
+                        local_chunk_path,
+                        session::AIStoreConfig {
+                            endpoint,
+                            bucket,
+                            object_key,
+                            provider,
+                        },
+                        config,
+                    )
+                })
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
         })
     }
 
@@ -6265,6 +6272,7 @@ impl PyVClaspSession {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         local_chunk_path: &str,
         object_key: String,
         endpoint: String,
@@ -6311,20 +6319,23 @@ impl PyVClaspSession {
             )));
         }
         Ok(Self {
-            inner: session::VClaspSession::open_s3(
-                local_chunk_path,
-                session::S3Config {
-                    endpoint,
-                    bucket,
-                    object_key,
-                    access_key_id: access_key,
-                    secret_access_key: secret_key,
-                    region,
-                    max_concurrency: global_io_concurrency,
-                },
-                config,
-            )
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
+            inner: py
+                .allow_threads(|| {
+                    session::VClaspSession::open_s3(
+                        local_chunk_path,
+                        session::S3Config {
+                            endpoint,
+                            bucket,
+                            object_key,
+                            access_key_id: access_key,
+                            secret_access_key: secret_key,
+                            region,
+                            max_concurrency: global_io_concurrency,
+                        },
+                        config,
+                    )
+                })
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
         })
     }
 
@@ -6484,6 +6495,10 @@ impl PyVClaspSession {
             ("decode_groups", metrics.decode_groups),
             ("resident_encoded_hits", metrics.resident_encoded_hits),
             ("resident_encoded_misses", metrics.resident_encoded_misses),
+            (
+                "resident_encoded_evictions",
+                metrics.resident_encoded_evictions,
+            ),
             ("resident_cursor_hits", metrics.resident_cursor_hits),
             ("resident_cursor_misses", metrics.resident_cursor_misses),
             ("decoder_state_resets", metrics.decoder_state_resets),

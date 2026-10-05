@@ -454,6 +454,7 @@ pub struct HierarchicalBatchStats {
     pub decode_groups: usize,
     pub encoded_cache_hits: usize,
     pub encoded_cache_misses: usize,
+    pub encoded_cache_evictions: u64,
     pub encoded_cache_resident_bytes: u64,
     pub resident_cursor_hits: usize,
     pub resident_cursor_misses: usize,
@@ -523,6 +524,7 @@ pub(crate) fn accumulate_batch_stats(
     total.decode_groups += part.decode_groups;
     total.encoded_cache_hits += part.encoded_cache_hits;
     total.encoded_cache_misses += part.encoded_cache_misses;
+    total.encoded_cache_evictions += part.encoded_cache_evictions;
     total.resident_cursor_hits += part.resident_cursor_hits;
     total.resident_cursor_misses += part.resident_cursor_misses;
     total.decoder_state_resets += part.decoder_state_resets;
@@ -1958,6 +1960,7 @@ impl HierarchicalBatchExecutor {
             decode_groups: 0,
             encoded_cache_hits: 0,
             encoded_cache_misses: 0,
+            encoded_cache_evictions: 0,
             encoded_cache_resident_bytes: 0,
             resident_cursor_hits: 0,
             resident_cursor_misses: 0,
@@ -2391,6 +2394,7 @@ impl HierarchicalBatchExecutor {
                 decode_groups: 1,
                 encoded_cache_hits: 0,
                 encoded_cache_misses: 0,
+                encoded_cache_evictions: 0,
                 encoded_cache_resident_bytes: self.encoded_cache.resident_bytes() as u64,
                 resident_cursor_hits: usize::from(cache_hit),
                 resident_cursor_misses: usize::from(!cache_hit),
@@ -2797,6 +2801,22 @@ impl HierarchicalBatchExecutor {
     }
 
     pub(crate) fn execute_window_streaming(
+        &mut self,
+        batches: &[Vec<LogicalTarget>],
+        on_batch_ready: &mut dyn FnMut(
+            usize,
+            Vec<HierarchicalOutput>,
+            u64,
+        ) -> Option<Vec<HierarchicalOutput>>,
+    ) -> Result<HierarchicalIncrementalWindow, String> {
+        let evictions_before = self.encoded_cache.stats()["evictions"];
+        let mut window = self.execute_window_streaming_inner(batches, on_batch_ready)?;
+        window.stats.encoded_cache_evictions =
+            self.encoded_cache.stats()["evictions"].saturating_sub(evictions_before);
+        Ok(window)
+    }
+
+    fn execute_window_streaming_inner(
         &mut self,
         batches: &[Vec<LogicalTarget>],
         on_batch_ready: &mut dyn FnMut(
@@ -3517,6 +3537,7 @@ impl HierarchicalBatchExecutor {
                 decode_groups,
                 encoded_cache_hits,
                 encoded_cache_misses,
+                encoded_cache_evictions: 0,
                 encoded_cache_resident_bytes: self.encoded_cache.resident_bytes() as u64,
                 resident_cursor_hits: 0,
                 resident_cursor_misses: 0,
@@ -4154,6 +4175,7 @@ impl HierarchicalBatchExecutor {
                     .len(),
                 encoded_cache_hits,
                 encoded_cache_misses,
+                encoded_cache_evictions: 0,
                 encoded_cache_resident_bytes: self.encoded_cache.resident_bytes() as u64,
                 resident_cursor_hits: 0,
                 resident_cursor_misses: 0,

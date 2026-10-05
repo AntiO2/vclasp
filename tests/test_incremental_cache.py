@@ -1,4 +1,5 @@
 """Regression for AU reuse across streaming windows without live cursors."""
+
 import json
 import os
 from pathlib import Path
@@ -20,8 +21,13 @@ def test_incremental_windows_reuse_encoded_aus(budget):
 
     def reader(capacity):
         return vclasp.VClaspSession.local(
-            chunk, model, [], max_callers=1, decoder_threads=1,
-            global_decode_concurrency=2, resident_encoded_bytes=capacity,
+            chunk,
+            model,
+            [],
+            max_callers=1,
+            decoder_threads=1,
+            global_decode_concurrency=2,
+            resident_encoded_bytes=capacity,
             resident_cursor_capacity=0,
         )
 
@@ -52,3 +58,12 @@ def test_incremental_windows_reuse_encoded_aus(budget):
     elif budget <= 1:
         assert all(stats["resident_encoded_hits"] == 0 for stats in snapshots)
         assert all(stats["physical_ranges"] > 0 for stats in snapshots)
+
+    metrics = cached.metrics_snapshot()
+    assert metrics["resident_encoded_evictions"] == sum(
+        stats["resident_encoded_evictions"] for stats in snapshots
+    )
+    if budget == 32 << 10:
+        assert metrics["resident_encoded_evictions"] > 0
+    else:
+        assert metrics["resident_encoded_evictions"] == 0
