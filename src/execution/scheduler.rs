@@ -936,6 +936,7 @@ impl LogicalScheduler {
                         started_ns: range_started,
                         first_byte_ns: completed_ns,
                         completed_ns,
+                        monotonic_timing: None,
                     });
                 }
                 stats.fetch_wall_ns = fetch_started.elapsed().as_nanos() as u64;
@@ -1065,6 +1066,7 @@ mod tests {
                     started_ns: range_started,
                     first_byte_ns: started.elapsed().as_nanos() as u64,
                     completed_ns: started.elapsed().as_nanos() as u64,
+                    monotonic_timing: None,
                 })?;
             }
             Ok(())

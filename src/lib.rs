@@ -704,6 +704,20 @@ pub struct S3ObjectStoreReader {
     inner: backend::S3ObjectStoreClient,
 }
 
+#[cfg(feature = "experiment-controls")]
+fn object_store_pressure_to_python(
+    py: Python<'_>,
+    pressure: backend::ObjectStorePressure,
+) -> PyResult<Py<PyDict>> {
+    let row = PyDict::new_bound(py);
+    row.set_item("max_concurrency", pressure.max_concurrency)?;
+    row.set_item("active_requests", pressure.active_requests)?;
+    row.set_item("outstanding_requests", pressure.outstanding_requests)?;
+    row.set_item("queued_requests", pressure.queued_requests)?;
+    row.set_item("service_time_ns_ewma", pressure.service_time_ns_ewma)?;
+    Ok(row.unbind())
+}
+
 /// Thin Python adapter over the Rust mmap backend for label-free storage probes.
 #[pyclass]
 pub struct LocalRangeReader {
@@ -1378,6 +1392,10 @@ impl S3RangeReader {
 
 #[pymethods]
 impl S3ObjectStoreReader {
+    #[cfg(feature = "experiment-controls")]
+    fn pressure_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        object_store_pressure_to_python(py, self.inner.pressure_snapshot())
+    }
     #[new]
     #[pyo3(signature = (endpoint, bucket, access_key_id, secret_access_key,
                         region="us-east-1".to_string(), max_concurrency=8))]
@@ -5097,6 +5115,7 @@ fn hierarchical_stats_dict(
         ("decode_groups", stats.decode_groups as u64),
         ("resident_encoded_hits", stats.encoded_cache_hits as u64),
         ("resident_encoded_misses", stats.encoded_cache_misses as u64),
+        ("resident_encoded_evictions", stats.encoded_cache_evictions),
         ("resident_encoded_bytes", stats.encoded_cache_resident_bytes),
         ("resident_cursor_hits", stats.resident_cursor_hits as u64),
         (
@@ -6133,6 +6152,7 @@ impl PyVClaspSession {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn local(
+        py: Python<'_>,
         chunk_path: &str,
         cost_model: std::collections::HashMap<String, f64>,
         wave_request_overhead_ns: Vec<f64>,
@@ -6165,7 +6185,8 @@ impl PyVClaspSession {
             resident_cursor_capacity,
         )?;
         Ok(Self {
-            inner: session::VClaspSession::open_local(chunk_path, config)
+            inner: py
+                .allow_threads(|| session::VClaspSession::open_local(chunk_path, config))
                 .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
         })
     }
@@ -6182,6 +6203,7 @@ impl PyVClaspSession {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn aistore(
+        py: Python<'_>,
         local_chunk_path: &str,
         object_key: String,
         endpoint: String,
@@ -6218,17 +6240,20 @@ impl PyVClaspSession {
             resident_cursor_capacity,
         )?;
         Ok(Self {
-            inner: session::VClaspSession::open_aistore(
-                local_chunk_path,
-                session::AIStoreConfig {
-                    endpoint,
-                    bucket,
-                    object_key,
-                    provider,
-                },
-                config,
-            )
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
+            inner: py
+                .allow_threads(|| {
+                    session::VClaspSession::open_aistore(
+                        local_chunk_path,
+                        session::AIStoreConfig {
+                            endpoint,
+                            bucket,
+                            object_key,
+                            provider,
+                        },
+                        config,
+                    )
+                })
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
         })
     }
 
@@ -6247,6 +6272,7 @@ impl PyVClaspSession {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         local_chunk_path: &str,
         object_key: String,
         endpoint: String,
@@ -6293,20 +6319,23 @@ impl PyVClaspSession {
             )));
         }
         Ok(Self {
-            inner: session::VClaspSession::open_s3(
-                local_chunk_path,
-                session::S3Config {
-                    endpoint,
-                    bucket,
-                    object_key,
-                    access_key_id: access_key,
-                    secret_access_key: secret_key,
-                    region,
-                    max_concurrency: global_io_concurrency,
-                },
-                config,
-            )
-            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
+            inner: py
+                .allow_threads(|| {
+                    session::VClaspSession::open_s3(
+                        local_chunk_path,
+                        session::S3Config {
+                            endpoint,
+                            bucket,
+                            object_key,
+                            access_key_id: access_key,
+                            secret_access_key: secret_key,
+                            region,
+                            max_concurrency: global_io_concurrency,
+                        },
+                        config,
+                    )
+                })
+                .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?,
         })
     }
 
@@ -6453,6 +6482,9 @@ impl PyVClaspSession {
         let metrics = self.inner.metrics_snapshot();
         [
             ("completed_windows", metrics.completed_windows),
+            ("resident_path_windows", metrics.resident_path_windows),
+            ("stateless_path_windows", metrics.stateless_path_windows),
+            ("other_path_windows", metrics.other_path_windows),
             ("logical_targets", metrics.logical_targets),
             ("physical_ranges", metrics.physical_ranges),
             ("client_requests", metrics.client_requests),
@@ -6461,6 +6493,12 @@ impl PyVClaspSession {
             ("submitted_access_units", metrics.submitted_access_units),
             ("decoded_access_units", metrics.decoded_access_units),
             ("decode_groups", metrics.decode_groups),
+            ("resident_encoded_hits", metrics.resident_encoded_hits),
+            ("resident_encoded_misses", metrics.resident_encoded_misses),
+            (
+                "resident_encoded_evictions",
+                metrics.resident_encoded_evictions,
+            ),
             ("resident_cursor_hits", metrics.resident_cursor_hits),
             ("resident_cursor_misses", metrics.resident_cursor_misses),
             ("decoder_state_resets", metrics.decoder_state_resets),
@@ -6490,13 +6528,51 @@ impl PyVClaspSession {
             .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)
     }
 
-    /// Call after all submitted work finishes.
+    /// Sample distinct shared decode budgets without coordinator admission.
     #[cfg(feature = "experiment-controls")]
+    fn decoder_activity(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        self.inner
+            .decode_activity()
+            .into_iter()
+            .map(|state| {
+                let row = PyDict::new_bound(py);
+                row.set_item("active_jobs", state.active_jobs)?;
+                row.set_item("queued_jobs", state.queued_jobs)?;
+                row.set_item("available_threads", state.available_threads)?;
+                row.set_item("lifetime_peak_active_jobs", state.peak_active_jobs)?;
+                row.set_item("completed_jobs", state.completed_jobs)?;
+                row.set_item("acquisition_wait_ns", state.acquisition_wait_ns)?;
+                Ok(row.unbind())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    fn io_activity(&self, py: Python<'_>) -> PyResult<Vec<Option<Py<PyDict>>>> {
+        self.inner
+            .io_activity()
+            .into_iter()
+            .map(|pressure| {
+                pressure
+                    .map(|value| object_store_pressure_to_python(py, value))
+                    .transpose()
+            })
+            .collect()
+    }
+
+    /// Drain complete windows; stop capture after all work finishes by default.
+    #[cfg(feature = "experiment-controls")]
+    #[pyo3(signature = (stop=true))]
     fn take_execution_trace(
         &self,
         py: Python<'_>,
+        stop: bool,
     ) -> PyResult<(Vec<Py<PyDict>>, usize, usize, Vec<Py<PyDict>>, usize, usize)> {
-        let trace = self.inner.take_execution_trace();
+        let trace = if stop {
+            self.inner.take_execution_trace()
+        } else {
+            self.inner.drain_execution_trace()
+        };
         let mut ranges = Vec::with_capacity(trace.range_events.len());
         for event in trace.range_events {
             let row = PyDict::new_bound(py);
@@ -6510,6 +6586,7 @@ impl PyVClaspSession {
             row.set_item("started_ns", event.range.started_ns)?;
             row.set_item("first_byte_ns", event.range.first_byte_ns)?;
             row.set_item("completed_ns", event.range.completed_ns)?;
+            row.set_item("monotonic_timing", event.range.monotonic_timing)?;
             row.set_item("physical_requests", event.range.physical_requests)?;
             row.set_item("fetched_bytes", event.range.fetched_bytes)?;
             row.set_item("consumer_sample_ids", event.range.consumer_sample_ids)?;

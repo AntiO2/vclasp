@@ -5,13 +5,16 @@
 //! scheduler to run against local SSD (zero network cost) or MinIO (real
 //! Range GET latency and bytes-transferred measurement).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 pub use vclasp_object_store::{
-    CompletedRange, ObjectRange, ObjectStorePressure, S3ObjectStoreClient,
+    monotonic_time_ns, CompletedRange, ObjectRange, ObjectStorePressure, S3ObjectStoreClient,
 };
+
+static NEXT_LOCAL_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct ProfiledRangeBatch {
@@ -41,10 +44,12 @@ pub trait StorageBackend: Send + Sync {
         let started = Instant::now();
         for (index, &(offset, length)) in ranges.iter().enumerate() {
             let range_started = started.elapsed().as_nanos() as u64;
+            let monotonic_started = monotonic_time_ns();
             let bytes = self.read_byte_range(offset, length)?;
+            let monotonic_completed = monotonic_time_ns();
             callback(CompletedRange {
                 index,
-                physical_request_id: index as u64 + 1,
+                physical_request_id: NEXT_LOCAL_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
                 physical_object_offset: offset,
                 physical_object_length: length,
                 physical_requests: 1,
@@ -53,6 +58,9 @@ pub trait StorageBackend: Send + Sync {
                 started_ns: range_started,
                 first_byte_ns: started.elapsed().as_nanos() as u64,
                 completed_ns: started.elapsed().as_nanos() as u64,
+                monotonic_timing: monotonic_started
+                    .zip(monotonic_completed)
+                    .map(|(start, end)| (start, end, end)),
             })?;
         }
         Ok(())
@@ -558,6 +566,7 @@ fn execute_broker_window(
                     started_ns: completed.started_ns,
                     first_byte_ns: completed.first_byte_ns,
                     completed_ns: completed.completed_ns,
+                    monotonic_timing: completed.monotonic_timing,
                     physical_requests: usize::from(owns_physical_request),
                     physical_fetched_bytes: if owns_physical_request {
                         completed.bytes.len() as u64
@@ -741,6 +750,7 @@ impl StorageBackend for S3Backend {
                         started_ns: 0,
                         first_byte_ns: if index == 0 { completed_ns } else { 0 },
                         completed_ns: if index == 0 { completed_ns } else { 0 },
+                        monotonic_timing: None,
                     })?;
                 }
                 Ok(())
@@ -1139,6 +1149,7 @@ impl StorageBackend for AIStoreGetBatchBackend {
                 started_ns: 0,
                 first_byte_ns: if index == 0 { completed_ns } else { 0 },
                 completed_ns: if index == 0 { completed_ns } else { 0 },
+                monotonic_timing: None,
             })?;
         }
         Ok(())
@@ -1183,6 +1194,57 @@ mod aistore_tests {
 
     struct ProfiledBackend;
 
+    #[test]
+    fn default_range_ids_are_unique_across_calls_and_threads() {
+        struct Reader;
+        impl StorageBackend for Reader {
+            fn read_byte_range(
+                &self,
+                _offset: u64,
+                length: u64,
+            ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                Ok(vec![0; length as usize])
+            }
+        }
+        let ids = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut ids = Vec::new();
+                        for _ in 0..2 {
+                            Reader
+                                .for_each_byte_range(&[(0, 4), (4, 4)], &mut |completed| {
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        let (start, first, end) =
+                                            completed.monotonic_timing.unwrap();
+                                        assert!(start > 0 && start <= first && first <= end);
+                                        assert!(end <= super::monotonic_time_ns().unwrap());
+                                    }
+                                    ids.push(completed.physical_request_id);
+                                    Ok(())
+                                })
+                                .unwrap();
+                        }
+                        ids
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(ids.len(), 32);
+        assert!(ids.iter().all(|id| *id > 0));
+        assert_eq!(
+            ids.into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            32
+        );
+    }
+
     impl StorageBackend for ProfiledBackend {
         fn read_byte_range(
             &self,
@@ -1209,6 +1271,7 @@ mod aistore_tests {
                     started_ns: 5,
                     first_byte_ns: 15,
                     completed_ns: 50,
+                    monotonic_timing: None,
                 },
                 CompletedRange {
                     index: 2,
@@ -1221,6 +1284,7 @@ mod aistore_tests {
                     started_ns: 50,
                     first_byte_ns: 60,
                     completed_ns: 80,
+                    monotonic_timing: None,
                 },
                 CompletedRange {
                     index: 0,
@@ -1233,6 +1297,7 @@ mod aistore_tests {
                     started_ns: 0,
                     first_byte_ns: 10,
                     completed_ns: 100,
+                    monotonic_timing: None,
                 },
             ] {
                 callback(completed)?;

@@ -197,6 +197,14 @@ trace phases. This barrier waits for all earlier commands on every execution
 lane, including metric and trace updates; it preserves resident reader state.
 `metrics_snapshot()` itself remains a nonblocking snapshot. The same barrier
 is available on the Python session and releases the GIL while waiting.
+Session `resident_encoded_evictions` counts actual LRU removals during completed
+physical windows, including insertion and capacity reduction. Disabled caches
+and rejected oversized AUs do not count as evictions. Subtract phase snapshots
+after synchronization to exclude warmup; this is a count, not a memory estimate.
+
+Python local, S3 and AIStore session constructors release the GIL during
+index loading and backend setup, so independent Python monitoring threads can
+observe initialization. Argument conversion and validation retain the GIL.
 
 ### Python session
 
@@ -370,6 +378,44 @@ object offset and length may differ from a member's planned payload range when
 concurrent requests are coalesced. A submitted AU can likewise serve more than
 one logical target. A nonzero dropped count makes the corresponding trace
 incomplete. This diagnostic is not part of the default reader API.
+
+To stream long runs, Python can call `take_execution_trace(stop=False)` while
+work continues; Rust uses `drain_execution_trace()`. Each drain atomically
+returns complete observed windows, resets their counts and frees buffer capacity,
+while preserving capture and unique window IDs. Sum expected and dropped counts
+across drains, and combine shared physical request consumers across all drains.
+After synchronizing the reader, perform a final default `take_execution_trace()`
+to stop capture. A window larger than the configured capacity can still lose
+events, which must invalidate the run.
+
+The diagnostic `decoder_activity()` method samples each distinct shared decode
+budget directly, without waiting behind execution commands. Each entry reports
+`active_jobs`, `queued_jobs`, `available_threads`, `lifetime_peak_active_jobs`,
+`completed_jobs`, and cumulative `acquisition_wait_ns`. Active jobs count held
+decode permits, not FFmpeg threads or allocated decoder contexts; queue counts
+cover threads waiting to acquire those permits. Acquisition time includes mutex
+and capacity waits. Configuration validation does not acquire a decode permit.
+Lifetime peaks include initialization and warmup and must not be subtracted to
+infer measurement-phase peaks; preserve the timestamped samples instead.
+
+The diagnostic `io_activity()` method samples each distinct session backend.
+S3 entries report the shared transport's `active_requests`,
+`outstanding_requests`, `queued_requests`, configured `max_concurrency`, and
+service-time EWMA. `S3ObjectStoreReader.pressure_snapshot()` exposes the same
+transport measurement for baseline adapters. Active counts represent held I/O
+permits; queued counts represent outstanding transport tasks awaiting those
+permits. They exclude planner and broker admission queues. Fields are read
+independently and can briefly disagree during transitions. Local backends
+return `None`; a missing gauge is not interpreted as zero activity.
+
+On Linux, each exact physical range event also contains `monotonic_timing`:
+the start, first-byte, and completion timestamps in nanoseconds from
+`CLOCK_MONOTONIC`. These timestamps share Python's `time.monotonic_ns()` clock
+and remain comparable across execution windows and broker consumers.
+The existing `started_ns`, `first_byte_ns`, and `completed_ns` values measure
+execution-window timing. Unsupported platforms and aggregate transport modes
+return `None` for `monotonic_timing`; those events cannot establish exact
+cross-window GET concurrency. No chunk format changes are required.
 
 ## Mechanism controls
 

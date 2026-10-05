@@ -340,6 +340,9 @@ impl VClaspPipeline {
 #[derive(Debug, Clone, Default)]
 pub struct SessionMetrics {
     pub completed_windows: u64,
+    pub resident_path_windows: u64,
+    pub stateless_path_windows: u64,
+    pub other_path_windows: u64,
     pub logical_targets: u64,
     pub physical_ranges: u64,
     pub client_requests: u64,
@@ -348,6 +351,9 @@ pub struct SessionMetrics {
     pub submitted_access_units: u64,
     pub decoded_access_units: u64,
     pub decode_groups: u64,
+    pub resident_encoded_hits: u64,
+    pub resident_encoded_misses: u64,
+    pub resident_encoded_evictions: u64,
     pub resident_cursor_hits: u64,
     pub resident_cursor_misses: u64,
     pub decoder_state_resets: u64,
@@ -468,17 +474,21 @@ impl ExecutionTraceState {
 
     fn take(&self) -> SessionExecutionTrace {
         self.enabled.store(false, Ordering::Relaxed);
+        self.drain()
+    }
+
+    fn drain(&self) -> SessionExecutionTrace {
         let mut buffer = self
             .buffer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         SessionExecutionTrace {
             range_events: std::mem::take(&mut buffer.range_events),
-            expected_requests: buffer.expected_requests,
-            dropped_range_events: buffer.dropped_range_events,
+            expected_requests: std::mem::take(&mut buffer.expected_requests),
+            dropped_range_events: std::mem::take(&mut buffer.dropped_range_events),
             decode_events: std::mem::take(&mut buffer.decode_events),
-            expected_submitted_aus: buffer.expected_submitted_aus,
-            dropped_decode_events: buffer.dropped_decode_events,
+            expected_submitted_aus: std::mem::take(&mut buffer.expected_submitted_aus),
+            dropped_decode_events: std::mem::take(&mut buffer.dropped_decode_events),
         }
     }
 }
@@ -486,6 +496,14 @@ impl ExecutionTraceState {
 impl SessionMetrics {
     fn observe(&mut self, stats: &ExecutionStats) {
         self.completed_windows += 1;
+        match stats.mode {
+            "global_window_adaptive" => self.resident_path_windows += 1,
+            "window_closure_session"
+            | "window_closure_session_fixed16_fallback"
+            | "window_region_session"
+            | "window_session" => self.stateless_path_windows += 1,
+            _ => self.other_path_windows += 1,
+        }
         self.logical_targets += stats.logical_targets as u64;
         self.physical_ranges += stats.physical_ranges as u64;
         self.client_requests += stats.client_requests as u64;
@@ -494,6 +512,9 @@ impl SessionMetrics {
         self.submitted_access_units += stats.submitted_access_units as u64;
         self.decoded_access_units += stats.decoded_access_units as u64;
         self.decode_groups += stats.decode_groups as u64;
+        self.resident_encoded_hits += stats.encoded_cache_hits as u64;
+        self.resident_encoded_misses += stats.encoded_cache_misses as u64;
+        self.resident_encoded_evictions += stats.encoded_cache_evictions;
         self.resident_cursor_hits += stats.resident_cursor_hits as u64;
         self.resident_cursor_misses += stats.resident_cursor_misses as u64;
         self.decoder_state_resets += stats.decoder_state_resets as u64;
@@ -635,6 +656,10 @@ struct SessionInner {
     metrics: Arc<Mutex<SessionMetrics>>,
     #[cfg(feature = "experiment-controls")]
     execution_trace: Arc<ExecutionTraceState>,
+    #[cfg(feature = "experiment-controls")]
+    decode_budgets: Vec<Arc<DecodeBudget>>,
+    #[cfg(feature = "experiment-controls")]
+    backends: Vec<Arc<dyn crate::backend::StorageBackend>>,
 }
 
 #[derive(Clone)]
@@ -663,6 +688,28 @@ impl VClaspSession {
         }
         #[cfg(feature = "experiment-controls")]
         let execution_trace = Arc::new(ExecutionTraceState::new());
+        #[cfg(feature = "experiment-controls")]
+        let decode_budgets = {
+            let mut handles = Vec::new();
+            for executor in &executors {
+                let handle = executor.decode_budget_handle();
+                if !handles.iter().any(|other| Arc::ptr_eq(other, &handle)) {
+                    handles.push(handle);
+                }
+            }
+            handles
+        };
+        #[cfg(feature = "experiment-controls")]
+        let backends = {
+            let mut handles = Vec::new();
+            for executor in &executors {
+                let handle = executor.backend_handle();
+                if !handles.iter().any(|other| Arc::ptr_eq(other, &handle)) {
+                    handles.push(handle);
+                }
+            }
+            handles
+        };
         #[cfg(feature = "experiment-controls")]
         let executors = executors
             .into_iter()
@@ -693,6 +740,10 @@ impl VClaspSession {
                 metrics,
                 #[cfg(feature = "experiment-controls")]
                 execution_trace,
+                #[cfg(feature = "experiment-controls")]
+                decode_budgets,
+                #[cfg(feature = "experiment-controls")]
+                backends,
             }),
         })
     }
@@ -926,6 +977,30 @@ impl VClaspSession {
     #[cfg(feature = "experiment-controls")]
     pub fn take_execution_trace(&self) -> SessionExecutionTrace {
         self.inner.execution_trace.take()
+    }
+
+    /// Drain complete observed windows without disabling capture.
+    #[cfg(feature = "experiment-controls")]
+    pub fn drain_execution_trace(&self) -> SessionExecutionTrace {
+        self.inner.execution_trace.drain()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn decode_activity(&self) -> Vec<crate::decoder::DecodeBudgetState> {
+        self.inner
+            .decode_budgets
+            .iter()
+            .map(|budget| budget.snapshot())
+            .collect()
+    }
+
+    #[cfg(feature = "experiment-controls")]
+    pub(crate) fn io_activity(&self) -> Vec<Option<crate::backend::ObjectStorePressure>> {
+        self.inner
+            .backends
+            .iter()
+            .map(|backend| backend.object_store_pressure())
+            .collect()
     }
 
     #[cfg(feature = "experiment-controls")]
@@ -1478,6 +1553,41 @@ fn attribute_joint_stats(global: &ExecutionStats, logical_counts: &[usize]) -> V
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_counts_observed_window_paths_without_inference_from_hits() {
+        let mut metrics = super::SessionMetrics::default();
+        for mode in [
+            "global_window_adaptive",
+            "window_closure_session",
+            "unknown",
+        ] {
+            metrics.observe(&super::ExecutionStats {
+                mode,
+                ..Default::default()
+            });
+        }
+        assert_eq!(metrics.resident_path_windows, 1);
+        assert_eq!(metrics.stateless_path_windows, 1);
+        assert_eq!(metrics.other_path_windows, 1);
+        assert_eq!(metrics.completed_windows, 3);
+        assert_eq!(metrics.resident_cursor_hits, 0);
+    }
+    #[test]
+    fn session_cache_counters_follow_physical_windows() {
+        let mut metrics = super::SessionMetrics::default();
+        for (hits, misses, targets) in [(0, 7, 32), (5, 2, 64)] {
+            metrics.observe(&super::ExecutionStats {
+                encoded_cache_hits: hits,
+                encoded_cache_misses: misses,
+                logical_targets: targets,
+                ..Default::default()
+            });
+        }
+        assert_eq!(metrics.completed_windows, 2);
+        assert_eq!(metrics.logical_targets, 96);
+        assert_eq!(metrics.resident_encoded_hits, 5);
+        assert_eq!(metrics.resident_encoded_misses, 9);
+    }
     #[cfg(feature = "experiment-controls")]
     use super::ExecutionTraceState;
     use super::{
@@ -1603,11 +1713,12 @@ mod tests {
             started_ns: 10,
             first_byte_ns: 20,
             completed_ns: 30,
+            monotonic_timing: None,
             physical_requests: 1,
             fetched_bytes: 80,
             consumer_sample_ids: vec![7, 8],
         };
-        trace.observe(&WindowOutput {
+        let window = WindowOutput {
             batches: Vec::new(),
             batch_ready_ns: Vec::new(),
             ordered_delivery_ns: Vec::new(),
@@ -1633,8 +1744,9 @@ mod tests {
                     consumer_sample_ids: vec![8],
                 },
             ],
-        });
-        let result = trace.take();
+        };
+        trace.observe(&window);
+        let result = trace.drain();
         assert_eq!(
             (
                 result.range_events.len(),
@@ -1656,6 +1768,15 @@ mod tests {
             result.decode_events[0].decode.consumer_sample_ids,
             vec![7, 8]
         );
+        assert!(trace.enabled.load(super::Ordering::Relaxed));
+        assert_eq!(trace.drain().expected_requests, 0);
+        trace.observe(&window);
+        let final_result = trace.take();
+        assert_eq!(final_result.expected_requests, 2);
+        assert_eq!(final_result.expected_submitted_aus, 2);
+        assert_eq!(final_result.range_events[0].window_id, 1);
+        assert!(!trace.enabled.load(super::Ordering::Relaxed));
+        assert_eq!(trace.take().expected_requests, 0);
     }
 
     #[derive(Default)]

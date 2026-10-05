@@ -10,5 +10,6 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 futures-util = "0.3"
+libc = "0.2"
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
