@@ -10,8 +10,9 @@ import vclasp
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.parametrize("cursor_capacity", [0, 2])
 @pytest.mark.parametrize("budget", [0, 1, 32 << 10, 8 << 20])
-def test_incremental_windows_reuse_encoded_aus(budget):
+def test_incremental_windows_reuse_encoded_aus(budget, cursor_capacity):
     chunk = os.environ.get("VCLASP_CACHE_TEST_CHUNK")
     video = os.environ.get("VCLASP_CACHE_TEST_VIDEO")
     model_path = os.environ.get("VCLASP_CACHE_TEST_MODEL")
@@ -28,7 +29,7 @@ def test_incremental_windows_reuse_encoded_aus(budget):
             decoder_threads=1,
             global_decode_concurrency=2,
             resident_encoded_bytes=capacity,
-            resident_cursor_capacity=0,
+            resident_cursor_capacity=cursor_capacity,
         )
 
     cached, baseline = reader(budget), reader(0)
@@ -55,6 +56,13 @@ def test_incremental_windows_reuse_encoded_aus(budget):
         assert all(row["resident_payload_bytes"] <= row["budget_payload_bytes"] for row in cache)
         assert all(row["resident_payload_capacity_bytes"] >= row["resident_payload_bytes"] for row in cache)
         cache_sequences.append([row["update_sequence"] for row in cache])
+        cursors = cached.cursor_activity()
+        assert sum(row["live_cursors"] for row in cursors) == stats["resident_cursor_entries"]
+        assert all(row["detached_cursors"] == 0 for row in cursors)
+        assert all(row["created_cursors"] - row["destroyed_cursors"] == row["live_cursors"] for row in cursors)
+        assert all(row["prefetched_payload_capacity_bytes"] >= row["prefetched_payload_bytes"] for row in cursors)
+        assert sum(row["prefetched_payload_bytes"] for row in cursors) == stats["resident_read_ahead_bytes"]
+
     if budget >= 8 << 20:
         assert snapshots[0]["resident_encoded_hits"] == 0
         assert snapshots[1]["resident_encoded_hits"] > 0
