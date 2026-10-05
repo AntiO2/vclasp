@@ -2924,11 +2924,12 @@ impl HierarchicalBatchExecutor {
             .collect::<Result<Vec<_>, _>>()?;
         let target_records = batch_records.iter().flatten().cloned().collect::<Vec<_>>();
 
+        let resident_record_ids = self.resident_record_ids();
         let plan_started = Instant::now();
         let plan = self.resolve_plan(
             &target_records,
             HierarchicalAction::Adaptive,
-            &HashSet::new(),
+            &resident_record_ids,
         )?;
         let plan_ns = plan_started.elapsed().as_nanos() as u64;
         let ResolvedPlan {
@@ -2991,6 +2992,21 @@ impl HierarchicalBatchExecutor {
             }
         }
 
+        // Own hits for the window so cache eviction cannot invalidate pending jobs.
+        let mut encoded_records = HashMap::with_capacity(selected_ids.len());
+        let mut encoded_cache_hits = 0usize;
+        for record_id in selected_ids
+            .iter()
+            .filter(|id| resident_record_ids.contains(id))
+        {
+            let encoded = self.cached_encoded_record(*record_id).ok_or_else(|| {
+                format!("resident record {record_id} disappeared after planning snapshot")
+            })?;
+            encoded_records.insert(*record_id, encoded);
+            encoded_cache_hits += 1;
+        }
+        let encoded_cache_misses = selected_ids.len().saturating_sub(encoded_cache_hits);
+
         // Prioritize every physical span by its earliest consuming batch.
         // This changes only request order; closure resolution and byte extents
         // continue to come from the registered catalog and planner.
@@ -3010,7 +3026,11 @@ impl HierarchicalBatchExecutor {
         let mut record_ranges = HashMap::<u64, Vec<usize>>::new();
         for records in selected_groups.values() {
             for record in records {
-                let covering = Self::range_indices_covering_record(record, &ranges)?;
+                let covering = if encoded_records.contains_key(&record.record_id) {
+                    Vec::new()
+                } else {
+                    Self::range_indices_covering_record(record, &ranges)?
+                };
                 record_ranges.insert(record.record_id, covering);
             }
         }
@@ -3160,6 +3180,7 @@ impl HierarchicalBatchExecutor {
         let mut submitted_access_units = 0usize;
         let mut decode_groups = 0usize;
 
+        let encoded_cache = &mut self.encoded_cache;
         let backend = &self.backend;
         let codec_config = &self.codec_config;
         let incremental_decode_pool = &self.incremental_decode_pool;
@@ -3338,6 +3359,9 @@ impl HierarchicalBatchExecutor {
                         records,
                         &missing_target_ids,
                         |record| {
+                            if let Some(encoded) = encoded_records.get(&record.record_id) {
+                                return Ok(encoded.clone());
+                            }
                             let indices = &record_ranges[&record.record_id];
                             let record_fetch_ranges = indices
                                 .iter()
@@ -3357,7 +3381,10 @@ impl HierarchicalBatchExecutor {
                                 &record_fetch_ranges,
                                 &record_buffers,
                             )?;
-                            mp4_sample_to_annex_b(&sample, record.nal_length_size)
+                            let encoded = mp4_sample_to_annex_b(&sample, record.nal_length_size)?;
+                            encoded_cache.put(record.record_id, encoded.clone());
+                            encoded_records.insert(record.record_id, encoded.clone());
+                            Ok(encoded)
                         },
                     )?;
                     assemble_ns += assemble_started.elapsed().as_nanos() as u64;
@@ -3488,8 +3515,8 @@ impl HierarchicalBatchExecutor {
                 range_64k_to_256k: range_buckets[3],
                 range_gt_256k: range_buckets[4],
                 decode_groups,
-                encoded_cache_hits: 0,
-                encoded_cache_misses: 0,
+                encoded_cache_hits,
+                encoded_cache_misses,
                 encoded_cache_resident_bytes: self.encoded_cache.resident_bytes() as u64,
                 resident_cursor_hits: 0,
                 resident_cursor_misses: 0,
