@@ -34,6 +34,7 @@ def test_incremental_windows_reuse_encoded_aus(budget):
     cached, baseline = reader(budget), reader(0)
     windows = [list(range(16)), list(range(8, 24)), list(range(8, 24)), [63, 63, 0]]
     snapshots = []
+    cache_sequences = []
     for frames in windows:
         targets = [[(i, video, frame) for i, frame in enumerate(frames)]]
         cached.start_execution_trace(10000, 10000)
@@ -48,6 +49,12 @@ def test_incremental_windows_reuse_encoded_aus(budget):
         assert trace[2] == trace[5] == 0
         assert stats["resident_encoded_bytes"] <= budget
         snapshots.append(stats)
+        cache = cached.cache_activity()
+        assert sum(row["budget_payload_bytes"] for row in cache) == budget
+        assert all(row["alive"] for row in cache)
+        assert all(row["resident_payload_bytes"] <= row["budget_payload_bytes"] for row in cache)
+        assert all(row["resident_payload_capacity_bytes"] >= row["resident_payload_bytes"] for row in cache)
+        cache_sequences.append([row["update_sequence"] for row in cache])
     if budget >= 8 << 20:
         assert snapshots[0]["resident_encoded_hits"] == 0
         assert snapshots[1]["resident_encoded_hits"] > 0
@@ -59,6 +66,8 @@ def test_incremental_windows_reuse_encoded_aus(budget):
         assert all(stats["resident_encoded_hits"] == 0 for stats in snapshots)
         assert all(stats["physical_ranges"] > 0 for stats in snapshots)
 
+    assert all(all(after >= before for before, after in zip(a, b))
+               for a, b in zip(cache_sequences, cache_sequences[1:]))
     metrics = cached.metrics_snapshot()
     assert metrics["resident_encoded_evictions"] == sum(
         stats["resident_encoded_evictions"] for stats in snapshots
