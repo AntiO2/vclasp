@@ -503,7 +503,7 @@ struct PacketMeta {
 }
 
 #[derive(Debug, Clone)]
-struct FrameMeta {
+struct CodedPictureMeta {
     pts: i64,
     frame_type: String,
 }
@@ -610,6 +610,7 @@ fn probe_packets(ffprobe: &Path, path: &Path) -> Result<Vec<PacketMeta>, String>
         &[
             "-v",
             "error",
+            "-nofind_stream_info",
             "-select_streams",
             "v:0",
             "-show_packets",
@@ -639,40 +640,114 @@ fn probe_packets(ffprobe: &Path, path: &Path) -> Result<Vec<PacketMeta>, String>
         .collect()
 }
 
-fn probe_frames(ffprobe: &Path, path: &Path) -> Result<Vec<FrameMeta>, String> {
-    let path_text = path.to_string_lossy();
-    let value = run_json(
-        ffprobe,
-        &[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_frames",
-            "-show_entries",
-            "frame=pts,pict_type",
-            "-of",
-            "json",
-            &path_text,
-        ],
-    )?;
-    value["frames"]
-        .as_array()
-        .ok_or_else(|| "ffprobe frames output is not an array".to_string())?
-        .iter()
-        .map(|row| {
-            let frame_type = row["pict_type"]
-                .as_str()
-                .ok_or_else(|| "ffprobe frame is missing pict_type".to_string())?;
-            if !matches!(frame_type, "I" | "P" | "B") {
-                return Err(format!("unsupported decoded frame type {frame_type}"));
+#[cfg(feature = "ffmpeg")]
+fn parse_coded_pictures(
+    path: &Path,
+    packets: &[PacketMeta],
+    config: &[u8],
+    nal_length_size: usize,
+) -> Result<Vec<CodedPictureMeta>, String> {
+    use ffmpeg_next as ffmpeg;
+    use std::ptr;
+
+    struct Parser(*mut ffmpeg::ffi::AVCodecParserContext);
+    impl Drop for Parser {
+        fn drop(&mut self) {
+            unsafe { ffmpeg::ffi::av_parser_close(self.0) };
+        }
+    }
+    ffmpeg::init().map_err(|error| error.to_string())?;
+    let parser =
+        unsafe { ffmpeg::ffi::av_parser_init(ffmpeg::ffi::AVCodecID::AV_CODEC_ID_H264 as i32) };
+    if parser.is_null() {
+        return Err("H.264 parser unavailable".to_string());
+    }
+    let parser = Parser(parser);
+    let mut context = ffmpeg::codec::context::Context::new();
+    unsafe {
+        (*parser.0).flags |= ffmpeg::ffi::PARSER_FLAG_COMPLETE_FRAMES as i32;
+        (*context.as_mut_ptr()).codec_id = ffmpeg::ffi::AVCodecID::AV_CODEC_ID_H264;
+        (*context.as_mut_ptr()).codec_type = ffmpeg::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
+    }
+    let mut source = File::open(path).map_err(|error| error.to_string())?;
+    let file_size = source.metadata().map_err(|error| error.to_string())?.len();
+    let mut pictures = Vec::with_capacity(packets.len());
+    for (index, packet) in packets.iter().enumerate() {
+        if packet
+            .pos
+            .checked_add(packet.size)
+            .is_none_or(|end| end > file_size)
+        {
+            return Err(format!("packet {index} lies outside the encoded file"));
+        }
+        let size = usize::try_from(packet.size).map_err(|_| "packet is too large")?;
+        i32::try_from(size).map_err(|_| "packet exceeds the parser input limit")?;
+        let mut sample = vec![0; size];
+        source
+            .seek(SeekFrom::Start(packet.pos))
+            .map_err(|error| error.to_string())?;
+        source
+            .read_exact(&mut sample)
+            .map_err(|error| error.to_string())?;
+        let mut input = if index == 0 {
+            config.to_vec()
+        } else {
+            Vec::new()
+        };
+        input.extend(mp4_sample_to_annex_b(&sample, nal_length_size)?);
+        let input_size = i32::try_from(input.len()).map_err(|_| "parser input is too large")?;
+        input.resize(
+            input.len() + ffmpeg::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
+            0,
+        );
+        let mut output = ptr::null_mut();
+        let mut output_size = 0;
+        // The parser reads coded syntax only. No codec is opened and no packet
+        // is sent to a decoder; sample identity comes from container timestamps.
+        let consumed = unsafe {
+            (*parser.0).pict_type = ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_NONE as i32;
+            ffmpeg::ffi::av_parser_parse2(
+                parser.0,
+                context.as_mut_ptr(),
+                &mut output,
+                &mut output_size,
+                input.as_ptr(),
+                input_size,
+                packet.pts,
+                packet.dts,
+                i64::try_from(packet.pos).map_err(|_| "packet position exceeds i64")?,
+            )
+        };
+        if consumed != input_size || output_size <= 0 || output.is_null() {
+            return Err(format!("packet {index} is not one complete coded picture"));
+        }
+        let picture_type = unsafe { (*parser.0).pict_type };
+        let frame_type = match picture_type {
+            value if value == ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_I as i32 => "I",
+            value if value == ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_P as i32 => "P",
+            value if value == ffmpeg::ffi::AVPictureType::AV_PICTURE_TYPE_B as i32 => "B",
+            value => {
+                return Err(format!(
+                    "unsupported coded picture type {value} in packet {index}"
+                ))
             }
-            Ok(FrameMeta {
-                pts: json_i64(row, "pts")?,
-                frame_type: frame_type.to_string(),
-            })
-        })
-        .collect()
+        };
+        pictures.push(CodedPictureMeta {
+            pts: packet.pts,
+            frame_type: frame_type.to_string(),
+        });
+    }
+    Ok(pictures)
+}
+
+#[cfg(not(feature = "ffmpeg"))]
+fn parse_coded_pictures(
+    _path: &Path,
+    _packets: &[PacketMeta],
+    _config: &[u8],
+    _nal_length_size: usize,
+) -> Result<Vec<CodedPictureMeta>, String> {
+    Err("coded-picture parsing requires the ffmpeg build feature".to_string())
 }
 
 fn decode_ffprobe_hex_dump(value: &str) -> Result<Vec<u8>, String> {
@@ -707,6 +782,7 @@ fn probe_extradata(ffprobe: &Path, path: &Path) -> Result<Vec<u8>, String> {
         &[
             "-v",
             "error",
+            "-nofind_stream_info",
             "-select_streams",
             "v:0",
             "-show_entries",
@@ -994,19 +1070,19 @@ fn probe_video(
     options: &HierarchicalBuildOptions,
 ) -> Result<ProbedVideo, String> {
     let packets = probe_packets(&options.ffprobe_path, encoded_path)?;
-    let frames = probe_frames(&options.ffprobe_path, encoded_path)?;
+    let (config, nal_length_size) =
+        avcc_to_annex_b(&probe_extradata(&options.ffprobe_path, encoded_path)?)?;
+    let frames = parse_coded_pictures(encoded_path, &packets, &config, nal_length_size)?;
     validate_encoded_frame_count(
         &video.video_id,
         packets.len(),
         frames.len(),
         options.max_frames as usize,
     )?;
-    let (config, nal_length_size) =
-        avcc_to_annex_b(&probe_extradata(&options.ffprobe_path, encoded_path)?)?;
     let mut frame_by_pts = HashMap::new();
     for frame in frames {
         if frame_by_pts.insert(frame.pts, frame.frame_type).is_some() {
-            return Err(format!("duplicate decoded PTS {}", frame.pts));
+            return Err(format!("duplicate coded picture PTS {}", frame.pts));
         }
     }
     let mut display_pts = packets.iter().map(|packet| packet.pts).collect::<Vec<_>>();
@@ -1027,7 +1103,7 @@ fn probe_video(
         packet_indices[ordinal] = packet_index;
         frame_types[ordinal] = frame_by_pts
             .get(&packet.pts)
-            .ok_or_else(|| format!("missing decoded frame for PTS {}", packet.pts))?
+            .ok_or_else(|| format!("missing coded picture for PTS {}", packet.pts))?
             .clone();
     }
     Ok(ProbedVideo {
@@ -1536,6 +1612,100 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn coded_picture_parser_matches_separate_decoded_metadata_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        for b_frames in [0, 7] {
+            let path = directory.path().join(format!("b{b_frames}.mp4"));
+            let status = Command::new("ffmpeg")
+                .args([
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x48:rate=25",
+                    "-frames:v",
+                    "35",
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-threads",
+                    "1",
+                    "-g",
+                    "16",
+                    "-keyint_min",
+                    "16",
+                    "-sc_threshold",
+                    "0",
+                    "-bf",
+                ])
+                .arg(b_frames.to_string())
+                .args([
+                    "-refs",
+                    "1",
+                    "-x264-params",
+                    "b-pyramid=strict:b-adapt=0:rc-lookahead=0:open-gop=0",
+                ])
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let packets = probe_packets(Path::new("ffprobe"), &path).unwrap();
+            let (config, length_size) =
+                avcc_to_annex_b(&probe_extradata(Path::new("ffprobe"), &path).unwrap()).unwrap();
+            let coded = parse_coded_pictures(&path, &packets, &config, length_size).unwrap();
+            assert_eq!(coded.len(), 35);
+            assert!(coded.iter().any(|picture| picture.frame_type == "I"));
+            if b_frames > 0 {
+                assert!(coded.iter().any(|picture| picture.frame_type == "B"));
+                assert!(packets.windows(2).any(|pair| pair[0].pts > pair[1].pts));
+            }
+            // This is a separate test-only decoding reference, not ingestion.
+            let decoded = run_json(
+                Path::new("ffprobe"),
+                &[
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_frames",
+                    "-show_entries",
+                    "frame=pts,pict_type",
+                    "-of",
+                    "json",
+                    path.to_str().unwrap(),
+                ],
+            )
+            .unwrap();
+            let reference = decoded["frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|frame| {
+                    (
+                        json_i64(frame, "pts").unwrap(),
+                        frame["pict_type"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            assert_eq!(
+                coded
+                    .into_iter()
+                    .map(|picture| (picture.pts, picture.frame_type))
+                    .collect::<HashMap<_, _>>(),
+                reference
+            );
+            let mut outside = packets.clone();
+            outside[0].pos = u64::MAX;
+            assert!(parse_coded_pictures(&path, &outside, &config, length_size)
+                .unwrap_err()
+                .contains("outside the encoded file"));
+        }
+    }
 
     #[test]
     fn parallel_map_preserves_input_order_and_worker_bound() {

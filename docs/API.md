@@ -67,6 +67,11 @@ plans = vclasp.plan_byte_ranges(
 access-unit parsing, dependency indexing, payload placement, and final chunk
 assembly.
 
+AU discovery scans container packets and parses H.264 coded-picture headers
+with libavcodec's parser; it does not decode frames or generate RGB. Source
+transcoding is a separate encoding stage and necessarily decodes its input.
+RGB identity validation must be performed separately from packet indexing.
+
 ```python
 import vclasp
 
