@@ -50,6 +50,91 @@ mod tests {
     use crate::runtime_feedback::RuntimeFeedbackConfig;
     use std::collections::HashMap;
     #[test]
+    #[ignore = "manual paired AU extraction microbenchmark"]
+    fn benchmark_borrowed_au_extraction() {
+        use std::{hint::black_box, time::Instant};
+        for range_size in [8 * 1024, 1024 * 1024, 8 * 1024 * 1024] {
+            let mut buffer = vec![1u8; range_size];
+            let mut records = Vec::new();
+            for i in 0..64 {
+                let mut meta = record("video", 0, i);
+                meta.offset = (i as usize * (range_size / 64)) as u64;
+                meta.length = 64;
+                buffer[meta.offset as usize..meta.offset as usize + 4]
+                    .copy_from_slice(&60u32.to_be_bytes());
+                records.push(meta);
+            }
+            let ranges = [(0, range_size as u64)];
+            let mut timings = [Vec::new(), Vec::new()];
+            for repeat in 0..9 {
+                // Alternate order so allocator/cache warmness does not always favor one path.
+                for mode in [repeat % 2, 1 - repeat % 2] {
+                    let started = Instant::now();
+                    for meta in &records {
+                        let encoded = if mode == 0 {
+                            let copies = [black_box(&buffer).clone()];
+                            let sample =
+                                HierarchicalBatchExecutor::extract_record(meta, &ranges, &copies)
+                                    .unwrap()
+                                    .into_owned();
+                            crate::hierarchical_ingest::mp4_sample_to_annex_b(&sample, 4).unwrap()
+                        } else {
+                            let views = [black_box(buffer.as_slice())];
+                            let sample =
+                                HierarchicalBatchExecutor::extract_record(meta, &ranges, &views)
+                                    .unwrap();
+                            crate::hierarchical_ingest::mp4_sample_to_annex_b(&sample, 4).unwrap()
+                        };
+                        assert_eq!(encoded.len(), 64);
+                        assert_eq!(&encoded[..4], &[0, 0, 0, 1]);
+                        assert!(encoded[4..].iter().all(|byte| *byte == 1));
+                        black_box(encoded);
+                    }
+                    timings[mode].push(started.elapsed().as_nanos());
+                }
+            }
+            for values in &mut timings {
+                values.sort_unstable();
+            }
+            println!("range_bytes={range_size} aus=64 repetitions=9 old_median_ns={} borrowed_median_ns={}",
+                timings[0][4], timings[1][4]);
+        }
+    }
+
+    #[test]
+    fn extract_record_borrows_large_range_without_copying() {
+        let mut meta = record("video", 0, 0);
+        meta.offset = 1024;
+        meta.length = 16;
+        let buffer = vec![7u8; 1024 * 1024];
+        let buffers = [buffer.as_slice()];
+        let sample =
+            HierarchicalBatchExecutor::extract_record(&meta, &[(0, buffer.len() as u64)], &buffers)
+                .unwrap();
+        assert!(matches!(sample, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(sample.as_ptr(), buffer[1024..].as_ptr());
+        assert_eq!(sample.as_ref(), &[7; 16]);
+    }
+
+    #[test]
+    fn extract_record_assembles_split_ranges_and_rejects_missing_bytes() {
+        let mut meta = record("video", 0, 0);
+        meta.offset = 10;
+        meta.length = 4;
+        let buffers = [&[1u8, 2][..], &[3u8, 4][..]];
+        let sample =
+            HierarchicalBatchExecutor::extract_record(&meta, &[(10, 2), (12, 2)], &buffers)
+                .unwrap();
+        assert!(matches!(sample, std::borrow::Cow::Owned(_)));
+        assert_eq!(sample.as_ref(), &[1, 2, 3, 4]);
+        assert!(
+            HierarchicalBatchExecutor::extract_record(&meta, &[(10, 2), (13, 2)], &buffers,)
+                .is_err()
+        );
+        assert!(HierarchicalBatchExecutor::extract_record(&meta, &[(10, 2)], &buffers,).is_err());
+    }
+
+    #[test]
     fn accumulated_cache_residency_is_the_last_snapshot() {
         let mut total = super::HierarchicalBatchStats::default();
         for bytes in [4096, 1024] {
@@ -2708,18 +2793,37 @@ impl HierarchicalBatchExecutor {
         Ok((result.outputs, result.stats))
     }
 
-    fn extract_record(
+    fn extract_record<'a, B: AsRef<[u8]>>(
         record: &HierarchicalRecordMeta,
         ranges: &[(u64, u64)],
-        buffers: &[Vec<u8>],
-    ) -> Result<Vec<u8>, String> {
+        buffers: &'a [B],
+    ) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+        if ranges.len() != buffers.len() {
+            return Err("range and buffer counts differ".to_string());
+        }
         let record_end = record
             .offset
             .checked_add(record.length)
             .ok_or_else(|| format!("record {} range overflow", record.record_id))?;
+        if let ([(offset, length)], [buffer]) = (ranges, buffers) {
+            let buffer = buffer.as_ref();
+            if buffer.len() as u64 != *length {
+                return Err("backend returned an incorrect range length".to_string());
+            }
+            let end = offset
+                .checked_add(*length)
+                .ok_or("fetched range overflow")?;
+            if record.offset >= *offset && record_end <= end {
+                let start = (record.offset - offset) as usize;
+                return Ok(std::borrow::Cow::Borrowed(
+                    &buffer[start..start + record.length as usize],
+                ));
+            }
+        }
         let mut output = vec![0u8; record.length as usize];
         let mut covered = 0u64;
         for (&(range_offset, range_length), buffer) in ranges.iter().zip(buffers) {
+            let buffer = buffer.as_ref();
             if buffer.len() as u64 != range_length {
                 return Err("backend returned an incorrect range length".to_string());
             }
@@ -2744,7 +2848,7 @@ impl HierarchicalBatchExecutor {
                 record.length, record.record_id
             ));
         }
-        Ok(output)
+        Ok(std::borrow::Cow::Owned(output))
     }
 
     fn range_indices_covering_record(
@@ -3393,7 +3497,7 @@ impl HierarchicalBatchExecutor {
                                     completed_buffers[*index]
                                         .as_ref()
                                         .expect("ready decode task has all range buffers")
-                                        .clone()
+                                        .as_slice()
                                 })
                                 .collect::<Vec<_>>();
                             let sample = Self::extract_record(
