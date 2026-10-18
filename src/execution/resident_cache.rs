@@ -131,6 +131,7 @@ where
     fn on_remove(&mut self, key: &K) {
         self.resident.remove(key);
         self.priorities.remove(key);
+        self.order.retain(|candidate| candidate != key);
     }
 
     fn residency_counts(&self) -> (usize, usize) {
@@ -183,6 +184,20 @@ mod tests {
         DependencyLivenessLru, ResidentCandidate, ResidentStatePolicy, WindowDependencyLiveness,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn removed_and_reinserted_key_is_most_recent() {
+        let mut policy = DependencyLivenessLru::new();
+        policy.on_insert(1);
+        policy.on_insert(2);
+        for _ in 0..100 {
+            policy.on_remove(&1);
+            policy.on_insert(1);
+        }
+        assert_eq!(policy.order.len(), 2);
+        assert_eq!(policy.victim(), Some(2));
+        assert_eq!(policy.victim(), Some(1));
+    }
 
     #[test]
     fn liveness_policy_rejects_state_without_visible_reuse() {

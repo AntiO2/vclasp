@@ -38,47 +38,63 @@ impl IndexReader {
         }
 
         // Concatenate all batches
-        let schema = batches[0].schema();
+        let schema = batches
+            .first()
+            .ok_or("index has no record batches")?
+            .schema();
         let merged = arrow::compute::concat_batches(&schema, &batches)?;
 
-        let video_ids = merged
-            .column(1)
+        macro_rules! column {
+            ($name:literal) => {
+                merged
+                    .column_by_name($name)
+                    .ok_or(concat!("missing index column: ", $name))?
+            };
+        }
+
+        let video_ids = column!("video_id")
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or("video_id column not StringArray")?
             .clone();
-        let tiers = merged
-            .column(0)
+        let tiers = column!("tier")
             .as_any()
             .downcast_ref::<Int32Array>()
             .ok_or("tier column not Int32Array")?
             .clone();
-        let offsets = merged
-            .column(3)
+        let offsets = column!("record_offset")
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or("record_offset column not Int64Array")?
             .clone();
-        let lengths = merged
-            .column(4)
+        let lengths = column!("record_length")
             .as_any()
             .downcast_ref::<Int64Array>()
             .ok_or("record_length column not Int64Array")?
             .clone();
-        let frame_idxs = merged
-            .column(5)
+        let frame_idxs = column!("frame_idx")
             .as_any()
             .downcast_ref::<Int32Array>()
             .ok_or("frame_idx column not Int32Array")?
             .clone();
-        let dependency_kinds = merged
-            .column(7)
+        let dependency_kinds = column!("dependency_kind")
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or("dependency_kind column not StringArray")?
             .clone();
 
         let n = video_ids.len();
+        for row in 0..n {
+            if video_ids.is_null(row)
+                || tiers.is_null(row)
+                || offsets.is_null(row)
+                || lengths.is_null(row)
+                || offsets.value(row) < 0
+                || lengths.value(row) <= 0
+            {
+                return Err(format!("invalid index row {row}").into());
+            }
+        }
 
         // Build hash index: video_id -> row indices
         let mut video_index: HashMap<String, Vec<usize>> = HashMap::new();
@@ -168,15 +184,20 @@ impl IndexReader {
         video_ids: &[String],
         tiers: &[i32],
     ) -> Result<Vec<(u64, u64)>, Box<dyn std::error::Error>> {
-        assert_eq!(video_ids.len(), tiers.len());
+        if video_ids.len() != tiers.len() {
+            return Err("video and tier counts differ".into());
+        }
         let n = video_ids.len();
 
         // Small batch: use scalar hash lookup (faster for < 64 items)
         if n < 64 {
-            let mut rng = fastrand::Rng::new();
             let mut results = Vec::with_capacity(n);
+            let mut positions = HashMap::<(&str, i32), usize>::new();
             for i in 0..n {
-                results.push(self.lookup_one(&video_ids[i], tiers[i], &mut rng)?);
+                let candidates = self.lookup_all(&video_ids[i], tiers[i])?;
+                let position = positions.entry((&video_ids[i], tiers[i])).or_default();
+                results.push(candidates[*position % candidates.len()]);
+                *position += 1;
             }
             return Ok(results);
         }
@@ -286,4 +307,45 @@ pub struct RecordLocation {
     pub length: u64,
     pub frame_idx: i32,
     pub dependency_kind: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_lookup_does_not_change_selection_at_simd_threshold() {
+        let index = IndexReader {
+            video_ids: StringArray::from(vec!["video", "video"]),
+            tiers: Int32Array::from(vec![2, 2]),
+            offsets: Int64Array::from(vec![10, 20]),
+            lengths: Int64Array::from(vec![3, 4]),
+            frame_idxs: Int32Array::from(vec![0, 1]),
+            dependency_kinds: StringArray::from(vec!["gop", "gop"]),
+            video_index: HashMap::from([("video".into(), vec![0, 1])]),
+            record_count: 2,
+        };
+        for count in [1, 63, 64, 65] {
+            assert_eq!(
+                index
+                    .lookup_batch(&vec!["video".into(); count], &vec![2; count])
+                    .unwrap(),
+                (0..count)
+                    .map(|index| if index % 2 == 0 { (10, 3) } else { (20, 4) })
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(index.lookup_batch(&["video".into()], &[]).is_err());
+    }
+
+    #[test]
+    fn empty_parquet_is_an_error_not_an_indexing_panic() {
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::empty());
+        let mut bytes = Vec::new();
+        parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, None)
+            .unwrap()
+            .close()
+            .unwrap();
+        assert!(IndexReader::from_parquet(&bytes).is_err());
+    }
 }

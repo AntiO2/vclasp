@@ -1,8 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 #[cfg(feature = "experiment-controls")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
@@ -50,12 +49,178 @@ mod tests {
     use crate::runtime_feedback::RuntimeFeedbackConfig;
     use std::collections::HashMap;
     #[test]
+    fn fetched_buffers_release_after_the_last_assembly_consumer() {
+        let mut buffers = super::PendingRangeBuffers::new(vec![2, 1]);
+        buffers.insert(0, vec![1; 1024]).unwrap();
+        buffers.insert(1, vec![2; 2048]).unwrap();
+        assert_eq!(buffers.peak_bytes, 3072);
+        buffers
+            .release(&std::collections::HashSet::from([0]))
+            .unwrap();
+        assert_eq!(buffers.get(0).unwrap(), &[1; 1024]);
+        buffers
+            .release(&std::collections::HashSet::from([0, 1]))
+            .unwrap();
+        assert!(buffers.get(0).is_none());
+        assert!(buffers.get(1).is_none());
+        assert_eq!(buffers.retained_bytes, 0);
+        assert_eq!(buffers.peak_bytes, 3072);
+        assert_eq!(buffers.received_bytes, 3072);
+        assert_eq!(buffers.released_bytes, buffers.received_bytes);
+    }
+
+    #[test]
+    fn fetched_buffers_discard_late_data_for_completed_consumers() {
+        let mut buffers = super::PendingRangeBuffers::new(vec![1, 0]);
+        buffers
+            .release(&std::collections::HashSet::from([0]))
+            .unwrap();
+        buffers.insert(0, vec![1; 4096]).unwrap();
+        buffers.insert(1, vec![2; 4096]).unwrap();
+        assert_eq!(buffers.retained_bytes, 0);
+        assert_eq!(buffers.peak_bytes, 0);
+        assert_eq!(buffers.received_bytes, 8192);
+        assert_eq!(buffers.released_bytes, 8192);
+        assert!(buffers.get(0).is_none());
+    }
+
+    #[test]
+    fn fetched_buffers_reject_duplicate_delivery_and_invalid_release() {
+        let mut buffers = super::PendingRangeBuffers::new(vec![1, 1]);
+        buffers.insert(0, vec![1]).unwrap();
+        assert!(buffers.insert(2, vec![0]).is_err());
+        assert!(buffers.insert(0, vec![2]).is_err());
+        assert_eq!(buffers.get(0), Some([1].as_slice()));
+        assert!(buffers
+            .release(&std::collections::HashSet::from([0, 2]))
+            .is_err());
+        assert_eq!(buffers.consumers[0], 1);
+        buffers
+            .release(&std::collections::HashSet::from([0]))
+            .unwrap();
+        assert!(buffers
+            .release(&std::collections::HashSet::from([0]))
+            .is_err());
+        assert!(buffers.insert(0, vec![3]).is_err());
+    }
+
+    #[test]
+    fn disjoint_fetches_do_not_retain_the_whole_window_payload() {
+        let mut buffers = super::PendingRangeBuffers::new(vec![1; 64]);
+        for index in 0..64 {
+            buffers.insert(index, vec![0; 4096]).unwrap();
+            buffers
+                .release(&std::collections::HashSet::from([index]))
+                .unwrap();
+        }
+        assert_eq!(buffers.peak_bytes, 4096);
+        assert_eq!(buffers.retained_bytes, 0);
+    }
+    #[test]
+    #[ignore = "manual paired AU extraction microbenchmark"]
+    fn benchmark_borrowed_au_extraction() {
+        use std::{hint::black_box, time::Instant};
+        for range_size in [8 * 1024, 1024 * 1024, 8 * 1024 * 1024] {
+            let mut buffer = vec![1u8; range_size];
+            let mut records = Vec::new();
+            for i in 0..64 {
+                let mut meta = record("video", 0, i);
+                meta.offset = (i as usize * (range_size / 64)) as u64;
+                meta.length = 64;
+                buffer[meta.offset as usize..meta.offset as usize + 4]
+                    .copy_from_slice(&60u32.to_be_bytes());
+                records.push(meta);
+            }
+            let ranges = [(0, range_size as u64)];
+            let mut timings = [Vec::new(), Vec::new()];
+            for repeat in 0..9 {
+                // Alternate order so allocator/cache warmness does not always favor one path.
+                for mode in [repeat % 2, 1 - repeat % 2] {
+                    let started = Instant::now();
+                    for meta in &records {
+                        let encoded = if mode == 0 {
+                            let copies = [black_box(&buffer).clone()];
+                            let sample =
+                                HierarchicalBatchExecutor::extract_record(meta, &ranges, &copies)
+                                    .unwrap()
+                                    .into_owned();
+                            crate::hierarchical_ingest::mp4_sample_to_annex_b(&sample, 4).unwrap()
+                        } else {
+                            let views = [black_box(buffer.as_slice())];
+                            let sample =
+                                HierarchicalBatchExecutor::extract_record(meta, &ranges, &views)
+                                    .unwrap();
+                            crate::hierarchical_ingest::mp4_sample_to_annex_b(&sample, 4).unwrap()
+                        };
+                        assert_eq!(encoded.len(), 64);
+                        assert_eq!(&encoded[..4], &[0, 0, 0, 1]);
+                        assert!(encoded[4..].iter().all(|byte| *byte == 1));
+                        black_box(encoded);
+                    }
+                    timings[mode].push(started.elapsed().as_nanos());
+                }
+            }
+            for values in &mut timings {
+                values.sort_unstable();
+            }
+            println!("range_bytes={range_size} aus=64 repetitions=9 old_median_ns={} borrowed_median_ns={}",
+                timings[0][4], timings[1][4]);
+        }
+    }
+
+    #[test]
+    fn extract_record_borrows_large_range_without_copying() {
+        let mut meta = record("video", 0, 0);
+        meta.offset = 1024;
+        meta.length = 16;
+        let buffer = vec![7u8; 1024 * 1024];
+        let buffers = [buffer.as_slice()];
+        let sample =
+            HierarchicalBatchExecutor::extract_record(&meta, &[(0, buffer.len() as u64)], &buffers)
+                .unwrap();
+        assert!(matches!(sample, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(sample.as_ptr(), buffer[1024..].as_ptr());
+        assert_eq!(sample.as_ref(), &[7; 16]);
+    }
+
+    #[test]
+    fn extract_record_assembles_split_ranges_and_rejects_missing_bytes() {
+        let mut meta = record("video", 0, 0);
+        meta.offset = 10;
+        meta.length = 4;
+        let buffers = [&[1u8, 2][..], &[3u8, 4][..]];
+        let sample =
+            HierarchicalBatchExecutor::extract_record(&meta, &[(10, 2), (12, 2)], &buffers)
+                .unwrap();
+        assert!(matches!(sample, std::borrow::Cow::Owned(_)));
+        assert_eq!(sample.as_ref(), &[1, 2, 3, 4]);
+        assert!(
+            HierarchicalBatchExecutor::extract_record(&meta, &[(10, 2), (13, 2)], &buffers,)
+                .is_err()
+        );
+        assert!(HierarchicalBatchExecutor::extract_record(&meta, &[(10, 2)], &buffers,).is_err());
+    }
+
+    #[test]
     fn accumulated_cache_residency_is_the_last_snapshot() {
         let mut total = super::HierarchicalBatchStats::default();
         for bytes in [4096, 1024] {
             let part = super::HierarchicalBatchStats {
                 encoded_cache_hits: 3,
                 encoded_cache_resident_bytes: bytes,
+                incremental_range_buffer_peak_bytes: bytes,
+                incremental: super::IncrementalExecutionMetrics {
+                    range_buffer_received_bytes: bytes,
+                    range_buffer_released_bytes: bytes,
+                    range_completion_blocked_sends: 1,
+                    range_completion_block_ns: 2,
+                    decode_queue_ns: 3,
+                    decode_resource_wait_ns: 4,
+                    decode_service_ns: 5,
+                    decode_timing_samples: 1,
+                    decoded_rgb_bytes: 6,
+                    ..Default::default()
+                },
                 resident_read_ahead_bytes: 64,
                 resident_encoded_budget_bytes: 8192,
                 resident_cursor_capacity: 2,
@@ -65,6 +230,16 @@ mod tests {
         }
         assert_eq!(total.encoded_cache_hits, 6);
         assert_eq!(total.encoded_cache_resident_bytes, 1024);
+        assert_eq!(total.incremental_range_buffer_peak_bytes, 4096);
+        assert_eq!(total.incremental.range_buffer_received_bytes, 5120);
+        assert_eq!(total.incremental.range_buffer_released_bytes, 5120);
+        assert_eq!(total.incremental.range_completion_blocked_sends, 2);
+        assert_eq!(total.incremental.range_completion_block_ns, 4);
+        assert_eq!(total.incremental.decode_queue_ns, 6);
+        assert_eq!(total.incremental.decode_resource_wait_ns, 8);
+        assert_eq!(total.incremental.decode_service_ns, 10);
+        assert_eq!(total.incremental.decode_timing_samples, 2);
+        assert_eq!(total.incremental.decoded_rgb_bytes, 12);
         assert_eq!(total.resident_read_ahead_bytes, 64);
         assert_eq!(total.resident_encoded_budget_bytes, 8192);
         assert_eq!(total.resident_cursor_capacity, 2);
@@ -129,7 +304,7 @@ mod tests {
             offset: 0,
             length: 1,
             decode_ordinal: 0,
-            closure_record_ids: vec![frame_idx as u64],
+            closure_record_ids: vec![frame_idx as u64].into(),
             target_output_ordinal: 0,
             nal_length_size: 4,
         }
@@ -173,13 +348,13 @@ mod tests {
         let mut first = record("video", 0, 0);
         first.offset = 0;
         first.length = 1024;
-        first.closure_record_ids = vec![0];
+        first.closure_record_ids = vec![0].into();
         let mut second = record("video", 0, 1);
         second.record_id = 1;
         second.offset = 4096;
         second.length = 1024;
         second.decode_ordinal = 1;
-        second.closure_record_ids = vec![0, 1];
+        second.closure_record_ids = vec![0, 1].into();
         second.target_output_ordinal = 1;
         let catalog = crate::hierarchical_ingest::HierarchicalCatalog::from_records_for_test(vec![
             first, second,
@@ -353,9 +528,9 @@ mod tests {
     #[test]
     fn window_liveness_uses_closure_consumers_without_a_target_count_threshold() {
         let mut first = record("video", 0, 1);
-        first.closure_record_ids = vec![0, 1];
+        first.closure_record_ids = vec![0, 1].into();
         let mut second = record("video", 0, 2);
-        second.closure_record_ids = vec![0, 2];
+        second.closure_record_ids = vec![0, 2].into();
 
         let same_batch =
             HierarchicalBatchExecutor::window_liveness(&[vec![first.clone(), second.clone()]]);
@@ -407,6 +582,76 @@ pub struct HierarchicalIncrementalWindow {
     pub decode_events: Vec<DecodeTraceEvent>,
 }
 
+/// Fetched bytes belong to assembly tasks, not to the lifetime of the window.
+struct PendingRangeBuffers {
+    buffers: Vec<Option<bytes::Bytes>>,
+    received: Vec<bool>,
+    consumers: Vec<usize>,
+    retained_bytes: u64,
+    peak_bytes: u64,
+    received_bytes: u64,
+    released_bytes: u64,
+}
+
+impl PendingRangeBuffers {
+    fn new(consumers: Vec<usize>) -> Self {
+        Self {
+            buffers: std::iter::repeat_with(|| None)
+                .take(consumers.len())
+                .collect(),
+            received: vec![false; consumers.len()],
+            consumers,
+            retained_bytes: 0,
+            peak_bytes: 0,
+            received_bytes: 0,
+            released_bytes: 0,
+        }
+    }
+
+    fn insert(&mut self, index: usize, bytes: impl Into<bytes::Bytes>) -> Result<(), String> {
+        let bytes = bytes.into();
+        let received = self
+            .received
+            .get_mut(index)
+            .ok_or_else(|| format!("backend returned invalid range index {index}"))?;
+        if *received {
+            return Err(format!("backend returned duplicate range index {index}"));
+        }
+        *received = true;
+        self.received_bytes += bytes.len() as u64;
+        if self.consumers[index] > 0 {
+            self.retained_bytes += bytes.len() as u64;
+            self.peak_bytes = self.peak_bytes.max(self.retained_bytes);
+            self.buffers[index] = Some(bytes);
+        } else {
+            self.released_bytes += bytes.len() as u64;
+        }
+        Ok(())
+    }
+
+    fn get(&self, index: usize) -> Option<&[u8]> {
+        self.buffers.get(index)?.as_deref()
+    }
+
+    fn release(&mut self, indices: &HashSet<usize>) -> Result<(), String> {
+        for &index in indices {
+            if self.consumers.get(index).copied().unwrap_or(0) == 0 {
+                return Err(format!("range {index} has no remaining assembly consumer"));
+            }
+        }
+        for &index in indices {
+            self.consumers[index] -= 1;
+            if self.consumers[index] == 0 {
+                if let Some(bytes) = self.buffers[index].take() {
+                    self.retained_bytes -= bytes.len() as u64;
+                    self.released_bytes += bytes.len() as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "experiment-controls")]
 #[derive(Debug, Clone)]
 pub struct RangeTraceEvent {
@@ -433,7 +678,41 @@ pub struct DecodeTraceEvent {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct IncrementalExecutionMetrics {
+    pub codec: decoder::profile::DecodeProfile,
+    pub output_restore_ns: u64,
+    pub output_clone_bytes: u64,
+    pub range_buffer_received_bytes: u64,
+    pub range_buffer_released_bytes: u64,
+    pub range_completion_blocked_sends: u64,
+    pub range_completion_block_ns: u64,
+    pub decode_queue_ns: u64,
+    pub decode_resource_wait_ns: u64,
+    pub decode_service_ns: u64,
+    pub decode_timing_samples: u64,
+    pub decoded_rgb_bytes: u64,
+}
+
+impl IncrementalExecutionMetrics {
+    pub(crate) fn accumulate(&mut self, part: &Self) {
+        self.codec.accumulate(&part.codec);
+        self.output_restore_ns += part.output_restore_ns;
+        self.output_clone_bytes += part.output_clone_bytes;
+        self.range_buffer_received_bytes += part.range_buffer_received_bytes;
+        self.range_buffer_released_bytes += part.range_buffer_released_bytes;
+        self.range_completion_blocked_sends += part.range_completion_blocked_sends;
+        self.range_completion_block_ns += part.range_completion_block_ns;
+        self.decode_queue_ns += part.decode_queue_ns;
+        self.decode_resource_wait_ns += part.decode_resource_wait_ns;
+        self.decode_service_ns += part.decode_service_ns;
+        self.decode_timing_samples += part.decode_timing_samples;
+        self.decoded_rgb_bytes += part.decoded_rgb_bytes;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct HierarchicalBatchStats {
+    pub incremental: IncrementalExecutionMetrics,
     pub logical_targets: usize,
     pub unique_targets: usize,
     pub physical_ranges: usize,
@@ -480,6 +759,9 @@ pub struct HierarchicalBatchStats {
     pub io_pressure_outstanding_at_plan: usize,
     pub io_pressure_queued_at_plan: usize,
     pub assemble_ns: u64,
+    /// Largest fetched-buffer total retained by one incremental assembly window.
+    /// Excludes transport queues, encoded caches, decoder inputs and RGB output.
+    pub incremental_range_buffer_peak_bytes: u64,
     pub decode_ns: u64,
     /// Time between accepting the first logical request and closing the
     /// session-global planning window.
@@ -504,6 +786,7 @@ pub(crate) fn accumulate_batch_stats(
     total: &mut HierarchicalBatchStats,
     part: &HierarchicalBatchStats,
 ) {
+    total.incremental.accumulate(&part.incremental);
     total.logical_targets += part.logical_targets;
     total.unique_targets += part.unique_targets;
     total.physical_ranges += part.physical_ranges;
@@ -547,6 +830,9 @@ pub(crate) fn accumulate_batch_stats(
     total.range_service_ns_sum += part.range_service_ns_sum;
     total.range_max_in_flight = total.range_max_in_flight.max(part.range_max_in_flight);
     total.range_timing_samples += part.range_timing_samples;
+    total.incremental_range_buffer_peak_bytes = total
+        .incremental_range_buffer_peak_bytes
+        .max(part.incremental_range_buffer_peak_bytes);
     total.io_pressure_max_concurrency = total
         .io_pressure_max_concurrency
         .max(part.io_pressure_max_concurrency);
@@ -782,6 +1068,7 @@ enum RecordSelection {
 }
 
 pub struct HierarchicalBatchExecutor {
+    resident_snapshot: Arc<Mutex<HashMap<String, u64>>>,
     catalog: Arc<HierarchicalCatalog>,
     layout: Arc<HierarchicalLayoutIndex>,
     backend: Arc<dyn StorageBackend>,
@@ -797,6 +1084,10 @@ pub struct HierarchicalBatchExecutor {
     decode_budget: Arc<DecodeBudget>,
     decoder_slots: SharedDecoderSlots,
     incremental_decode_pool: IncrementalDecodePool,
+    stage_profiling: Arc<decoder::profile::CodecProfiler>,
+    transient_budget: Option<Arc<crate::byte_budget::ByteBudget>>,
+    rgb_frame_bytes: usize,
+    nested_memory_reservation: bool,
     batch_deadline_fences: bool,
     encoded_cache: planner::ByteCache,
     resident_cursors: HashMap<(String, u64), StreamingGopState>,
@@ -814,6 +1105,10 @@ pub struct HierarchicalBatchExecutor {
     last_cursor_policy_ns: u64,
     #[cfg(feature = "experiment-controls")]
     execution_trace_enabled: Option<Arc<AtomicBool>>,
+    #[cfg(feature = "experiment-controls")]
+    pending_range_events: Vec<RangeTraceEvent>,
+    #[cfg(feature = "experiment-controls")]
+    pending_decode_events: Vec<DecodeTraceEvent>,
 }
 
 struct StreamingGopState {
@@ -823,6 +1118,10 @@ struct StreamingGopState {
 }
 
 struct ResidentCursorRequest {
+    profile_enabled: bool,
+    profiler: Arc<decoder::profile::CodecProfiler>,
+    decode_record_ids: Vec<u64>,
+    decode_enqueued_ns: u64,
     key: (String, u64),
     state: Option<StreamingGopState>,
     targets: Vec<LogicalTarget>,
@@ -869,226 +1168,84 @@ pub struct ResidentStateBudget {
     pub live_cursors: usize,
 }
 
-struct IncrementalDecodeJob {
-    requested: Vec<(u64, usize)>,
-    codec_config: Vec<u8>,
-    vcl_record: Vec<u8>,
-    access_units: usize,
-}
-
-struct IncrementalDecodedJob {
-    frames: Vec<(u64, DecodedRgbFrame)>,
-    completed_ns: u64,
-    access_units: usize,
-}
-
-fn requested_display_ordinals(
-    mut records: Vec<&HierarchicalRecordMeta>,
-    target_ids: &HashSet<u64>,
-) -> Vec<(u64, usize)> {
-    records.sort_unstable_by_key(|record| record.frame_idx);
-    records
-        .into_iter()
-        .enumerate()
-        .filter_map(|(ordinal, record)| {
-            target_ids
-                .contains(&record.record_id)
-                .then_some((record.record_id, ordinal))
-        })
-        .collect()
-}
-
-fn build_incremental_decode_job<F>(
-    codec_config: &[u8],
-    mut records: Vec<&HierarchicalRecordMeta>,
-    target_ids: &HashSet<u64>,
-    mut load_annex_b: F,
-) -> Result<IncrementalDecodeJob, String>
-where
-    F: FnMut(&HierarchicalRecordMeta) -> Result<Vec<u8>, String>,
-{
-    records.sort_unstable_by_key(|record| record.decode_ordinal);
-    let mut annex_b = Vec::new();
-    for record in &records {
-        annex_b.extend_from_slice(&load_annex_b(record)?);
-    }
-    let mut self_contained = Vec::with_capacity(codec_config.len() + annex_b.len());
-    self_contained.extend_from_slice(codec_config);
-    self_contained.extend_from_slice(&annex_b);
-    let (parsed_config, vcl_record, _) =
-        decoder::extract_closed_record_parts(&self_contained).map_err(|error| error.to_string())?;
-    let requested = requested_display_ordinals(records.clone(), target_ids);
-    if requested.is_empty() {
-        return Err("decode job does not contain a requested target".to_string());
-    }
-    Ok(IncrementalDecodeJob {
-        requested,
-        codec_config: parsed_config,
-        vcl_record,
-        access_units: records.len(),
-    })
-}
-
-enum IncrementalPipelineEvent {
-    Range(crate::backend::CompletedRange),
-    FetchFinished(Result<(), String>),
-    Decoded(Result<(IncrementalDecodedJob, u64), String>),
-}
-
-struct IncrementalDecodeWork {
-    job: IncrementalDecodeJob,
-    total_started: Instant,
-    completion: mpsc::Sender<IncrementalPipelineEvent>,
-}
-
-struct IncrementalDecodePool {
-    senders: Vec<mpsc::Sender<IncrementalDecodeWork>>,
-    threads: Vec<JoinHandle<()>>,
-    next_slot: Arc<AtomicUsize>,
-}
-
-impl IncrementalDecodePool {
-    fn new(
-        slots: SharedDecoderSlots,
-        decode_budget: Arc<DecodeBudget>,
-        decoder_threads: usize,
-    ) -> Self {
-        Self::new_with_shared_cursor(
-            slots,
-            decode_budget,
-            decoder_threads,
-            Arc::new(AtomicUsize::new(0)),
-        )
-    }
-
-    fn new_with_shared_cursor(
-        slots: SharedDecoderSlots,
-        decode_budget: Arc<DecodeBudget>,
-        decoder_threads: usize,
-        next_slot: Arc<AtomicUsize>,
-    ) -> Self {
-        let mut senders = Vec::with_capacity(slots.len());
-        let mut threads = Vec::with_capacity(slots.len());
-        for slot_index in 0..slots.len() {
-            let (sender, receiver) = mpsc::channel::<IncrementalDecodeWork>();
-            senders.push(sender);
-            let slots = Arc::clone(&slots);
-            let decode_budget = Arc::clone(&decode_budget);
-            threads.push(std::thread::spawn(move || {
-                while let Ok(work) = receiver.recv() {
-                    let decode_started = Instant::now();
-                    let result = (|| {
-                        let _permit = decode_budget.acquire(decoder_threads)?;
-                        let mut pool = slots[slot_index]
-                            .lock()
-                            .map_err(|_| "hierarchical decoder slot lock poisoned".to_string())?;
-                        let ordinals = work
-                            .job
-                            .requested
-                            .iter()
-                            .map(|(_, ordinal)| *ordinal)
-                            .collect::<Vec<_>>();
-                        let frames = decoder::decode_full_gop_selected_rgb24(
-                            &work.job.codec_config,
-                            &work.job.vcl_record,
-                            &mut pool,
-                            &ordinals,
-                        )
-                        .map_err(|error| error.to_string())?;
-                        if frames.len() != work.job.requested.len() {
-                            return Err(format!(
-                                "decoded {} hierarchical targets from {} requests",
-                                frames.len(),
-                                work.job.requested.len()
-                            ));
-                        }
-                        Ok(IncrementalDecodedJob {
-                            frames: work
-                                .job
-                                .requested
-                                .into_iter()
-                                .zip(frames)
-                                .map(|((record_id, _), frame)| (record_id, frame))
-                                .collect(),
-                            completed_ns: work.total_started.elapsed().as_nanos() as u64,
-                            access_units: work.job.access_units,
-                        })
-                    })();
-                    let elapsed_ns = decode_started.elapsed().as_nanos() as u64;
-                    if work
-                        .completion
-                        .send(IncrementalPipelineEvent::Decoded(
-                            result.map(|decoded| (decoded, elapsed_ns)),
-                        ))
-                        .is_err()
-                    {
-                        continue;
-                    }
-                }
-            }));
-        }
-        Self {
-            senders,
-            threads,
-            next_slot,
-        }
-    }
-
-    fn submit(
-        &self,
-        job: IncrementalDecodeJob,
-        total_started: Instant,
-        completion: mpsc::Sender<IncrementalPipelineEvent>,
-    ) -> Result<(), String> {
-        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.senders.len();
-        self.senders[slot]
-            .send(IncrementalDecodeWork {
-                job,
-                total_started,
-                completion,
-            })
-            .map_err(|_| "incremental decoder worker stopped early".to_string())
-    }
-
-    fn decode_all(
-        &self,
-        jobs: Vec<IncrementalDecodeJob>,
-        total_started: Instant,
-    ) -> Result<Vec<IncrementalDecodedJob>, String> {
-        let job_count = jobs.len();
-        let (sender, receiver) = mpsc::channel();
-        for job in jobs {
-            self.submit(job, total_started, sender.clone())?;
-        }
-        drop(sender);
-
-        let mut decoded = Vec::with_capacity(job_count);
-        while decoded.len() < job_count {
-            match receiver
-                .recv()
-                .map_err(|_| "parallel decoder workers stopped early".to_string())?
-            {
-                IncrementalPipelineEvent::Decoded(Ok((job, _))) => decoded.push(job),
-                IncrementalPipelineEvent::Decoded(Err(error)) => return Err(error),
-                IncrementalPipelineEvent::Range(_) | IncrementalPipelineEvent::FetchFinished(_) => {
-                    return Err("decode-only pool returned an unexpected I/O event".to_string())
-                }
-            }
-        }
-        Ok(decoded)
-    }
-}
-
-impl Drop for IncrementalDecodePool {
-    fn drop(&mut self) {
-        self.senders.clear();
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
-}
+#[path = "decode_pool.rs"]
+mod decode_pool;
+#[cfg(test)]
+use decode_pool::requested_display_ordinals;
+use decode_pool::{build_incremental_decode_job, IncrementalDecodePool, IncrementalPipelineEvent};
 
 impl HierarchicalBatchExecutor {
+    pub(crate) fn resident_snapshot_handle(&self) -> Arc<Mutex<HashMap<String, u64>>> {
+        Arc::clone(&self.resident_snapshot)
+    }
+
+    fn publish_resident_snapshot(&self) {
+        let cache = self.encoded_cache.stats();
+        let (encoded, read_ahead, budget, cursors, cursor_capacity, pinned, probationary) =
+            self.resident_metrics();
+        *self
+            .resident_snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = HashMap::from([
+            (
+                "updated_monotonic_ns".into(),
+                decoder::profile::monotonic_ns(),
+            ),
+            ("cache_get_hits".into(), cache["hits"]),
+            ("cache_get_misses".into(), cache["misses"]),
+            ("evictions".into(), cache["evictions"]),
+            ("resident_payload_bytes".into(), encoded + read_ahead),
+            ("encoded_au_bytes".into(), encoded),
+            ("read_ahead_bytes".into(), read_ahead),
+            ("budget_bytes".into(), budget),
+            ("resident_entries".into(), cache["entries"]),
+            ("live_cursors".into(), cursors as u64),
+            ("cursor_capacity".into(), cursor_capacity as u64),
+            ("pinned_cursors".into(), pinned as u64),
+            ("probationary_cursors".into(), probationary as u64),
+        ]);
+    }
+
+    fn fetch_observed(
+        &mut self,
+        ranges: &[(u64, u64)],
+        consumers: &[Vec<u64>],
+    ) -> Result<crate::backend::ProfiledRangeBatch, String> {
+        #[cfg(feature = "experiment-controls")]
+        let capture = self
+            .execution_trace_enabled
+            .as_ref()
+            .is_some_and(|enabled| enabled.load(Ordering::Relaxed));
+        self.backend
+            .read_byte_ranges_observed(ranges, &mut |completed| {
+                #[cfg(feature = "experiment-controls")]
+                if capture {
+                    let (offset, length) = ranges[completed.index];
+                    self.pending_range_events.push(RangeTraceEvent {
+                        range_index: self.pending_range_events.len(),
+                        planned_payload_offset: offset,
+                        planned_length: length,
+                        physical_request_id: completed.physical_request_id,
+                        physical_object_offset: completed.physical_object_offset,
+                        physical_object_length: completed.physical_object_length,
+                        started_ns: completed.started_ns,
+                        first_byte_ns: completed.first_byte_ns,
+                        completed_ns: completed.completed_ns,
+                        monotonic_timing: completed.monotonic_timing,
+                        physical_requests: completed.physical_requests,
+                        fetched_bytes: completed.physical_fetched_bytes,
+                        consumer_sample_ids: consumers[completed.index].clone(),
+                    });
+                }
+                #[cfg(not(feature = "experiment-controls"))]
+                let _ = (completed, consumers);
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn stage_profiling_handle(&self) -> Arc<decoder::profile::CodecProfiler> {
+        Arc::clone(&self.stage_profiling)
+    }
     pub fn resident_metrics(&self) -> (u64, u64, u64, usize, usize, usize, usize) {
         let (pinned, probationary) = self.resident_state_policy.residency_counts();
         (
@@ -1309,12 +1466,15 @@ impl HierarchicalBatchExecutor {
         let decode_budget = DecodeBudget::new(decoder_threads.max(1).saturating_mul(decoder_slots));
         let decoder_slots =
             decoder::shared_decoder_slots_with_threads(decoder_slots, decoder_threads);
+        let stage_profiling = Arc::new(decoder::profile::CodecProfiler::default());
         let incremental_decode_pool = IncrementalDecodePool::new(
             Arc::clone(&decoder_slots),
             Arc::clone(&decode_budget),
             decoder_threads,
+            Arc::clone(&stage_profiling),
         );
-        Ok(Self {
+        let executor = Self {
+            resident_snapshot: Arc::new(Mutex::new(HashMap::new())),
             catalog,
             layout,
             backend,
@@ -1330,6 +1490,10 @@ impl HierarchicalBatchExecutor {
             decode_budget,
             decoder_slots,
             incremental_decode_pool,
+            stage_profiling,
+            transient_budget: None,
+            rgb_frame_bytes: 0,
+            nested_memory_reservation: false,
             batch_deadline_fences,
             encoded_cache: planner::ByteCache::new(resident_budget.encoded_bytes),
             resident_cursors: HashMap::new(),
@@ -1347,7 +1511,97 @@ impl HierarchicalBatchExecutor {
             last_cursor_policy_ns: 0,
             #[cfg(feature = "experiment-controls")]
             execution_trace_enabled: None,
-        })
+            #[cfg(feature = "experiment-controls")]
+            pending_range_events: Vec::new(),
+            #[cfg(feature = "experiment-controls")]
+            pending_decode_events: Vec::new(),
+        };
+        executor.publish_resident_snapshot();
+        Ok(executor)
+    }
+
+    pub(crate) fn with_transient_budget(
+        mut self,
+        budget: Arc<crate::byte_budget::ByteBudget>,
+        rgb_frame_bytes: usize,
+    ) -> Self {
+        self.transient_budget = Some(budget);
+        self.rgb_frame_bytes = rgb_frame_bytes;
+        self
+    }
+
+    pub(crate) fn transient_budget_handle(&self) -> Option<Arc<crate::byte_budget::ByteBudget>> {
+        self.transient_budget.as_ref().map(Arc::clone)
+    }
+
+    fn reserve_transient_buffers(
+        &self,
+        fetched_bytes: u64,
+        selected_ids: &HashSet<u64>,
+        targets: usize,
+    ) -> Result<Option<Arc<crate::byte_budget::BytePermit>>, String> {
+        let Some(budget) = self
+            .transient_budget
+            .as_ref()
+            .filter(|_| !self.nested_memory_reservation)
+        else {
+            return Ok(None);
+        };
+        let encoded = selected_ids.iter().try_fold(0usize, |total, id| {
+            let record = self
+                .catalog
+                .record(*id)
+                .ok_or("missing record for memory reservation")?;
+            total
+                .checked_add(usize::try_from(record.length).map_err(|_| "record size overflow")?)
+                .ok_or("encoded memory overflow")
+        })?;
+        // Include transport fan-out, Annex-B expansion and all concurrently
+        // active packet copies. RGB covers staging plus ordered restoration.
+        let bytes = usize::try_from(fetched_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_mul(2))
+            .and_then(|bytes| {
+                encoded
+                    .checked_mul(4)?
+                    .checked_mul(self.decoder_slots.len().checked_add(2)?)?
+                    .checked_add(bytes)
+            })
+            .and_then(|bytes| {
+                self.rgb_frame_bytes
+                    .checked_mul(targets)?
+                    .checked_mul(3)?
+                    .checked_add(bytes)
+            })
+            .ok_or("transient memory reservation overflow")?;
+        budget.acquire(bytes).map(|permit| Some(Arc::new(permit)))
+    }
+
+    fn reserve_resident_window(
+        &self,
+        records: &[HierarchicalRecordMeta],
+    ) -> Result<Option<Arc<crate::byte_budget::BytePermit>>, String> {
+        let mut ids = HashSet::new();
+        let mut begin = u64::MAX;
+        let mut end = 0;
+        for record in records {
+            for id in self
+                .catalog
+                .records_for_gop(&record.video_id, record.gop_id)
+                .ok_or("missing resident GOP")?
+            {
+                if ids.insert(*id) {
+                    let meta = self.catalog.record(*id).ok_or("missing resident AU")?;
+                    begin = begin.min(meta.offset);
+                    end = end.max(
+                        meta.offset
+                            .checked_add(meta.length)
+                            .ok_or("resident extent overflow")?,
+                    );
+                }
+            }
+        }
+        self.reserve_transient_buffers(end.saturating_sub(begin), &ids, records.len())
     }
 
     #[cfg(feature = "experiment-controls")]
@@ -1453,7 +1707,6 @@ impl HierarchicalBatchExecutor {
         mut self,
         decoder_slots: SharedDecoderSlots,
         decode_budget: Arc<DecodeBudget>,
-        next_slot: Arc<AtomicUsize>,
         cursor_decoder_threads: usize,
     ) -> Result<Self, String> {
         if decoder_slots.is_empty() {
@@ -1463,11 +1716,11 @@ impl HierarchicalBatchExecutor {
             return Err("cursor decoder threads must be positive".to_string());
         }
         decode_budget.validate(cursor_decoder_threads)?;
-        self.incremental_decode_pool = IncrementalDecodePool::new_with_shared_cursor(
+        self.incremental_decode_pool = IncrementalDecodePool::new(
             Arc::clone(&decoder_slots),
             Arc::clone(&decode_budget),
             self.decoder_threads,
-            next_slot,
+            Arc::clone(&self.stage_profiling),
         );
         self.decoder_slots = decoder_slots;
         self.decode_budget = decode_budget;
@@ -1719,7 +1972,7 @@ impl HierarchicalBatchExecutor {
                     if !seen_targets.insert(record.record_id) {
                         continue;
                     }
-                    for dependency_id in &record.closure_record_ids {
+                    for dependency_id in record.closure_record_ids.iter() {
                         if *dependency_id != record.record_id {
                             *by_dependency.entry(*dependency_id).or_default() += 1;
                         }
@@ -1854,8 +2107,8 @@ impl HierarchicalBatchExecutor {
         self.encoded_cache.resident_ids()
     }
 
-    fn cached_encoded_record(&mut self, record_id: u64) -> Option<Vec<u8>> {
-        self.encoded_cache.get(record_id)
+    fn cached_encoded_record(&mut self, record_id: u64) -> Option<bytes::Bytes> {
+        self.encoded_cache.get_shared(record_id)
     }
 
     fn rebalance_encoded_cache(&mut self) {
@@ -1940,12 +2193,14 @@ impl HierarchicalBatchExecutor {
 
         let mut decoded = HashMap::<u64, HierarchicalOutput>::new();
         let mut stats = HierarchicalBatchStats {
+            incremental: IncrementalExecutionMetrics::default(),
             logical_targets: 0,
             unique_targets: 0,
             physical_ranges: 0,
             client_requests: 0,
             useful_bytes: 0,
             fetched_bytes: 0,
+            incremental_range_buffer_peak_bytes: 0,
             submitted_access_units: 0,
             decoded_access_units: 0,
             planner_candidate_count: 0,
@@ -2052,6 +2307,8 @@ impl HierarchicalBatchExecutor {
             let outcomes = std::thread::scope(|scope| {
                 let mut handles = Vec::with_capacity(jobs.len());
                 for (request, state) in jobs {
+                    let mut request = request;
+                    request.decode_enqueued_ns = decoder::profile::monotonic_ns();
                     let codec_config = &codec_config;
                     let decode_budget = Arc::clone(&decode_budget);
                     handles.push(scope.spawn(move || {
@@ -2185,7 +2442,10 @@ impl HierarchicalBatchExecutor {
             .map(|record_id| self.catalog.record(*record_id).unwrap().length)
             .sum();
         let cache_hit = self.resident_cursors.contains_key(&key);
+        let mut cursor_setup_profile = decoder::profile::DecodeProfile::default();
         if !cache_hit {
+            let setup_profile =
+                decoder::profile::ProfileScope::start(self.stage_profiling.enabled());
             let evicted = evict_resident_entries_to_capacity(
                 &mut self.resident_cursors,
                 self.resident_state_policy.as_mut(),
@@ -2208,6 +2468,8 @@ impl HierarchicalBatchExecutor {
                 },
             );
             self.resident_state_policy.on_insert(key.clone());
+            cursor_setup_profile = setup_profile.snapshot();
+            cursor_setup_profile.jobs = 0;
         } else {
             self.resident_state_policy.on_hit(&key);
         }
@@ -2359,6 +2621,17 @@ impl HierarchicalBatchExecutor {
         let range_buckets = range_size_buckets(&ranges);
         let end_of_stream = required_max_decode_ordinal == last_decode_ordinal;
         Ok(ResidentCursorRequest {
+            profile_enabled: self.stage_profiling.enabled(),
+            profiler: Arc::clone(&self.stage_profiling),
+            decode_record_ids: records
+                .iter()
+                .enumerate()
+                .filter(|(ordinal, _)| {
+                    *ordinal >= start_decode_ordinal && *ordinal <= required_max_decode_ordinal
+                })
+                .map(|(_, record)| record.record_id)
+                .collect(),
+            decode_enqueued_ns: 0,
             key,
             state: None,
             targets: targets.to_vec(),
@@ -2374,12 +2647,17 @@ impl HierarchicalBatchExecutor {
             cache_hit,
             total_started,
             stats: HierarchicalBatchStats {
+                incremental: IncrementalExecutionMetrics {
+                    codec: cursor_setup_profile,
+                    ..Default::default()
+                },
                 logical_targets: targets.len(),
                 unique_targets: seen.len(),
                 physical_ranges,
                 client_requests,
                 useful_bytes,
                 fetched_bytes: 0,
+                incremental_range_buffer_peak_bytes: 0,
                 submitted_access_units: 0,
                 decoded_access_units: 0,
                 planner_candidate_count: 1,
@@ -2471,9 +2749,18 @@ impl HierarchicalBatchExecutor {
                 timing_samples: 0,
             }
         } else {
-            self.backend
-                .read_byte_ranges_profiled(&ranges)
-                .map_err(|error| error.to_string())?
+            let consumers = requests
+                .iter()
+                .flat_map(|request| {
+                    let ids = request
+                        .targets
+                        .iter()
+                        .map(|target| target.sample_id)
+                        .collect::<Vec<_>>();
+                    request.ranges.iter().map(move |_| ids.clone())
+                })
+                .collect::<Vec<_>>();
+            self.fetch_observed(&ranges, &consumers)?
         };
         let fetch_ns = fetch_started.elapsed().as_nanos() as u64;
         let crate::backend::ProfiledRangeBatch {
@@ -2495,6 +2782,23 @@ impl HierarchicalBatchExecutor {
         }
 
         for (request, (start, end)) in requests.iter_mut().zip(range_offsets) {
+            #[cfg(feature = "experiment-controls")]
+            if self
+                .execution_trace_enabled
+                .as_ref()
+                .is_some_and(|enabled| enabled.load(Ordering::Relaxed))
+            {
+                let consumers = request
+                    .targets
+                    .iter()
+                    .map(|target| target.sample_id)
+                    .collect::<Vec<_>>();
+                self.pending_decode_events
+                    .extend(request.decode_record_ids.iter().map(|id| DecodeTraceEvent {
+                        record_id: *id,
+                        consumer_sample_ids: consumers.clone(),
+                    }));
+            }
             let assemble_started = Instant::now();
             let request_buffers = &buffers[start..end];
             let fetched_access_units = request
@@ -2565,8 +2869,13 @@ impl HierarchicalBatchExecutor {
         codec_config: &[u8],
         decode_budget: &Arc<DecodeBudget>,
     ) -> Result<ResidentCursorResult, String> {
+        let worker_started_ns = decoder::profile::monotonic_ns();
+        let wait_started = Instant::now();
         let _permit = decode_budget.acquire(state.cursor.decoder_threads())?;
+        let resource_wait_ns = wait_started.elapsed().as_nanos() as u64;
         let decode_started = Instant::now();
+        let resource_acquired_ns = decoder::profile::monotonic_ns();
+        let profile = decoder::profile::ProfileScope::start(request.profile_enabled);
         let submitted_access_units = request.access_units.len();
         let frames = state
             .cursor
@@ -2578,6 +2887,39 @@ impl HierarchicalBatchExecutor {
                 request.end_of_stream,
             )
             .map_err(|error| error.to_string())?;
+        let service_ns = decode_started.elapsed().as_nanos() as u64;
+        if request.profile_enabled {
+            request.profiler.record(decoder::profile::DecodeJobEvent {
+                job_id: 0,
+                record_ids: request.decode_record_ids.clone(),
+                target_record_ids: request.unique_target_ids.clone(),
+                consumer_sample_ids: request
+                    .targets
+                    .iter()
+                    .map(|target| target.sample_id)
+                    .collect(),
+                execution_path: "resident_cursor",
+                submitted_ns: request.decode_enqueued_ns,
+                worker_started_ns,
+                resource_acquired_ns,
+                completed_ns: decoder::profile::monotonic_ns(),
+                profile: profile.snapshot(),
+            });
+        }
+        request
+            .stats
+            .incremental
+            .codec
+            .accumulate(&profile.snapshot());
+        request.stats.incremental.decode_resource_wait_ns += resource_wait_ns;
+        request.stats.incremental.decode_service_ns += service_ns;
+        request.stats.incremental.decode_timing_samples += 1;
+        request.stats.incremental.decoded_rgb_bytes += frames
+            .iter()
+            .map(|frame| frame.data.len() as u64)
+            .sum::<u64>();
+        let restore_started = Instant::now();
+        let mut cloned_bytes = 0u64;
         let mut decoded = request
             .unique_target_ids
             .iter()
@@ -2605,6 +2947,7 @@ impl HierarchicalBatchExecutor {
                         .remove(&record.record_id)
                         .expect("decoded cursor frame must exist")
                 } else {
+                    cloned_bytes += decoded[&record.record_id].data.len() as u64;
                     decoded[&record.record_id].clone()
                 };
                 HierarchicalOutput {
@@ -2613,6 +2956,8 @@ impl HierarchicalBatchExecutor {
                 }
             })
             .collect();
+        request.stats.incremental.output_restore_ns += restore_started.elapsed().as_nanos() as u64;
+        request.stats.incremental.output_clone_bytes += cloned_bytes;
         request.stats.submitted_access_units = submitted_access_units;
         request.stats.decoded_access_units = submitted_access_units;
         request.stats.decoder_state_resets = 0;
@@ -2675,6 +3020,7 @@ impl HierarchicalBatchExecutor {
             )
         })?;
         let state_prefetched_bytes = state.prefetched_bytes;
+        request.decode_enqueued_ns = decoder::profile::monotonic_ns();
         let decoded = Self::decode_resident_cursor_job(
             request,
             state,
@@ -2708,18 +3054,37 @@ impl HierarchicalBatchExecutor {
         Ok((result.outputs, result.stats))
     }
 
-    fn extract_record(
+    fn extract_record<'a, B: AsRef<[u8]>>(
         record: &HierarchicalRecordMeta,
         ranges: &[(u64, u64)],
-        buffers: &[Vec<u8>],
-    ) -> Result<Vec<u8>, String> {
+        buffers: &'a [B],
+    ) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+        if ranges.len() != buffers.len() {
+            return Err("range and buffer counts differ".to_string());
+        }
         let record_end = record
             .offset
             .checked_add(record.length)
             .ok_or_else(|| format!("record {} range overflow", record.record_id))?;
+        if let ([(offset, length)], [buffer]) = (ranges, buffers) {
+            let buffer = buffer.as_ref();
+            if buffer.len() as u64 != *length {
+                return Err("backend returned an incorrect range length".to_string());
+            }
+            let end = offset
+                .checked_add(*length)
+                .ok_or("fetched range overflow")?;
+            if record.offset >= *offset && record_end <= end {
+                let start = (record.offset - offset) as usize;
+                return Ok(std::borrow::Cow::Borrowed(
+                    &buffer[start..start + record.length as usize],
+                ));
+            }
+        }
         let mut output = vec![0u8; record.length as usize];
         let mut covered = 0u64;
         for (&(range_offset, range_length), buffer) in ranges.iter().zip(buffers) {
+            let buffer = buffer.as_ref();
             if buffer.len() as u64 != range_length {
                 return Err("backend returned an incorrect range length".to_string());
             }
@@ -2744,7 +3109,7 @@ impl HierarchicalBatchExecutor {
                 record.length, record.record_id
             ));
         }
-        Ok(output)
+        Ok(std::borrow::Cow::Owned(output))
     }
 
     fn range_indices_covering_record(
@@ -2810,7 +3175,9 @@ impl HierarchicalBatchExecutor {
         ) -> Option<Vec<HierarchicalOutput>>,
     ) -> Result<HierarchicalIncrementalWindow, String> {
         let evictions_before = self.encoded_cache.stats()["evictions"];
-        let mut window = self.execute_window_streaming_inner(batches, on_batch_ready)?;
+        let result = self.execute_window_streaming_inner(batches, on_batch_ready);
+        self.publish_resident_snapshot();
+        let mut window = result?;
         window.stats.encoded_cache_evictions =
             self.encoded_cache.stats()["evictions"].saturating_sub(evictions_before);
         Ok(window)
@@ -2825,6 +3192,11 @@ impl HierarchicalBatchExecutor {
             u64,
         ) -> Option<Vec<HierarchicalOutput>>,
     ) -> Result<HierarchicalIncrementalWindow, String> {
+        #[cfg(feature = "experiment-controls")]
+        {
+            self.pending_range_events.clear();
+            self.pending_decode_events.clear();
+        }
         if batches.is_empty() || batches.iter().any(Vec::is_empty) {
             return Err("incremental hierarchical window requires non-empty batches".to_string());
         }
@@ -2891,9 +3263,9 @@ impl HierarchicalBatchExecutor {
                 ordered_delivery_ns: vec![ready; batches.len()],
                 stats,
                 #[cfg(feature = "experiment-controls")]
-                range_events: Vec::new(),
+                range_events: std::mem::take(&mut self.pending_range_events),
                 #[cfg(feature = "experiment-controls")]
-                decode_events: Vec::new(),
+                decode_events: std::mem::take(&mut self.pending_decode_events),
             })
         })();
         self.active_window_liveness = None;
@@ -2964,6 +3336,13 @@ impl HierarchicalBatchExecutor {
             fixed16_reference_predicted_ns,
             mode,
         } = plan;
+        let fetch_bytes = ranges.iter().try_fold(0u64, |total, (_, length)| {
+            total
+                .checked_add(*length)
+                .ok_or("fetch byte count overflow")
+        })?;
+        let _memory =
+            self.reserve_transient_buffers(fetch_bytes, &selected_ids, target_records.len())?;
 
         let mut selected_groups = HashMap::<(String, u64), Vec<HierarchicalRecordMeta>>::new();
         for record_id in &selected_ids {
@@ -3073,7 +3452,7 @@ impl HierarchicalBatchExecutor {
                             .map(|selected| selected.record_id)
                             .collect()
                     };
-                    for record_id in required_ids {
+                    for record_id in required_ids.iter().copied() {
                         record_consumers
                             .entry(record_id)
                             .or_default()
@@ -3159,9 +3538,20 @@ impl HierarchicalBatchExecutor {
                 range_indices,
             });
         }
+        decode_tasks.sort_unstable_by_key(|task| {
+            (
+                task.batch_index,
+                task.records.first().map(|record| record.record_id),
+            )
+        });
 
-        let mut completed_buffers: Vec<Option<Vec<u8>>> =
-            std::iter::repeat_with(|| None).take(ranges.len()).collect();
+        let mut range_consumers_remaining = vec![0usize; ranges.len()];
+        for task in &decode_tasks {
+            for &index in &task.range_indices {
+                range_consumers_remaining[index] += 1;
+            }
+        }
+        let mut completed_buffers = PendingRangeBuffers::new(range_consumers_remaining);
         let mut pending_tasks = (0..decode_tasks.len()).collect::<HashSet<_>>();
         let mut decoded = HashMap::<u64, DecodedRgbFrame>::new();
         let mut decoded_ready_ns = HashMap::<u64, u64>::new();
@@ -3199,6 +3589,7 @@ impl HierarchicalBatchExecutor {
         let mut decode_ns = 0u64;
         let mut submitted_access_units = 0usize;
         let mut decode_groups = 0usize;
+        let mut incremental_metrics = IncrementalExecutionMetrics::default();
 
         let encoded_cache = &mut self.encoded_cache;
         let backend = &self.backend;
@@ -3229,12 +3620,21 @@ impl HierarchicalBatchExecutor {
         let mut active_decode_jobs = 0usize;
         let pipeline_result = std::thread::scope(|scope| -> Result<(), String> {
             let mut pipeline_error = None;
-            let (event_sender, event_receiver) = mpsc::channel::<IncrementalPipelineEvent>();
+            // Bound ready data as well as active operations. A slow assembler
+            // must backpressure fetch completion rather than buffer the window.
+            let event_capacity = io_pressure
+                .max_concurrency
+                .max(1)
+                .saturating_add(incremental_decode_pool.threads.len());
+            let (event_sender, event_receiver) =
+                mpsc::sync_channel::<IncrementalPipelineEvent>(event_capacity);
 
             let fetch_sender = event_sender.clone();
             let ranges_for_fetch = &ranges;
             let total_started_for_fetch = &total_started;
             scope.spawn(move || {
+                let mut blocked_sends = 0;
+                let mut blocked_ns = 0;
                 let result = (|| {
                     for (phase_start, phase_end) in phases {
                         let phase_started_ns = total_started_for_fetch.elapsed().as_nanos() as u64;
@@ -3249,16 +3649,34 @@ impl HierarchicalBatchExecutor {
                                         completed.first_byte_ns.saturating_add(phase_started_ns);
                                     completed.completed_ns =
                                         completed.completed_ns.saturating_add(phase_started_ns);
-                                    fetch_sender
-                                        .send(IncrementalPipelineEvent::Range(completed))
-                                        .map_err(|_| "incremental pipeline receiver stopped".into())
+                                    match fetch_sender
+                                        .try_send(IncrementalPipelineEvent::Range(completed))
+                                    {
+                                        Ok(()) => Ok(()),
+                                        Err(mpsc::TrySendError::Full(event)) => {
+                                            blocked_sends += 1;
+                                            let wait_started = Instant::now();
+                                            let sent = fetch_sender.send(event);
+                                            blocked_ns += wait_started.elapsed().as_nanos() as u64;
+                                            sent.map_err(|_| {
+                                                "incremental pipeline receiver stopped".into()
+                                            })
+                                        }
+                                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                                            Err("incremental pipeline receiver stopped".into())
+                                        }
+                                    }
                                 },
                             )
                             .map_err(|error| error.to_string())?;
                     }
                     Ok(())
                 })();
-                let _ = fetch_sender.send(IncrementalPipelineEvent::FetchFinished(result));
+                let _ = fetch_sender.send(IncrementalPipelineEvent::FetchFinished {
+                    result,
+                    blocked_sends,
+                    blocked_ns,
+                });
             });
             let mut fetch_finished = false;
             while !fetch_finished || active_decode_jobs > 0 || !pending_tasks.is_empty() {
@@ -3272,7 +3690,7 @@ impl HierarchicalBatchExecutor {
                 };
                 match event {
                     IncrementalPipelineEvent::Range(completed) => {
-                        if completed.index >= completed_buffers.len() {
+                        if completed.index >= ranges.len() {
                             pipeline_error = Some(format!(
                                 "backend returned invalid range index {}",
                                 completed.index
@@ -3315,9 +3733,20 @@ impl HierarchicalBatchExecutor {
                             range_intervals.push((completed.started_ns, completed.completed_ns));
                             range_timing_samples += 1;
                         }
-                        completed_buffers[completed.index] = Some(completed.bytes);
+                        if let Err(error) =
+                            completed_buffers.insert(completed.index, completed.bytes)
+                        {
+                            pipeline_error = Some(error);
+                            break;
+                        }
                     }
-                    IncrementalPipelineEvent::FetchFinished(result) => {
+                    IncrementalPipelineEvent::FetchFinished {
+                        result,
+                        blocked_sends,
+                        blocked_ns,
+                    } => {
+                        incremental_metrics.range_completion_blocked_sends += blocked_sends;
+                        incremental_metrics.range_completion_block_ns += blocked_ns;
                         fetch_finished = true;
                         if let Err(error) = result {
                             pipeline_error = Some(error);
@@ -3328,6 +3757,7 @@ impl HierarchicalBatchExecutor {
                         active_decode_jobs = active_decode_jobs.saturating_sub(1);
                         match result {
                             Ok((job, elapsed_ns)) => {
+                                incremental_metrics.accumulate(&job.metrics);
                                 decode_ns = decode_ns.saturating_add(elapsed_ns);
                                 decode_groups += 1;
                                 submitted_access_units += job.access_units;
@@ -3354,12 +3784,13 @@ impl HierarchicalBatchExecutor {
                             || task
                                 .range_indices
                                 .iter()
-                                .all(|index| completed_buffers[*index].is_some())
+                                .all(|index| completed_buffers.get(*index).is_some())
                     })
                     .copied()
                     .collect::<Vec<_>>();
-                ready_tasks
-                    .sort_unstable_by_key(|task_index| decode_tasks[*task_index].batch_index);
+                ready_tasks.sort_unstable_by_key(|task_index| {
+                    (decode_tasks[*task_index].batch_index, *task_index)
+                });
                 for task_index in ready_tasks {
                     pending_tasks.remove(&task_index);
                     let task = &decode_tasks[task_index];
@@ -3370,11 +3801,12 @@ impl HierarchicalBatchExecutor {
                         .copied()
                         .collect::<HashSet<_>>();
                     if missing_target_ids.is_empty() {
+                        completed_buffers.release(&task.range_indices)?;
                         continue;
                     }
                     let assemble_started = Instant::now();
                     let records = task.records.iter().collect::<Vec<_>>();
-                    let job = build_incremental_decode_job(
+                    let mut job = build_incremental_decode_job(
                         codec_config,
                         records,
                         &missing_target_ids,
@@ -3390,10 +3822,9 @@ impl HierarchicalBatchExecutor {
                             let record_buffers = indices
                                 .iter()
                                 .map(|index| {
-                                    completed_buffers[*index]
-                                        .as_ref()
+                                    completed_buffers
+                                        .get(*index)
                                         .expect("ready decode task has all range buffers")
-                                        .clone()
                                 })
                                 .collect::<Vec<_>>();
                             let sample = Self::extract_record(
@@ -3401,12 +3832,28 @@ impl HierarchicalBatchExecutor {
                                 &record_fetch_ranges,
                                 &record_buffers,
                             )?;
-                            let encoded = mp4_sample_to_annex_b(&sample, record.nal_length_size)?;
-                            encoded_cache.put(record.record_id, encoded.clone());
+                            let encoded = bytes::Bytes::from(mp4_sample_to_annex_b(
+                                &sample,
+                                record.nal_length_size,
+                            )?);
+                            encoded_cache.put_shared(record.record_id, encoded.clone());
                             encoded_records.insert(record.record_id, encoded.clone());
                             Ok(encoded)
                         },
                     )?;
+                    job.memory = _memory.as_ref().map(Arc::clone);
+                    if self.stage_profiling.enabled() {
+                        job.consumer_sample_ids = batches
+                            .iter()
+                            .flatten()
+                            .zip(batch_records.iter().flatten())
+                            .filter(|(_, record)| missing_target_ids.contains(&record.record_id))
+                            .map(|(target, _)| target.sample_id)
+                            .collect();
+                    }
+                    // Jobs own Annex-B input after assembly; raw range bytes
+                    // can be dropped before the decoder finishes.
+                    completed_buffers.release(&task.range_indices)?;
                     assemble_ns += assemble_started.elapsed().as_nanos() as u64;
                     claimed_target_ids.extend(missing_target_ids);
                     #[cfg(feature = "experiment-controls")]
@@ -3453,6 +3900,7 @@ impl HierarchicalBatchExecutor {
                             .filter_map(|record_id| decoded_ready_ns.get(record_id).copied())
                             .max();
                         let ready_ns = batch_ready[batch_index].unwrap_or_default();
+                        let restore_started = Instant::now();
                         let output = batches[batch_index]
                             .iter()
                             .zip(&batch_records[batch_index])
@@ -3465,6 +3913,12 @@ impl HierarchicalBatchExecutor {
                                 })
                             })
                             .collect::<Result<Vec<_>, String>>()?;
+                        incremental_metrics.output_restore_ns +=
+                            restore_started.elapsed().as_nanos() as u64;
+                        incremental_metrics.output_clone_bytes += output
+                            .iter()
+                            .map(|output| output.frame.data.len() as u64)
+                            .sum::<u64>();
                         completed_batch_outputs[batch_index] =
                             on_batch_ready(batch_index, output, ready_ns);
                     }
@@ -3501,6 +3955,8 @@ impl HierarchicalBatchExecutor {
             .map(Option::unwrap_or_default)
             .collect::<Vec<_>>();
         let total_ns = total_started.elapsed().as_nanos() as u64;
+        incremental_metrics.range_buffer_received_bytes = completed_buffers.received_bytes;
+        incremental_metrics.range_buffer_released_bytes = completed_buffers.released_bytes;
         let target_record_ids = target_records
             .iter()
             .map(|record| record.record_id)
@@ -3517,6 +3973,7 @@ impl HierarchicalBatchExecutor {
             batch_ready_ns,
             ordered_delivery_ns,
             stats: HierarchicalBatchStats {
+                incremental: incremental_metrics,
                 logical_targets: target_records.len(),
                 unique_targets: target_record_ids.len(),
                 physical_ranges,
@@ -3566,6 +4023,7 @@ impl HierarchicalBatchExecutor {
                 io_pressure_outstanding_at_plan: io_pressure.outstanding_requests,
                 io_pressure_queued_at_plan: io_pressure.queued_requests,
                 assemble_ns,
+                incremental_range_buffer_peak_bytes: completed_buffers.peak_bytes,
                 decode_ns,
                 session_admission_ns: 0,
                 session_joint_submissions: 1,
@@ -3835,10 +4293,9 @@ impl HierarchicalBatchExecutor {
                             && candidate.total_ns <= minimum + self.model.selection_tolerance_ns
                     })
                     .min_by(|left, right| {
-                        left.ranges
-                            .len()
-                            .cmp(&right.ranges.len())
-                            .then_with(|| left.fetched_bytes.cmp(&right.fetched_bytes))
+                        left.fetched_bytes
+                            .cmp(&right.fetched_bytes)
+                            .then_with(|| left.ranges.len().cmp(&right.ranges.len()))
                             .then_with(|| left.total_ns.total_cmp(&right.total_ns))
                     })
                     .ok_or_else(|| {
@@ -4006,24 +4463,36 @@ impl HierarchicalBatchExecutor {
             );
             if let Some(key) = self.cursor_compatible_gop_key(&target_records) {
                 if resident_cursor_keys.contains(&key) {
-                    let (outputs, mut stats) = self.execute_resident_cursor(
+                    let _memory = self.reserve_resident_window(&target_records)?;
+                    self.nested_memory_reservation = true;
+                    let result = self.execute_resident_cursor(
                         targets,
                         &target_records,
                         key,
                         total_started,
                         cursor_decoder_threads,
-                    )?;
+                    );
+                    self.nested_memory_reservation = false;
+                    let (outputs, mut stats) = result?;
                     apply_object_store_pressure(&mut stats, io_pressure);
                     return Ok((outputs, stats));
                 }
             }
-            if let Some((outputs, mut stats)) = self.execute_resident_state(
+            let _memory = if !resident_cursor_keys.is_empty() {
+                self.reserve_resident_window(&target_records)?
+            } else {
+                None
+            };
+            self.nested_memory_reservation = _memory.is_some();
+            let result = self.execute_resident_state(
                 targets,
                 &target_records,
                 &resident_cursor_keys,
                 total_started,
                 cursor_decoder_threads,
-            )? {
+            );
+            self.nested_memory_reservation = false;
+            if let Some((outputs, mut stats)) = result? {
                 apply_object_store_pressure(&mut stats, io_pressure);
                 return Ok((outputs, stats));
             }
@@ -4043,12 +4512,58 @@ impl HierarchicalBatchExecutor {
         let plan_ns = plan_started.elapsed().as_nanos() as u64;
         let ranges = plan.ranges;
         let selected_ids = plan.selected_ids;
+        let fetch_bytes = ranges.iter().try_fold(0u64, |total, (_, length)| {
+            total
+                .checked_add(*length)
+                .ok_or("fetch byte count overflow")
+        })?;
+        let _memory = self.reserve_transient_buffers(fetch_bytes, &selected_ids, targets.len())?;
 
         let fetch_started = Instant::now();
-        let fetch_profile = self
-            .backend
-            .read_byte_ranges_profiled(&ranges)
-            .map_err(|error| error.to_string())?;
+        let mut group_consumers = HashMap::<(String, u64), Vec<u64>>::new();
+        for (target, record) in targets.iter().zip(&target_records) {
+            group_consumers
+                .entry((record.video_id.clone(), record.gop_id))
+                .or_default()
+                .push(target.sample_id);
+        }
+        let consumers = ranges
+            .iter()
+            .map(|(offset, length)| {
+                let mut consumers = selected_ids
+                    .iter()
+                    .filter(|id| !resident_record_ids.contains(id))
+                    .filter_map(|id| self.catalog.record(*id))
+                    .filter(|record| {
+                        record.offset < offset + length && record.offset + record.length > *offset
+                    })
+                    .flat_map(|record| {
+                        group_consumers[&(record.video_id.clone(), record.gop_id)]
+                            .iter()
+                            .copied()
+                    })
+                    .collect::<Vec<_>>();
+                consumers.sort_unstable();
+                consumers.dedup();
+                consumers
+            })
+            .collect::<Vec<Vec<u64>>>();
+        let fetch_profile = self.fetch_observed(&ranges, &consumers)?;
+        #[cfg(feature = "experiment-controls")]
+        if self
+            .execution_trace_enabled
+            .as_ref()
+            .is_some_and(|enabled| enabled.load(Ordering::Relaxed))
+        {
+            self.pending_decode_events
+                .extend(selected_ids.iter().map(|id| DecodeTraceEvent {
+                    record_id: *id,
+                    consumer_sample_ids: {
+                        let record = self.catalog.record(*id).expect("selected record exists");
+                        group_consumers[&(record.video_id.clone(), record.gop_id)].clone()
+                    },
+                }));
+        }
         let fetch_ns = fetch_started.elapsed().as_nanos() as u64;
         let physical_ranges = fetch_profile.physical_requests;
         let physical_fetched_bytes = fetch_profile.physical_fetched_bytes;
@@ -4082,9 +4597,9 @@ impl HierarchicalBatchExecutor {
                 .record(*record_id)
                 .ok_or_else(|| format!("missing selected record {record_id}"))?;
             let sample = Self::extract_record(meta, &ranges, &buffers)?;
-            let encoded = mp4_sample_to_annex_b(&sample, meta.nal_length_size)?;
+            let encoded = bytes::Bytes::from(mp4_sample_to_annex_b(&sample, meta.nal_length_size)?);
             if matches!(action, HierarchicalAction::Adaptive) {
-                self.encoded_cache.put(*record_id, encoded.clone());
+                self.encoded_cache.put_shared(*record_id, encoded.clone());
             }
             encoded_records.insert(*record_id, encoded);
         }
@@ -4115,24 +4630,42 @@ impl HierarchicalBatchExecutor {
                 let group_targets = targets_by_group
                     .get(&key)
                     .ok_or_else(|| format!("decode group {:?} has no logical targets", key))?;
-                build_incremental_decode_job(&self.codec_config, records, group_targets, |record| {
-                    encoded_records
-                        .get(&record.record_id)
-                        .cloned()
-                        .ok_or_else(|| format!("missing encoded record {}", record.record_id))
-                })
+                let mut job = build_incremental_decode_job(
+                    &self.codec_config,
+                    records,
+                    group_targets,
+                    |record| {
+                        encoded_records
+                            .get(&record.record_id)
+                            .cloned()
+                            .ok_or_else(|| format!("missing encoded record {}", record.record_id))
+                    },
+                )?;
+                job.memory = _memory.as_ref().map(Arc::clone);
+                if self.stage_profiling.enabled() {
+                    job.consumer_sample_ids = targets
+                        .iter()
+                        .zip(&target_records)
+                        .filter(|(_, record)| group_targets.contains(&record.record_id))
+                        .map(|(target, _)| target.sample_id)
+                        .collect();
+                }
+                Ok(job)
             })
             .collect::<Result<Vec<_>, String>>()?;
         let decoded_jobs = self
             .incremental_decode_pool
             .decode_all(jobs, total_started)?;
         let mut decoded = HashMap::<u64, DecodedRgbFrame>::new();
+        let mut incremental_metrics = IncrementalExecutionMetrics::default();
         for job in decoded_jobs {
+            incremental_metrics.accumulate(&job.metrics);
             for (record_id, frame) in job.frames {
                 decoded.insert(record_id, frame);
             }
         }
         let decode_ns = decode_started.elapsed().as_nanos() as u64;
+        let restore_started = Instant::now();
         let outputs = targets
             .iter()
             .zip(&target_records)
@@ -4146,16 +4679,23 @@ impl HierarchicalBatchExecutor {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        incremental_metrics.output_restore_ns += restore_started.elapsed().as_nanos() as u64;
+        incremental_metrics.output_clone_bytes += outputs
+            .iter()
+            .map(|output| output.frame.data.len() as u64)
+            .sum::<u64>();
         let range_buckets = range_size_buckets(&ranges);
         Ok((
             outputs,
             HierarchicalBatchStats {
+                incremental: incremental_metrics,
                 logical_targets: targets.len(),
                 unique_targets: target_record_ids.iter().collect::<HashSet<_>>().len(),
                 physical_ranges,
                 client_requests: physical_ranges,
                 useful_bytes: plan.useful_bytes,
                 fetched_bytes: physical_fetched_bytes,
+                incremental_range_buffer_peak_bytes: 0,
                 submitted_access_units: selected_ids.len(),
                 decoded_access_units: selected_ids.len(),
                 planner_candidate_count: plan.candidate_count,

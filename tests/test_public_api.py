@@ -17,6 +17,9 @@ def test_production_executors_share_one_request_interface():
             "pipeline",
             "metrics_snapshot",
             "synchronize",
+            "set_stage_profiling",
+            "take_decode_job_trace",
+            "resident_state_snapshot",
         } <= methods
         assert "execute_forced" not in methods
         assert "execute_partitioned" not in methods

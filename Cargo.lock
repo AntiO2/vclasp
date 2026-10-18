@@ -2651,6 +2651,7 @@ dependencies = [
  "fastrand",
  "ffmpeg-next",
  "flatbuffers",
+ "libc",
  "memmap2",
  "parquet",
  "pkg-config",
@@ -2668,6 +2669,7 @@ dependencies = [
 name = "vclasp-object-store"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
  "libc",
  "object_store",

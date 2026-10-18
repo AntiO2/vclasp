@@ -8,18 +8,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Array, ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
+use arrow::array::{ArrayRef, BinaryArray, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 
 use crate::chunk::{self, ChunkWriteConfig};
 use crate::encoder::{X264Encoder, MAX_ANCHOR_P_GROUP_FRAMES};
-use crate::hierarchical_layout::{
-    AccessUnitRecord, GopRegion, HierarchicalLayoutIndex, RegionDecodeMode, TargetClosure,
-};
 
 #[derive(Debug, Clone)]
 pub struct VideoInput {
@@ -167,7 +162,11 @@ pub struct HierarchicalBuildStats {
     pub b_frames: usize,
     pub max_b_run: usize,
     pub total_seconds: f64,
+    /// Wall time spent preparing bounded groups of encoded/probed videos.
+    pub prepare_seconds: f64,
+    /// Sum of per-video elapsed times; workers may overlap. Not CPU-seconds.
     pub encode_seconds: f64,
+    /// Sum of per-video probe times, including ffprobe frame decoding.
     pub au_parse_seconds: f64,
     pub closure_construction_seconds: f64,
     pub closure_validation_seconds: f64,
@@ -176,295 +175,7 @@ pub struct HierarchicalBuildStats {
     pub chunk_write_seconds: f64,
 }
 
-#[derive(Debug, Clone)]
-pub struct HierarchicalRecordMeta {
-    pub record_id: u64,
-    pub video_id: String,
-    pub frame_idx: i32,
-    pub gop_id: u64,
-    pub pts: i64,
-    pub dts: i64,
-    pub offset: u64,
-    pub length: u64,
-    pub decode_ordinal: usize,
-    pub closure_record_ids: Vec<u64>,
-    pub target_output_ordinal: usize,
-    pub nal_length_size: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct HierarchicalCatalog {
-    records: HashMap<u64, HierarchicalRecordMeta>,
-    targets: HashMap<(String, i32), u64>,
-    gop_records: HashMap<(String, u64), Vec<u64>>,
-}
-
-impl HierarchicalCatalog {
-    #[cfg(test)]
-    pub(crate) fn from_records_for_test(records: Vec<HierarchicalRecordMeta>) -> Self {
-        let mut by_id = HashMap::with_capacity(records.len());
-        let mut targets = HashMap::with_capacity(records.len());
-        let mut gop_records = HashMap::<(String, u64), Vec<u64>>::new();
-        for record in records {
-            targets.insert(
-                (record.video_id.clone(), record.frame_idx),
-                record.record_id,
-            );
-            gop_records
-                .entry((record.video_id.clone(), record.gop_id))
-                .or_default()
-                .push(record.record_id);
-            by_id.insert(record.record_id, record);
-        }
-        for record_ids in gop_records.values_mut() {
-            record_ids.sort_unstable_by_key(|record_id| by_id[record_id].decode_ordinal);
-        }
-        Self {
-            records: by_id,
-            targets,
-            gop_records,
-        }
-    }
-
-    pub fn from_parquet(data: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        let reader =
-            ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(data))?.build()?;
-        let batches = reader.collect::<Result<Vec<_>, _>>()?;
-        if batches.is_empty() {
-            return Err("hierarchical index has no record batches".into());
-        }
-        let schema = batches[0].schema();
-        let merged = arrow::compute::concat_batches(&schema, &batches)?;
-        macro_rules! column {
-            ($name:literal, $kind:ty) => {
-                merged
-                    .column_by_name($name)
-                    .ok_or(concat!("hierarchical index is missing ", $name))?
-                    .as_any()
-                    .downcast_ref::<$kind>()
-                    .ok_or(concat!("hierarchical index has invalid type for ", $name))?
-            };
-        }
-        let record_ids = column!("record_id", Int64Array);
-        let video_ids = column!("video_id", StringArray);
-        let frame_idxs = column!("frame_idx", Int32Array);
-        let gop_ids = column!("gop_id", Int32Array);
-        let offsets = column!("record_offset", Int64Array);
-        let lengths = column!("record_length", Int64Array);
-        let packet_indices = column!("packet_index", Int32Array);
-        let presentation_timestamps = column!("pts", Int64Array);
-        let decode_timestamps = column!("dts", Int64Array);
-        let closure_ids = column!("closure_record_ids", BinaryArray);
-        let output_ordinals = column!("target_output_ordinal", Int32Array);
-        let nal_length_sizes = column!("nal_length_size", Int32Array);
-        let mut records = HashMap::with_capacity(merged.num_rows());
-        let mut targets = HashMap::with_capacity(merged.num_rows());
-        for row in 0..merged.num_rows() {
-            let parse_non_negative = |value: i64, field: &str| -> Result<u64, String> {
-                value
-                    .try_into()
-                    .map_err(|_| format!("hierarchical {field} is negative at row {row}"))
-            };
-            let record_id = parse_non_negative(record_ids.value(row), "record_id")?;
-            let closure_bytes = closure_ids.value(row);
-            if closure_bytes.len() % 8 != 0 {
-                return Err(format!("closure bytes are not u64 aligned at row {row}").into());
-            }
-            let closure_record_ids = closure_bytes
-                .chunks_exact(8)
-                .map(|value| u64::from_le_bytes(value.try_into().expect("8-byte chunk")))
-                .collect::<Vec<_>>();
-            if closure_record_ids.is_empty() || !closure_record_ids.contains(&record_id) {
-                return Err(format!("invalid closure for record {record_id}").into());
-            }
-            let output_ordinal: usize = output_ordinals
-                .value(row)
-                .try_into()
-                .map_err(|_| format!("negative output ordinal at row {row}"))?;
-            if output_ordinal >= closure_record_ids.len() {
-                return Err(format!("output ordinal outside closure at row {row}").into());
-            }
-            let nal_length_size: usize = nal_length_sizes
-                .value(row)
-                .try_into()
-                .map_err(|_| format!("negative NAL length size at row {row}"))?;
-            if !(1..=4).contains(&nal_length_size) {
-                return Err(format!("unsupported NAL length size at row {row}").into());
-            }
-            let meta = HierarchicalRecordMeta {
-                record_id,
-                video_id: video_ids.value(row).to_string(),
-                frame_idx: frame_idxs.value(row),
-                gop_id: gop_ids
-                    .value(row)
-                    .try_into()
-                    .map_err(|_| format!("negative GOP id at row {row}"))?,
-                pts: presentation_timestamps.value(row),
-                dts: decode_timestamps.value(row),
-                offset: parse_non_negative(offsets.value(row), "record_offset")?,
-                length: parse_non_negative(lengths.value(row), "record_length")?,
-                decode_ordinal: packet_indices
-                    .value(row)
-                    .try_into()
-                    .map_err(|_| format!("negative packet index at row {row}"))?,
-                closure_record_ids,
-                target_output_ordinal: output_ordinal,
-                nal_length_size,
-            };
-            if targets
-                .insert((meta.video_id.clone(), meta.frame_idx), record_id)
-                .is_some()
-            {
-                return Err(format!(
-                    "duplicate hierarchical target ({}, {})",
-                    meta.video_id, meta.frame_idx
-                )
-                .into());
-            }
-            if records.insert(record_id, meta).is_some() {
-                return Err(format!("duplicate hierarchical record {record_id}").into());
-            }
-        }
-        for record in records.values() {
-            let mut previous = None;
-            for dependency_id in &record.closure_record_ids {
-                let dependency = records.get(dependency_id).ok_or_else(|| {
-                    format!(
-                        "record {} references missing record {dependency_id}",
-                        record.record_id
-                    )
-                })?;
-                if dependency.video_id != record.video_id || dependency.gop_id != record.gop_id {
-                    return Err(
-                        format!("record {} has a cross-GOP closure", record.record_id).into(),
-                    );
-                }
-                if previous.is_some_and(|value| value >= dependency.decode_ordinal) {
-                    return Err(format!(
-                        "record {} closure is not in decode order",
-                        record.record_id
-                    )
-                    .into());
-                }
-                previous = Some(dependency.decode_ordinal);
-            }
-        }
-        let mut gop_records = HashMap::<(String, u64), Vec<u64>>::new();
-        for record in records.values() {
-            gop_records
-                .entry((record.video_id.clone(), record.gop_id))
-                .or_default()
-                .push(record.record_id);
-        }
-        for record_ids in gop_records.values_mut() {
-            record_ids.sort_unstable_by_key(|record_id| records[record_id].decode_ordinal);
-            if record_ids
-                .windows(2)
-                .any(|pair| records[&pair[0]].dts >= records[&pair[1]].dts)
-            {
-                return Err(
-                    "hierarchical GOP decode timestamps are not strictly increasing".into(),
-                );
-            }
-        }
-        Ok(Self {
-            records,
-            targets,
-            gop_records,
-        })
-    }
-
-    pub fn target(&self, video_id: &str, frame_idx: i32) -> Option<&HierarchicalRecordMeta> {
-        let record_id = self.targets.get(&(video_id.to_string(), frame_idx))?;
-        self.records.get(record_id)
-    }
-
-    pub fn record(&self, record_id: u64) -> Option<&HierarchicalRecordMeta> {
-        self.records.get(&record_id)
-    }
-
-    pub fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    pub fn records(&self) -> impl Iterator<Item = &HierarchicalRecordMeta> {
-        self.records.values()
-    }
-
-    pub fn records_for_gop(&self, video_id: &str, gop_id: u64) -> Option<&[u64]> {
-        self.gop_records
-            .get(&(video_id.to_string(), gop_id))
-            .map(Vec::as_slice)
-    }
-
-    pub fn to_layout_index(&self) -> Result<HierarchicalLayoutIndex, String> {
-        let mut video_ids = self
-            .records
-            .values()
-            .map(|record| record.video_id.clone())
-            .collect::<Vec<_>>();
-        video_ids.sort();
-        video_ids.dedup();
-        let video_numbers = video_ids
-            .into_iter()
-            .enumerate()
-            .map(|(index, video_id)| (video_id, index as u64))
-            .collect::<HashMap<_, _>>();
-        let records = self
-            .records
-            .values()
-            .map(|record| AccessUnitRecord {
-                record_id: record.record_id,
-                video_id: video_numbers[&record.video_id],
-                gop_id: record.gop_id,
-                offset: record.offset,
-                length: record.length,
-                decode_ordinal: record.decode_ordinal,
-            })
-            .collect::<Vec<_>>();
-        let closures = self
-            .records
-            .values()
-            .map(|record| TargetClosure {
-                sample_id: record.record_id,
-                video_id: video_numbers[&record.video_id],
-                gop_id: record.gop_id,
-                target_record_id: record.record_id,
-                record_ids: record.closure_record_ids.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut grouped = HashMap::<(String, u64), Vec<&HierarchicalRecordMeta>>::new();
-        for record in self.records.values() {
-            grouped
-                .entry((record.video_id.clone(), record.gop_id))
-                .or_default()
-                .push(record);
-        }
-        let mut regions = Vec::with_capacity(grouped.len());
-        for ((video_id, gop_id), mut group) in grouped {
-            group.sort_unstable_by_key(|record| record.decode_ordinal);
-            let offset = group.iter().map(|record| record.offset).min().unwrap();
-            let end = group
-                .iter()
-                .map(|record| record.offset + record.length)
-                .max()
-                .unwrap();
-            regions.push(GopRegion {
-                video_id: video_numbers[&video_id],
-                gop_id,
-                offset,
-                length: end - offset,
-                record_ids: group.iter().map(|record| record.record_id).collect(),
-            });
-        }
-        HierarchicalLayoutIndex::new_with_region_decode_mode(
-            records,
-            closures,
-            regions,
-            RegionDecodeMode::ClosureOnly,
-        )
-    }
-}
+pub use crate::catalog::{HierarchicalCatalog, HierarchicalRecordMeta};
 
 pub fn mp4_sample_to_annex_b(data: &[u8], nal_length_size: usize) -> Result<Vec<u8>, String> {
     if !(1..=4).contains(&nal_length_size) {
@@ -1331,6 +1042,7 @@ pub fn build_vclasp_chunk_internal(
     let mut max_b_run = 0usize;
     let mut encode_seconds = 0.0;
     let mut au_parse_seconds = 0.0;
+    let mut prepare_seconds = 0.0;
     let mut closure_construction_seconds = 0.0;
     let mut closure_validation_seconds = 0.0;
     let mut payload_copy_seconds = 0.0;
@@ -1338,125 +1050,138 @@ pub fn build_vclasp_chunk_internal(
     let mut chunk_write_seconds = 0.0;
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let stage_started = Instant::now();
-        parallel_map(videos.len(), options.workers, |video_index| {
-            encode_video_for_policy(&videos[video_index], &encoded_paths[video_index], options)
-        })?;
-        encode_seconds = stage_started.elapsed().as_secs_f64();
-
-        let stage_started = Instant::now();
-        let probed = parallel_map(videos.len(), options.workers, |video_index| {
-            probe_video(&videos[video_index], &encoded_paths[video_index], options)
-        })?;
-        au_parse_seconds = stage_started.elapsed().as_secs_f64();
-
-        for (video_index, (video, probed)) in videos.iter().zip(probed).enumerate() {
-            let encoded_path = &encoded_paths[video_index];
-            let ProbedVideo {
-                config,
-                nal_length_size,
-                packets,
-                pts_to_ordinal,
-                packet_indices,
-                frame_types,
-            } = probed;
-            if canonical_config
-                .as_ref()
-                .is_some_and(|value| value != &config)
-                || canonical_nal_length_size.is_some_and(|value| value != nal_length_size)
+        // Limit temporary MP4s and decoded probe metadata to one worker group.
+        // Within a worker, probe immediately after encoding its video, rather
+        // than waiting for a corpus-wide encode barrier.
+        for base in (0..videos.len()).step_by(options.workers) {
+            let count = options.workers.min(videos.len() - base);
+            let prepared_started = Instant::now();
+            let prepared = parallel_map(count, options.workers, |local_index| {
+                let index = base + local_index;
+                let started = Instant::now();
+                encode_video_for_policy(&videos[index], &encoded_paths[index], options)?;
+                let encode_seconds = started.elapsed().as_secs_f64();
+                let started = Instant::now();
+                let probed = probe_video(&videos[index], &encoded_paths[index], options)?;
+                Ok((probed, encode_seconds, started.elapsed().as_secs_f64()))
+            })?;
+            prepare_seconds += prepared_started.elapsed().as_secs_f64();
+            for (local_index, (probed, encoded_seconds, parsed_seconds)) in
+                prepared.into_iter().enumerate()
             {
-                return Err(format!(
-                    "encoded video {} does not share the canonical codec configuration",
-                    video.video_id
-                )
-                .into());
-            }
-            canonical_config.get_or_insert(config);
-            canonical_nal_length_size.get_or_insert(nal_length_size);
-            let mut current_b_run = 0usize;
-            for frame_type in &frame_types {
-                match frame_type.as_str() {
-                    "I" => {
-                        i_frames += 1;
-                        current_b_run = 0;
-                    }
-                    "P" => {
-                        p_frames += 1;
-                        current_b_run = 0;
-                    }
-                    "B" => {
-                        b_frames += 1;
-                        current_b_run += 1;
-                        max_b_run = max_b_run.max(current_b_run);
-                    }
-                    _ => {}
+                encode_seconds += encoded_seconds;
+                au_parse_seconds += parsed_seconds;
+                let video_index = base + local_index;
+                let video = &videos[video_index];
+                let encoded_path = &encoded_paths[video_index];
+                let ProbedVideo {
+                    config,
+                    nal_length_size,
+                    packets,
+                    pts_to_ordinal,
+                    packet_indices,
+                    frame_types,
+                } = probed;
+                if canonical_config
+                    .as_ref()
+                    .is_some_and(|value| value != &config)
+                    || canonical_nal_length_size.is_some_and(|value| value != nal_length_size)
+                {
+                    return Err(format!(
+                        "encoded video {} does not share the canonical codec configuration",
+                        video.video_id
+                    )
+                    .into());
                 }
-            }
-            let stage_started = Instant::now();
-            let (closures, gop_ids) = if options.dependency_policy == DependencyPolicy::SharedAnchor
-            {
-                derive_shared_anchor_closures(&frame_types, &packet_indices)?
-            } else {
-                derive_closures(&frame_types, &packet_indices)?
-            };
-            closure_construction_seconds += stage_started.elapsed().as_secs_f64();
-            let stage_started = Instant::now();
-            validate_closures(&closures, &gop_ids, &packet_indices)?;
-            closure_validation_seconds += stage_started.elapsed().as_secs_f64();
-            gops += gop_ids.iter().max().map_or(0, |value| value + 1);
+                canonical_config.get_or_insert(config);
+                canonical_nal_length_size.get_or_insert(nal_length_size);
+                let mut current_b_run = 0usize;
+                for frame_type in &frame_types {
+                    match frame_type.as_str() {
+                        "I" => {
+                            i_frames += 1;
+                            current_b_run = 0;
+                        }
+                        "P" => {
+                            p_frames += 1;
+                            current_b_run = 0;
+                        }
+                        "B" => {
+                            b_frames += 1;
+                            current_b_run += 1;
+                            max_b_run = max_b_run.max(current_b_run);
+                        }
+                        _ => {}
+                    }
+                }
+                let stage_started = Instant::now();
+                let (closures, gop_ids) =
+                    if options.dependency_policy == DependencyPolicy::SharedAnchor {
+                        derive_shared_anchor_closures(&frame_types, &packet_indices)?
+                    } else {
+                        derive_closures(&frame_types, &packet_indices)?
+                    };
+                closure_construction_seconds += stage_started.elapsed().as_secs_f64();
+                let stage_started = Instant::now();
+                validate_closures(&closures, &gop_ids, &packet_indices)?;
+                closure_validation_seconds += stage_started.elapsed().as_secs_f64();
+                gops += gop_ids.iter().max().map_or(0, |value| value + 1);
 
-            let stage_started = Instant::now();
-            let mut source = OpenOptions::new().read(true).open(&encoded_path)?;
-            let mut global_record_ids = vec![0i64; packets.len()];
-            let base_record_id = rows.len() as i64;
-            for ordinal in 0..packets.len() {
-                global_record_ids[ordinal] = base_record_id + packet_indices[ordinal] as i64;
-            }
-            for (packet_index, packet) in packets.iter().enumerate() {
-                let ordinal = pts_to_ordinal[&packet.pts];
-                source.seek(SeekFrom::Start(packet.pos))?;
-                let mut bytes = vec![0u8; packet.size as usize];
-                source.read_exact(&mut bytes)?;
-                payload.write_all(&bytes)?;
-                let closure = &closures[ordinal];
-                max_closure_records = max_closure_records.max(closure.len());
-                closure_lengths.push(closure.len());
-                let mut closure_bytes = Vec::with_capacity(closure.len() * 8);
-                for dependency in closure {
-                    closure_bytes.extend_from_slice(&global_record_ids[*dependency].to_le_bytes());
+                let stage_started = Instant::now();
+                let mut source = OpenOptions::new().read(true).open(&encoded_path)?;
+                let mut global_record_ids = vec![0i64; packets.len()];
+                let base_record_id = rows.len() as i64;
+                for ordinal in 0..packets.len() {
+                    global_record_ids[ordinal] = base_record_id + packet_indices[ordinal] as i64;
                 }
-                let target_output_ordinal = {
-                    let mut display = closure.clone();
-                    display.sort_unstable();
-                    display
-                        .iter()
-                        .position(|value| *value == ordinal)
-                        .ok_or("target is absent from its closure")? as i32
-                };
-                rows.push(RecordRow {
-                    tier: 2,
-                    video_id: video.video_id.clone(),
-                    class_name: video.class_name.clone(),
-                    record_offset: payload_cursor as i64,
-                    record_length: packet.size as i64,
-                    frame_idx: ordinal as i32,
-                    codec_config_id: 0,
-                    dependency_kind: options.dependency_policy.dependency_kind().to_string(),
-                    record_id: base_record_id + packet_index as i64,
-                    packet_index: packet_index as i32,
-                    gop_id: gop_ids[ordinal] as i32,
-                    pts: packet.pts,
-                    dts: packet.dts,
-                    frame_type: frame_types[ordinal].clone(),
-                    closure_record_ids: closure_bytes,
-                    target_output_ordinal,
-                    nal_length_size: nal_length_size as i32,
-                });
-                payload_cursor += packet.size;
-            }
-            payload_copy_seconds += stage_started.elapsed().as_secs_f64();
-            if options.baseline_mp4_dir.is_none() {
-                std::fs::remove_file(encoded_path)?;
+                for (packet_index, packet) in packets.iter().enumerate() {
+                    let ordinal = pts_to_ordinal[&packet.pts];
+                    source.seek(SeekFrom::Start(packet.pos))?;
+                    let mut bytes = vec![0u8; packet.size as usize];
+                    source.read_exact(&mut bytes)?;
+                    payload.write_all(&bytes)?;
+                    let closure = &closures[ordinal];
+                    max_closure_records = max_closure_records.max(closure.len());
+                    closure_lengths.push(closure.len());
+                    let mut closure_bytes = Vec::with_capacity(closure.len() * 8);
+                    for dependency in closure {
+                        closure_bytes
+                            .extend_from_slice(&global_record_ids[*dependency].to_le_bytes());
+                    }
+                    let target_output_ordinal = {
+                        let mut display = closure.clone();
+                        display.sort_unstable();
+                        display
+                            .iter()
+                            .position(|value| *value == ordinal)
+                            .ok_or("target is absent from its closure")?
+                            as i32
+                    };
+                    rows.push(RecordRow {
+                        tier: 2,
+                        video_id: video.video_id.clone(),
+                        class_name: video.class_name.clone(),
+                        record_offset: payload_cursor as i64,
+                        record_length: packet.size as i64,
+                        frame_idx: ordinal as i32,
+                        codec_config_id: 0,
+                        dependency_kind: options.dependency_policy.dependency_kind().to_string(),
+                        record_id: base_record_id + packet_index as i64,
+                        packet_index: packet_index as i32,
+                        gop_id: gop_ids[ordinal] as i32,
+                        pts: packet.pts,
+                        dts: packet.dts,
+                        frame_type: frame_types[ordinal].clone(),
+                        closure_record_ids: closure_bytes,
+                        target_output_ordinal,
+                        nal_length_size: nal_length_size as i32,
+                    });
+                    payload_cursor += packet.size;
+                }
+                payload_copy_seconds += stage_started.elapsed().as_secs_f64();
+                if options.baseline_mp4_dir.is_none() {
+                    std::fs::remove_file(encoded_path)?;
+                }
             }
         }
         payload.flush()?;
@@ -1521,6 +1246,7 @@ pub fn build_vclasp_chunk_internal(
         b_frames,
         max_b_run,
         total_seconds: total_started.elapsed().as_secs_f64(),
+        prepare_seconds,
         encode_seconds,
         au_parse_seconds,
         closure_construction_seconds,

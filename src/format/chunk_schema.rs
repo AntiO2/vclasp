@@ -223,6 +223,29 @@ pub fn create_chunk_header<'a: 'b, 'b, A: flatbuffers::Allocator + 'a>(
     builder.finish()
 }
 
-pub fn root_as_chunk_header(buf: &[u8]) -> ChunkHeader<'_> {
-    unsafe { flatbuffers::root_unchecked::<ChunkHeader<'_>>(buf) }
+impl flatbuffers::Verifiable for ChunkHeader<'_> {
+    fn run_verifier(
+        verifier: &mut flatbuffers::Verifier,
+        position: usize,
+    ) -> Result<(), flatbuffers::InvalidFlatbuffer> {
+        verifier
+            .visit_table(position)?
+            .visit_field::<flatbuffers::ForwardsUOffset<&str>>("magic", Self::VT_MAGIC, true)?
+            .visit_field::<u16>("format_version", Self::VT_FORMAT_VERSION, false)?
+            .visit_field::<flatbuffers::ForwardsUOffset<&str>>("codec", Self::VT_CODEC, true)?
+            .visit_field::<u16>("width", Self::VT_WIDTH, false)?
+            .visit_field::<u16>("height", Self::VT_HEIGHT, false)?
+            .visit_field::<u16>("fps_num", Self::VT_FPS_NUM, false)?
+            .visit_field::<u16>("fps_den", Self::VT_FPS_DEN, false)?
+            .visit_field::<u64>("sps_pps_length", Self::VT_SPS_PPS_LENGTH, false)?
+            .visit_field::<u64>("payload_length", Self::VT_PAYLOAD_LENGTH, false)?
+            .visit_field::<u64>("index_length", Self::VT_INDEX_LENGTH, false)?
+            .visit_field::<u64>("created_at", Self::VT_CREATED_AT, false)?
+            .finish();
+        Ok(())
+    }
+}
+
+pub fn root_as_chunk_header(buf: &[u8]) -> Result<ChunkHeader<'_>, flatbuffers::InvalidFlatbuffer> {
+    flatbuffers::root::<ChunkHeader<'_>>(buf)
 }

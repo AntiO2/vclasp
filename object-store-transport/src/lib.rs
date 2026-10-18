@@ -22,7 +22,7 @@ pub struct ObjectRange {
 
 pub struct CompletedRange {
     pub index: usize,
-    pub bytes: Vec<u8>,
+    pub bytes: bytes::Bytes,
     pub physical_request_id: u64,
     pub physical_object_offset: u64,
     pub physical_object_length: u64,
@@ -341,7 +341,7 @@ impl S3ObjectStoreClient {
                         physical_object_length: range.length,
                         physical_requests: 1,
                         physical_fetched_bytes: bytes.len() as u64,
-                        bytes,
+                        bytes: bytes.into(),
                         started_ns: range_started,
                         first_byte_ns,
                         completed_ns: started.elapsed().as_nanos() as u64,
@@ -395,7 +395,7 @@ impl S3ObjectStoreClient {
         let mut result: Vec<Option<Vec<u8>>> =
             std::iter::repeat_with(|| None).take(ranges.len()).collect();
         self.for_each_object_range(ranges, &mut |completed| {
-            result[completed.index] = Some(completed.bytes);
+            result[completed.index] = Some(completed.bytes.into());
             Ok(())
         })?;
         result

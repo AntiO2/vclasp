@@ -257,9 +257,7 @@ and configuration used for reproduction.
 See [execution architecture](docs/execution_architecture.md) for the detailed
 planner, cache, and fallback invariants. See
 [runtime cost feedback](docs/runtime_cost_feedback.md) for the online update
-model, safety gate, telemetry, and diagnostic runner. The
-[final architecture audit](docs/final_architecture_audit.md) maps every
-production invariant to its code and verification evidence.
+model, safety gate, telemetry, and diagnostic runner.
 
 ## Development
 

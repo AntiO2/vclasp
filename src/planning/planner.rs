@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +82,16 @@ pub fn plan_byte_ranges(
 
     let mut ordered: Vec<RecordRange> = dedup.into_values().collect();
     ordered.sort_by_key(|record| (record.offset, record.record_id));
+    plan_ordered_byte_ranges(&ordered, merge_threshold_bytes, max_range_bytes)
+}
+
+/// Internal path for already validated, unique, offset-sorted records. Reuse
+/// this ordering when evaluating many thresholds for the same closure.
+pub(crate) fn plan_ordered_byte_ranges(
+    ordered: &[RecordRange],
+    merge_threshold_bytes: Option<u64>,
+    max_range_bytes: Option<u64>,
+) -> Result<Vec<RangePlan>, String> {
     let mut plans: Vec<RangePlan> = Vec::new();
 
     for record in ordered {
@@ -155,8 +165,9 @@ pub fn plan_group_spans(
 pub struct ByteCache {
     capacity_bytes: usize,
     resident_bytes: usize,
-    entries: HashMap<u64, Vec<u8>>,
-    lru: VecDeque<u64>,
+    entries: HashMap<u64, (bytes::Bytes, u64)>,
+    lru: std::collections::BTreeSet<(u64, u64)>,
+    clock: u64,
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -174,7 +185,8 @@ impl ByteCache {
             capacity_bytes,
             resident_bytes: 0,
             entries: HashMap::new(),
-            lru: VecDeque::new(),
+            lru: std::collections::BTreeSet::new(),
+            clock: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -182,14 +194,25 @@ impl ByteCache {
     }
 
     fn touch(&mut self, record_id: u64) {
-        if let Some(position) = self.lru.iter().position(|key| *key == record_id) {
-            self.lru.remove(position);
+        if self.clock == u64::MAX {
+            let order = self.lru.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+            self.lru.clear();
+            for (stamp, id) in order.into_iter().enumerate() {
+                self.entries.get_mut(&id).expect("resident entry").1 = stamp as u64;
+                self.lru.insert((stamp as u64, id));
+            }
+            self.clock = self.entries.len() as u64;
         }
-        self.lru.push_back(record_id);
+        if let Some((_, stamp)) = self.entries.get_mut(&record_id) {
+            self.lru.remove(&(*stamp, record_id));
+            *stamp = self.clock;
+            self.lru.insert((*stamp, record_id));
+            self.clock += 1;
+        }
     }
 
-    pub fn get(&mut self, record_id: u64) -> Option<Vec<u8>> {
-        let value = self.entries.get(&record_id).cloned();
+    pub fn get_shared(&mut self, record_id: u64) -> Option<bytes::Bytes> {
+        let value = self.entries.get(&record_id).map(|(value, _)| value.clone());
         if value.is_some() {
             self.hits += 1;
             self.touch(record_id);
@@ -199,69 +222,61 @@ impl ByteCache {
         value
     }
 
-    /// Inspect residency without changing hit counters or LRU order.
+    pub fn get(&mut self, record_id: u64) -> Option<Vec<u8>> {
+        self.get_shared(record_id).map(Vec::from)
+    }
+
     pub fn contains(&self, record_id: u64) -> bool {
         self.entries.contains_key(&record_id)
     }
-
     pub fn resident_ids(&self) -> HashSet<u64> {
         self.entries.keys().copied().collect()
     }
-
     pub fn resident_bytes(&self) -> usize {
         self.resident_bytes
     }
 
-    pub fn remove(&mut self, record_id: u64) -> Option<Vec<u8>> {
-        let value = self.entries.remove(&record_id)?;
+    fn remove_shared(&mut self, record_id: u64) -> Option<bytes::Bytes> {
+        let (value, stamp) = self.entries.remove(&record_id)?;
         self.resident_bytes -= value.len();
-        if let Some(position) = self.lru.iter().position(|key| *key == record_id) {
-            self.lru.remove(position);
-        }
+        self.lru.remove(&(stamp, record_id));
         Some(value)
+    }
+
+    pub fn remove(&mut self, record_id: u64) -> Option<Vec<u8>> {
+        self.remove_shared(record_id).map(Vec::from)
+    }
+
+    fn evict_oldest(&mut self) {
+        let (_, victim) = *self.lru.first().expect("resident LRU entry");
+        self.remove_shared(victim).expect("resident cache entry");
+        self.evictions += 1;
     }
 
     pub fn resize(&mut self, capacity_bytes: usize) {
         self.capacity_bytes = capacity_bytes;
         while self.resident_bytes > self.capacity_bytes {
-            let victim = self
-                .lru
-                .pop_front()
-                .expect("cache accounting lost LRU entry during resize");
-            let removed = self
-                .entries
-                .remove(&victim)
-                .expect("cache accounting lost resident entry during resize");
-            self.resident_bytes -= removed.len();
-            self.evictions += 1;
+            self.evict_oldest();
         }
     }
 
     pub fn put(&mut self, record_id: u64, value: Vec<u8>) -> bool {
+        self.put_shared(record_id, bytes::Bytes::from(value))
+    }
+
+    /// Retain an independently owned AU; callers must not pass a small slice
+    /// backed by an oversized GET buffer, which would evade byte accounting.
+    pub fn put_shared(&mut self, record_id: u64, value: bytes::Bytes) -> bool {
         if value.len() > self.capacity_bytes || self.capacity_bytes == 0 {
             return false;
         }
-        if let Some(previous) = self.entries.remove(&record_id) {
-            self.resident_bytes -= previous.len();
-            if let Some(position) = self.lru.iter().position(|key| *key == record_id) {
-                self.lru.remove(position);
-            }
-        }
-        while self.resident_bytes + value.len() > self.capacity_bytes {
-            let victim = self
-                .lru
-                .pop_front()
-                .expect("cache accounting lost LRU entry");
-            let removed = self
-                .entries
-                .remove(&victim)
-                .expect("cache accounting lost resident entry");
-            self.resident_bytes -= removed.len();
-            self.evictions += 1;
+        self.remove_shared(record_id);
+        while value.len() > self.capacity_bytes - self.resident_bytes {
+            self.evict_oldest();
         }
         self.resident_bytes += value.len();
-        self.entries.insert(record_id, value);
-        self.lru.push_back(record_id);
+        self.entries.insert(record_id, (value, self.clock));
+        self.touch(record_id);
         true
     }
 
@@ -269,6 +284,7 @@ impl ByteCache {
         self.entries.clear();
         self.lru.clear();
         self.resident_bytes = 0;
+        self.clock = 0;
     }
 
     pub fn stats(&self) -> HashMap<String, u64> {
@@ -286,6 +302,42 @@ impl ByteCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_cache_hits_do_not_copy_au_storage() {
+        let mut cache = ByteCache::new(16);
+        let value = bytes::Bytes::from(vec![7; 8]);
+        let pointer = value.as_ptr();
+        cache.put_shared(1, value);
+        let hit = cache.get_shared(1).unwrap();
+        assert_eq!(pointer, hit.as_ptr());
+        cache.clock = u64::MAX;
+        cache.get_shared(1).unwrap();
+        assert_eq!(cache.lru.len(), 1);
+        assert_eq!(cache.resident_bytes(), 8);
+        cache.put(2, vec![8; 16]);
+        assert!(!cache.contains(1));
+        assert_eq!(hit.as_ref(), &[7; 8]);
+    }
+
+    #[test]
+    fn ordered_planning_matches_public_planning_under_caps() {
+        let records = (0..32)
+            .map(|id| RecordRange {
+                record_id: id,
+                offset: id * 13,
+                length: 5,
+            })
+            .collect::<Vec<_>>();
+        for gap in [None, Some(0), Some(8), Some(16), Some(u64::MAX)] {
+            for cap in [None, Some(5), Some(32), Some(128)] {
+                assert_eq!(
+                    plan_byte_ranges(&records, gap, cap).unwrap(),
+                    plan_ordered_byte_ranges(&records, gap, cap).unwrap()
+                );
+            }
+        }
+    }
 
     #[test]
     fn exact_plan_deduplicates_without_merging() {
