@@ -54,7 +54,7 @@ pub trait StorageBackend: Send + Sync {
                 physical_object_length: length,
                 physical_requests: 1,
                 physical_fetched_bytes: bytes.len() as u64,
-                bytes,
+                bytes: bytes.into(),
                 started_ns: range_started,
                 first_byte_ns: started.elapsed().as_nanos() as u64,
                 completed_ns: started.elapsed().as_nanos() as u64,
@@ -76,6 +76,14 @@ pub trait StorageBackend: Send + Sync {
     fn read_byte_ranges_profiled(
         &self,
         ranges: &[(u64, u64)],
+    ) -> Result<ProfiledRangeBatch, Box<dyn std::error::Error>> {
+        self.read_byte_ranges_observed(ranges, &mut |_| {})
+    }
+
+    fn read_byte_ranges_observed(
+        &self,
+        ranges: &[(u64, u64)],
+        observe: &mut dyn FnMut(&CompletedRange),
     ) -> Result<ProfiledRangeBatch, Box<dyn std::error::Error>> {
         let mut result: Vec<Option<Vec<u8>>> =
             std::iter::repeat_with(|| None).take(ranges.len()).collect();
@@ -110,7 +118,11 @@ pub trait StorageBackend: Send + Sync {
                 intervals.push((completed.started_ns, completed.completed_ns));
                 timing_samples += 1;
             }
-            result[completed.index] = Some(completed.bytes);
+            if result[completed.index].is_some() {
+                return Err("backend returned a duplicate range index".into());
+            }
+            observe(&completed);
+            result[completed.index] = Some(completed.bytes.into());
             Ok(())
         })?;
         let buffers = result
@@ -215,14 +227,32 @@ pub trait StorageBackend: Send + Sync {
 pub struct LocalBackend {
     mmap: memmap2::Mmap,
     payload_start: usize,
+    payload_end: usize,
 }
 
 impl LocalBackend {
     pub fn new(mmap: memmap2::Mmap, payload_start: usize) -> Self {
+        let payload_end = mmap.len();
         LocalBackend {
             mmap,
             payload_start,
+            payload_end,
         }
+    }
+
+    pub fn with_payload_bounds(
+        mmap: memmap2::Mmap,
+        payload_start: usize,
+        payload_end: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if payload_start > payload_end || payload_end > mmap.len() {
+            return Err("invalid local payload bounds".into());
+        }
+        Ok(Self {
+            mmap,
+            payload_start,
+            payload_end,
+        })
     }
 }
 
@@ -232,12 +262,13 @@ impl StorageBackend for LocalBackend {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let start = self.payload_start + offset as usize;
-        let end = start + length as usize;
-        if end > self.mmap.len() {
-            return Err(format!("range out of bounds: offset={}, len={}", offset, length).into());
-        }
-        Ok(self.mmap[start..end].to_vec())
+        let range = crate::chunk::checked_payload_range(
+            self.payload_start,
+            self.payload_end,
+            offset,
+            length,
+        )?;
+        Ok(self.mmap[range].to_vec())
     }
 
     fn executes_planned_ranges_exactly(&self) -> bool {
@@ -351,7 +382,7 @@ struct BrokerPhysicalSpan {
 
 #[derive(Clone)]
 pub struct SharedS3RangeBroker {
-    sender: mpsc::Sender<BrokerRequest>,
+    sender: mpsc::SyncSender<BrokerRequest>,
 }
 
 impl SharedS3RangeBroker {
@@ -360,7 +391,7 @@ impl SharedS3RangeBroker {
         config: GlobalRangeBrokerConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = config.validate()?;
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(config.expected_concurrent_callers);
         thread::Builder::new()
             .name("vclasp-s3-range-broker".to_string())
             .spawn(move || run_s3_range_broker(client, config, receiver))?;
@@ -531,52 +562,7 @@ fn execute_broker_window(
         let span = spans
             .get(span_index)
             .ok_or_else(|| format!("broker returned invalid physical span {span_index}"))?;
-        let owner = span
-            .members
-            .iter()
-            .map(|member| (member.request_index, member.range_index))
-            .min()
-            .expect("broker spans have members");
-
-        for member in &span.members {
-            let relative = member
-                .offset
-                .checked_sub(span.offset)
-                .ok_or_else(|| "broker member precedes its physical span".to_string())?
-                as usize;
-            let end = relative
-                .checked_add(member.length as usize)
-                .ok_or_else(|| "broker member slice overflow".to_string())?;
-            if end > completed.bytes.len() {
-                return Err(format!(
-                    "broker member {}:{} exceeds physical span {}",
-                    member.request_index, member.range_index, span_index
-                )
-                .into());
-            }
-            let owns_physical_request = owner == (member.request_index, member.range_index);
-            requests[member.request_index]
-                .response
-                .send(Ok(CompletedRange {
-                    index: member.range_index,
-                    bytes: completed.bytes[relative..end].to_vec(),
-                    physical_request_id: completed.physical_request_id,
-                    physical_object_offset: completed.physical_object_offset,
-                    physical_object_length: completed.physical_object_length,
-                    started_ns: completed.started_ns,
-                    first_byte_ns: completed.first_byte_ns,
-                    completed_ns: completed.completed_ns,
-                    monotonic_timing: completed.monotonic_timing,
-                    physical_requests: usize::from(owns_physical_request),
-                    physical_fetched_bytes: if owns_physical_request {
-                        completed.bytes.len() as u64
-                    } else {
-                        0
-                    },
-                }))
-                .map_err(|_| "global S3 range broker consumer stopped".to_string())?;
-        }
-        Ok(())
+        deliver_broker_span(&requests, span, completed)
     });
 
     if let Err(error) = fetch_result {
@@ -587,18 +573,94 @@ fn execute_broker_window(
     }
 }
 
+fn deliver_broker_span(
+    requests: &[BrokerRequest],
+    span: &BrokerPhysicalSpan,
+    completed: CompletedRange,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut unaccounted = true;
+    for member in &span.members {
+        let relative = usize::try_from(
+            member
+                .offset
+                .checked_sub(span.offset)
+                .ok_or_else(|| "broker member precedes its physical span".to_string())?,
+        )?;
+        let end = relative
+            .checked_add(usize::try_from(member.length)?)
+            .ok_or_else(|| "broker member slice overflow".to_string())?;
+        if end > completed.bytes.len() {
+            return Err(format!(
+                "broker member {}:{} exceeds physical span {}",
+                member.request_index, member.range_index, completed.index
+            )
+            .into());
+        }
+        let delivered = requests[member.request_index]
+            .response
+            .send(Ok(CompletedRange {
+                index: member.range_index,
+                bytes: completed.bytes.slice(relative..end),
+                physical_request_id: completed.physical_request_id,
+                physical_object_offset: completed.physical_object_offset,
+                physical_object_length: completed.physical_object_length,
+                started_ns: completed.started_ns,
+                first_byte_ns: completed.first_byte_ns,
+                completed_ns: completed.completed_ns,
+                monotonic_timing: completed.monotonic_timing,
+                physical_requests: if unaccounted {
+                    completed.physical_requests
+                } else {
+                    0
+                },
+                physical_fetched_bytes: if unaccounted {
+                    completed.bytes.len() as u64
+                } else {
+                    0
+                },
+            }))
+            .is_ok();
+        // A cancelled logical consumer must not cancel a shared physical
+        // GET. Attribute it once to the first successfully delivered slice.
+        if delivered {
+            unaccounted = false;
+        }
+    }
+    Ok(())
+}
+
 fn run_s3_range_broker(
     client: S3ObjectStoreClient,
     config: GlobalRangeBrokerConfig,
     receiver: mpsc::Receiver<BrokerRequest>,
 ) {
+    let worker_count = client.pressure_snapshot().max_concurrency.max(1);
+    let (jobs, work) = mpsc::sync_channel::<Vec<BrokerRequest>>(worker_count);
+    let work = Arc::new(Mutex::new(work));
+    let mut workers = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let work = Arc::clone(&work);
+        let client = client.clone();
+        workers.push(thread::spawn(move || loop {
+            let request = work
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv();
+            let Ok(request) = request else {
+                break;
+            };
+            execute_broker_window(&client, config, request);
+        }));
+    }
     while let Ok(first) = receiver.recv() {
         let requests = collect_broker_window(first, &client, &receiver, config);
-        let client = client.clone();
-        // Execution is detached from collection so requests that become ready
-        // early can immediately submit their next intents. The shared S3
-        // semaphore remains the single global physical-I/O budget.
-        thread::spawn(move || execute_broker_window(&client, config, requests));
+        if jobs.send(requests).is_err() {
+            break;
+        }
+    }
+    drop(jobs);
+    for worker in workers {
+        let _ = worker.join();
     }
 }
 
@@ -746,7 +808,7 @@ impl StorageBackend for S3Backend {
                         physical_object_length: 0,
                         physical_requests: usize::from(index == 0),
                         physical_fetched_bytes: if index == 0 { fetched_bytes } else { 0 },
-                        bytes,
+                        bytes: bytes.into(),
                         started_ns: 0,
                         first_byte_ns: if index == 0 { completed_ns } else { 0 },
                         completed_ns: if index == 0 { completed_ns } else { 0 },
@@ -890,6 +952,21 @@ pub trait MultiObjectStorageBackend {
         ranges: &[AIStoreObjectRange],
     ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>>;
 
+    fn for_each_object_range(
+        &self,
+        ranges: &[AIStoreObjectRange],
+        callback: &mut dyn FnMut(usize, Vec<u8>) -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (index, bytes) in self.fetch_object_ranges(ranges)?.into_iter().enumerate() {
+            callback(index, bytes)?;
+        }
+        Ok(())
+    }
+
+    fn streams_members(&self) -> bool {
+        false
+    }
+
     fn client_requests_for_ranges(&self, ranges: &[AIStoreObjectRange]) -> usize {
         usize::from(!ranges.is_empty())
     }
@@ -922,6 +999,8 @@ impl AIStoreGetBatchClient {
             return Err("AIStore endpoint and bucket must be non-empty".into());
         }
         let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
             .pool_idle_timeout(Duration::from_secs(90))
             .redirect(reqwest::redirect::Policy::limited(4))
             .build()?;
@@ -938,13 +1017,37 @@ impl AIStoreGetBatchClient {
         expected_lengths: &[u64],
     ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
         let mut result = Vec::with_capacity(expected_lengths.len());
-        let mut tar = tar::Archive::new(std::io::Cursor::new(archive));
+        Self::for_each_tar_range(
+            std::io::Cursor::new(archive),
+            expected_lengths,
+            &mut |_, bytes| {
+                result.push(bytes);
+                Ok(())
+            },
+        )?;
+        Ok(result)
+    }
+
+    fn for_each_tar_range<R: std::io::Read>(
+        reader: R,
+        expected_lengths: &[u64],
+        callback: &mut dyn FnMut(usize, Vec<u8>) -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut count = 0;
+        let mut tar = tar::Archive::new(reader);
         for (index, entry) in tar.entries()?.enumerate() {
             if index >= expected_lengths.len() {
                 return Err("AIStore GetBatch returned extra archive entries".into());
             }
             let mut entry = entry?;
-            let mut bytes = Vec::with_capacity(expected_lengths[index] as usize);
+            if !entry.header().entry_type().is_file() || entry.size() != expected_lengths[index] {
+                return Err(format!(
+                    "AIStore GetBatch range {index} length mismatch or non-file entry"
+                )
+                .into());
+            }
+            let expected = usize::try_from(expected_lengths[index])?;
+            let mut bytes = Vec::with_capacity(expected);
             std::io::Read::read_to_end(&mut entry, &mut bytes)?;
             if bytes.len() != expected_lengths[index] as usize {
                 return Err(format!(
@@ -954,17 +1057,18 @@ impl AIStoreGetBatchClient {
                 )
                 .into());
             }
-            result.push(bytes);
+            callback(index, bytes)?;
+            count += 1;
         }
-        if result.len() != expected_lengths.len() {
+        if count != expected_lengths.len() {
             return Err(format!(
                 "AIStore GetBatch returned {} entries for {} ranges",
-                result.len(),
+                count,
                 expected_lengths.len()
             )
             .into());
         }
-        Ok(result)
+        Ok(())
     }
 
     fn request_body(
@@ -1001,8 +1105,21 @@ impl AIStoreGetBatchClient {
         &self,
         ranges: &[AIStoreObjectRange],
     ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+        let mut result = Vec::with_capacity(ranges.len());
+        self.stream_object_ranges(ranges, &mut |_, bytes| {
+            result.push(bytes);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    fn stream_object_ranges(
+        &self,
+        ranges: &[AIStoreObjectRange],
+        callback: &mut dyn FnMut(usize, Vec<u8>) -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if ranges.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let request = Self::request_body(ranges)?;
         let expected_lengths = ranges.iter().map(|range| range.length).collect::<Vec<_>>();
@@ -1014,12 +1131,21 @@ impl AIStoreGetBatchClient {
             .json(&request)
             .send()?
             .error_for_status()?;
-        let archive = response.bytes()?;
-        Self::decode_tar_ranges(&archive, &expected_lengths)
+        Self::for_each_tar_range(response, &expected_lengths, callback)
     }
 }
 
 impl MultiObjectStorageBackend for AIStoreGetBatchClient {
+    fn for_each_object_range(
+        &self,
+        ranges: &[AIStoreObjectRange],
+        callback: &mut dyn FnMut(usize, Vec<u8>) -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.stream_object_ranges(ranges, callback)
+    }
+    fn streams_members(&self) -> bool {
+        true
+    }
     fn fetch_object_ranges(
         &self,
         ranges: &[AIStoreObjectRange],
@@ -1029,6 +1155,17 @@ impl MultiObjectStorageBackend for AIStoreGetBatchClient {
 }
 
 impl MultiObjectStorageBackend for SharedAIStoreGetBatchClient {
+    fn for_each_object_range(
+        &self,
+        ranges: &[AIStoreObjectRange],
+        callback: &mut dyn FnMut(usize, Vec<u8>) -> Result<(), Box<dyn std::error::Error>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _permit = self.acquire();
+        self.inner.stream_object_ranges(ranges, callback)
+    }
+    fn streams_members(&self) -> bool {
+        true
+    }
     fn fetch_object_ranges(
         &self,
         ranges: &[AIStoreObjectRange],
@@ -1131,28 +1268,47 @@ impl StorageBackend for AIStoreGetBatchBackend {
         ranges: &[(u64, u64)],
         callback: &mut dyn FnMut(CompletedRange) -> Result<(), Box<dyn std::error::Error>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let started = Instant::now();
-        let buffers = self.read_byte_ranges(ranges)?;
-        let fetched_bytes = buffers.iter().map(|buffer| buffer.len() as u64).sum();
-        let completed_ns = started.elapsed().as_nanos() as u64;
-        for (index, bytes) in buffers.into_iter().enumerate() {
-            callback(CompletedRange {
-                index,
-                physical_request_id: 0,
-                physical_object_offset: 0,
-                physical_object_length: 0,
-                physical_requests: usize::from(index == 0),
-                physical_fetched_bytes: if index == 0 { fetched_bytes } else { 0 },
-                bytes,
-                // GetBatch is one client request. Attribute request-level
-                // timing once; later callbacks carry only returned entries.
-                started_ns: 0,
-                first_byte_ns: if index == 0 { completed_ns } else { 0 },
-                completed_ns: if index == 0 { completed_ns } else { 0 },
-                monotonic_timing: None,
-            })?;
+        if ranges.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let object_ranges = ranges
+            .iter()
+            .map(|&(offset, length)| {
+                let offset = self
+                    .payload_start
+                    .checked_add(offset)
+                    .ok_or("AIStore range overflow")?;
+                offset.checked_add(length).ok_or("AIStore range overflow")?;
+                if length == 0 {
+                    return Err("AIStore range has zero length");
+                }
+                Ok(AIStoreObjectRange {
+                    object_key: self.object_key.clone(),
+                    offset,
+                    length,
+                })
+            })
+            .collect::<Result<Vec<_>, &str>>()?;
+        let started = Instant::now();
+        let request_id = NEXT_LOCAL_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        self.client
+            .for_each_object_range(&object_ranges, &mut |index, bytes| {
+                let ready_ns = started.elapsed().as_nanos() as u64;
+                callback(CompletedRange {
+                    index,
+                    physical_request_id: request_id,
+                    physical_object_offset: 0,
+                    physical_object_length: 0,
+                    physical_requests: usize::from(index == 0),
+                    physical_fetched_bytes: bytes.len() as u64,
+                    bytes: bytes.into(),
+                    // Member readiness is not complete-request service time.
+                    started_ns: ready_ns,
+                    first_byte_ns: ready_ns,
+                    completed_ns: ready_ns,
+                    monotonic_timing: None,
+                })
+            })
     }
 
     fn client_requests_for_ranges(&self, ranges: &[(u64, u64)]) -> usize {
@@ -1160,7 +1316,11 @@ impl StorageBackend for AIStoreGetBatchBackend {
     }
 
     fn executes_planned_ranges_exactly(&self) -> bool {
-        true
+        false
+    }
+
+    fn supports_streaming_range_completion(&self) -> bool {
+        self.client.streams_members()
     }
 }
 
@@ -1267,7 +1427,7 @@ mod aistore_tests {
                     physical_object_length: 1,
                     physical_requests: 1,
                     physical_fetched_bytes: 1,
-                    bytes: vec![1],
+                    bytes: vec![1].into(),
                     started_ns: 5,
                     first_byte_ns: 15,
                     completed_ns: 50,
@@ -1280,7 +1440,7 @@ mod aistore_tests {
                     physical_object_length: 1,
                     physical_requests: 1,
                     physical_fetched_bytes: 1,
-                    bytes: vec![2],
+                    bytes: vec![2].into(),
                     started_ns: 50,
                     first_byte_ns: 60,
                     completed_ns: 80,
@@ -1293,7 +1453,7 @@ mod aistore_tests {
                     physical_object_length: 1,
                     physical_requests: 1,
                     physical_fetched_bytes: 1,
-                    bytes: vec![0],
+                    bytes: vec![0].into(),
                     started_ns: 0,
                     first_byte_ns: 10,
                     completed_ns: 100,
@@ -1413,6 +1573,84 @@ mod aistore_tests {
             merge_gap_bytes,
             max_range_bytes,
         }
+    }
+
+    #[test]
+    fn cancelled_broker_consumer_does_not_fail_a_shared_get() {
+        let (cancelled, cancelled_receiver) = mpsc::channel();
+        drop(cancelled_receiver);
+        let (live, receiver) = mpsc::channel();
+        let mut requests = vec![
+            broker_request(&[("object", 0, 4)]),
+            broker_request(&[("object", 2, 2)]),
+        ];
+        requests[0].response = cancelled;
+        requests[1].response = live;
+        let span = plan_broker_spans(&requests, broker_config(0, 1024))
+            .unwrap()
+            .remove(0);
+        let bytes = bytes::Bytes::from_static(b"abcd");
+        let pointer = bytes[2..].as_ptr();
+        super::deliver_broker_span(
+            &requests,
+            &span,
+            CompletedRange {
+                index: 0,
+                bytes,
+                physical_request_id: 42,
+                physical_object_offset: 0,
+                physical_object_length: 4,
+                physical_requests: 1,
+                physical_fetched_bytes: 4,
+                started_ns: 1,
+                first_byte_ns: 2,
+                completed_ns: 3,
+                monotonic_timing: None,
+            },
+        )
+        .unwrap();
+        let result = receiver.recv().unwrap().unwrap();
+        assert_eq!(result.bytes.as_ref(), b"cd");
+        assert_eq!(result.bytes.as_ptr(), pointer);
+        assert_eq!(result.physical_requests, 1);
+        assert_eq!(result.physical_fetched_bytes, 4);
+    }
+
+    #[test]
+    fn tar_members_are_delivered_before_reading_the_complete_archive() {
+        struct CountedReader<'a> {
+            reader: std::io::Cursor<&'a [u8]>,
+            count: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl std::io::Read for CountedReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = std::io::Read::read(&mut self.reader, buffer)?;
+                self.count.set(self.count.get() + count);
+                Ok(count)
+            }
+        }
+        let archive = tar_payload(&[b"abc", b"de"]);
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let reader = CountedReader {
+            reader: std::io::Cursor::new(archive.as_slice()),
+            count: count.clone(),
+        };
+        let mut delivered = Vec::new();
+        AIStoreGetBatchClient::for_each_tar_range(reader, &[3, 2], &mut |index, bytes| {
+            if index == 0 {
+                assert!(count.get() < archive.len());
+            }
+            delivered.push(bytes);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(delivered, vec![b"abc".to_vec(), b"de".to_vec()]);
+        assert!(AIStoreGetBatchClient::for_each_tar_range(
+            std::io::Cursor::new(&archive),
+            &[3],
+            &mut |_, _| Ok(())
+        )
+        .is_err());
     }
 
     #[test]
@@ -1592,7 +1830,8 @@ mod aistore_tests {
         assert_eq!(backend.client_requests_for_ranges(&ranges), 1);
         assert_eq!(backend.server_entries_for_ranges(&ranges), 3);
         assert_eq!(backend.client_requests_for_ranges(&[]), 0);
-        assert!(!backend.supports_streaming_range_completion());
+        assert!(backend.supports_streaming_range_completion());
+        assert!(!backend.executes_planned_ranges_exactly());
     }
 
     #[test]

@@ -159,6 +159,7 @@ let config = SessionConfig {
     runtime_feedback: RuntimeFeedbackConfig::default(),
     max_callers: 8,
     max_pending_calls: 32,
+    max_inflight_bytes: 256 << 20,
     max_inflight_windows: 8,
     admission_quiet: Duration::from_micros(250),
     max_merge_gap_bytes: Some(16 * 1024),
@@ -202,6 +203,48 @@ physical windows, including insertion and capacity reduction. Disabled caches
 and rejected oversized AUs do not count as evictions. Subtract phase snapshots
 after synchronization to exclude warmup; this is a count, not a memory estimate.
 
+`max_pending_calls` bounds admitted calls through execution and result
+consumption, not just an ingress queue. A cancelled handle releases its permit
+only after execution also releases it. Submit and consume concurrently when
+using more work than this capacity; do not fill an unbounded list of handles
+before waiting for any result.
+
+`max_inflight_bytes` is a session-wide transient working-buffer reservation
+(Python default: 256 MiB). It includes planned range buffers, conservative
+Annex-B/packet expansion and RGB staging/restoration. Oversized windows return
+an error; smaller competing windows wait for capacity. Decoder jobs keep the
+reservation until completion, including cancellation/error cleanup. This is
+not a process RSS limit: allocator/container overhead, preloaded metadata,
+persistent encoded caches, codec-private DPBs and caller-owned outputs remain
+separate. Reservations describe planned logical working buffers; a shared
+broker response can pin a larger physical allocation, so this counter must not
+be presented as an exact live-allocation counter. Live cursors no longer convert
+or retain unrequested RGB. An already
+emitted output that was not requested requires replay if requested later.
+
+The current AU catalog is parsed once per chunk reader and shared across
+session lanes. Tier-control indexes are parsed only through explicit control
+access. Invalid current catalogs are errors, not an implicit legacy fallback.
+
+The transport's Rust completion API owns `bytes::Bytes`; broker consumers
+receive shared slices. APIs returning `Vec<u8>` still return independently
+owned bytes, and PyO3 still converts results to Python bytes. Cache entries
+hold compact Annex-B AUs, not small slices pinning entire GET buffers.
+
+AIStore native GetBatch delivers validated tar members incrementally and has
+a 10-second connection timeout and 120-second request deadline. Its request
+count is one per GetBatch, not one per member. Member arrival time is not
+reported as full-request service time. Returned payload-byte accounting does
+not include tar headers or HTTP framing.
+
+Ingestion prepares at most `workers` encoded/probed videos before ordered
+serialization. `prepare_seconds` is preparation wall time; `encode_seconds`
+and `au_parse_seconds` are sums of per-video elapsed times and can overlap.
+They are not CPU-seconds or additive wall-time stages. Frame probing uses
+FFmpeg frame decoding; closure construction is restricted to the supported
+controlled encodings, not arbitrary H.264 reference-graph discovery. Closure
+graph validation does not substitute for decoded RGB reference validation.
+
 Python local, S3 and AIStore session constructors release the GIL during
 index loading and backend setup, so independent Python monitoring threads can
 observe initialization. Argument conversion and validation retain the GIL.
@@ -233,6 +276,23 @@ cost_model = {
 }
 wave_overhead_ns = [800_000.0] * 8
 ```
+
+`bandwidth_bytes_per_ns` is aggregate transfer bandwidth shared by concurrent
+GETs, not the bandwidth of each individual GET. Without wave calibration, the
+model charges one startup latency per wave of up to `io_concurrency` requests,
+plus the total transferred bytes divided by that aggregate bandwidth.
+
+`selection_tolerance_ns` is a prediction uncertainty band. Within that band,
+selection prefers fewer fetched bytes, then less decoder work and fewer GETs
+among eligible candidates. The existing predicted-cost bound against the
+Fixed 16 KiB reference still applies. This ranking is a cost heuristic, not a simulation of the live I/O
+queue; global request/decode limits and configured range caps remain execution
+constraints. No workload label is needed.
+
+The session's `admission_quiet_us` is the total waiting budget for collecting
+one joint request window. It is not restarted for each arriving caller. Ready
+requests may still be collected without waiting when this budget is zero;
+barriers fence later submissions off from the current window.
 
 Runtime feedback is enabled by default. Successful windows update a shared
 request/byte/decode estimator after a minimum-observation and prediction-error
@@ -299,6 +359,102 @@ backpressure time.
 `execute`, `execute_window`, `submit`, and `submit_window` remain lower-level
 interfaces for synchronous applications and diagnostics. A single batch is an
 `L=1` request; callers never choose a workload-specific reader.
+
+Fetched range buffers are released after their last assembly consumer has
+copied the required AUs into decoder-owned input. Shared ranges remain alive
+until all their consumers are done; encoded-cache ownership is separate.
+The I/O-to-execution completion queue is bounded using the I/O/decode operation
+capacities, so a slow consumer applies backpressure. This bounds queue entries,
+not total bytes: range sizes, encoded inputs, decoder state and RGB outputs have
+their own memory costs.
+
+`incremental_range_buffer_peak_bytes` reports the largest total of raw fetched
+buffers held by one incremental assembly window. Session aggregation takes the
+maximum rather than adding peaks across windows or lanes. It excludes bytes
+in transport/completion queues, encoded caches, decoder inputs and RGB outputs;
+it is neither total RSS nor a process-wide memory limit. Non-incremental paths
+do not contribute to this metric.
+
+Execution also reports the following counters in returned stats
+and `metrics_snapshot()`. Python names have the `incremental_` prefix; Rust
+exposes the same fields through `ExecutionStats.incremental` and
+`SessionMetrics.incremental` (`session::IncrementalExecutionMetrics`).
+
+| Suffix after `incremental_` | Meaning |
+| --- | --- |
+| `range_buffer_received_bytes` | Logical range-buffer bytes delivered to assembly; not unique physical network bytes |
+| `range_buffer_released_bytes` | Delivered bytes released after the last consumer, including unused late delivery |
+| `range_completion_blocked_sends` | Range completion sends that encountered a full execution queue |
+| `range_completion_block_ns` | Time those range producers spent in blocking send calls |
+| `decode_queue_ns` | Time from decode-job submission until its worker receives it |
+| `decode_resource_wait_ns` | Worker time acquiring the shared decode budget and decoder-slot lock |
+| `decode_service_ns` | Time in the decoder helper, including its RGB materialization |
+| `decode_timing_samples` | Successfully completed jobs contributing decode timings |
+| `decoded_rgb_bytes` | RGB bytes produced by those jobs, before logical duplicate restoration |
+| `output_restore_ns` | Time restoring logical RGB outputs; may overlap other jobs |
+| `output_clone_bytes` | RGB bytes cloned during logical output restoration, excluding Python copies |
+
+Session aggregation sums these counters. Decode timing covers successful
+stateless and resident-cursor jobs. The `incremental_` names identify the
+existing metric group, not an execution-policy requirement. A zero sample
+count means no decode-timing sample, not that decoder work was free.
+Range send counters exclude decoder-completion sends and the final completion
+notification. Decoder queue/resource/service times exclude Python conversion
+and output delivery. The original `decode_ns` retains its existing worker-time
+scope, including resource waiting; do not add it to the new decode timings.
+
+Parallel-job timing sums are not a mutually exclusive wall-clock breakdown and
+do not provide queue P95/P99 distributions. Logical buffer bytes may differ
+from attributed physical GET bytes when one GET serves several consumers.
+Do not derive exact overfetch by blindly subtracting per-window useful bytes
+from physical bytes; use the existing extent and consumer trace for attribution.
+
+### Optional codec profiling
+
+`session.set_stage_profiling(True)` enables detailed timing for subsequent jobs;
+it is off by default. Stop producers and call `synchronize()` before changing
+the setting for an overhead comparison. Returned stats and session snapshots
+include `codec_profile_jobs`, `codec_accepted_packets`, `codec_received_frames`,
+and `codec_<stage>_{wall_ns,thread_cpu_ns,calls,cpu_samples,bytes}`. Stages are
+`decoder_setup`, `packet_copy`, `send`, `receive`, `flush`,
+`rgb_convert`, and `rgb_copy`. Accepted packets and received frames are distinct
+from closure size and the existing submitted-AU counters. Packet copy bytes
+count FFmpeg-owned input copies; RGB copy bytes count packed RGB materialization,
+not logical duplicate restoration or Python output copies.
+
+CPU samples use the calling thread's CPU clock on Linux. They exclude codec
+worker-thread CPU, which requires process-level measurement. Zero CPU samples
+mean unavailable or disabled, not zero CPU cost. Job aggregates cover completed
+successful jobs; a failed request is not a successful timing sample.
+
+`take_decode_job_trace()` returns `(events, dropped_events)`. Events contain
+lane/job IDs, submitted and requested record IDs, codec metrics, and monotonic
+timestamps for queue submission, worker start, resource acquisition and service
+completion. The buffer holds at most 8,192 events per execution lane and must
+be drained periodically; lost events are counted. IDs are scoped to the lane.
+Linux timestamps use `CLOCK_MONOTONIC`; other platforms report the clock as
+unavailable. These are job timelines, not a serialized critical-path breakdown.
+Events also identify their logical consumer sample IDs, stateless/resident
+execution path and decoder context address. Addresses are process-local debug
+identifiers and may be reused after a decoder is destroyed; use opening/flush
+counts and job order rather than treating addresses as permanent IDs.
+`codec_decoder_opens` counts successful decoder construction under profiling.
+
+Python batch/window results separately report `python_output_wall_ns`,
+`python_output_bytes`, and available calling-thread CPU samples for conversion
+to Python-owned bytes. These adapter metrics are not Rust-session counters.
+Admission metrics include current/peak pending calls and cumulative admission
+wait. Snapshot capacities and current occupancy are gauges; lifetime peaks must
+not be differenced or presented as post-warmup interval maxima.
+
+`resident_state_snapshot()` returns one coherent cache/cursor snapshot per
+execution lane. It is published at construction and after an execution returns,
+including errors. `updated_monotonic_ns` identifies its observation time;
+`scope="last_completed_execution_per_lane"` means it is not an instantaneous
+inspection of an active lane. Fields include cache hits/misses/evictions,
+encoded-AU and read-ahead payload bytes, the byte budget, resident entries,
+live/pinned/probationary cursor counts and cursor capacity. Payload byte counts
+are not allocator usage or codec DPB memory. Sample process RSS/PSS separately.
 
 S3-compatible applications should create one process-wide session. The session
 owns the planner, caches, live decoder state, and global resource budgets.

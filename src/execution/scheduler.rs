@@ -14,11 +14,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 #[cfg(feature = "ffmpeg")]
-use pyo3::prelude::*;
-#[cfg(feature = "ffmpeg")]
-use pyo3::types::PyBytes;
-
-#[cfg(feature = "ffmpeg")]
 use crate::chunk;
 #[cfg(feature = "ffmpeg")]
 use crate::decoder;
@@ -68,17 +63,18 @@ impl LogicalBatchDecoder {
         mut reader: chunk::ChunkReader,
         file_path: String,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let gop_size = reader.index.infer_gop_size();
-        let tier1_stride = reader.index.infer_tier1_stride(gop_size);
+        let gop_size = reader.control_index()?.infer_gop_size();
+        let tier1_stride = reader.control_index()?.infer_tier1_stride(gop_size);
 
         // Determine frames_per_record for tier2 from dependency_kind
         let dep = reader.read_sps_pps().ok().and_then(|_| {
             reader
-                .index
+                .control_index()
+                .ok()?
                 .video_entries()
                 .keys()
                 .next()
-                .and_then(|vid| reader.index.dependency_kind_for(vid, 2))
+                .and_then(|vid| reader.control_index().ok()?.dependency_kind_for(vid, 2))
         });
         let frames_per_record_tier2 = match dep {
             Some("idr") | None => 1,
@@ -532,7 +528,11 @@ impl LogicalScheduler {
             group_reqs.sort_by_key(|(_, _, _, r)| *r);
 
             // Resolve record offsets for cost-based clustering
-            let all_ranges = self.decoder.inner.index.lookup_all(&vid, tier_val)?;
+            let all_ranges = self
+                .decoder
+                .inner
+                .control_index()?
+                .lookup_all(&vid, tier_val)?;
 
             // Split into clusters using byte-gap cost model
             let clusters = if let Some(thresh) = self.merge_threshold {
@@ -667,11 +667,11 @@ impl LogicalScheduler {
                 continue;
             }
 
-            if let Some(loc) = self
-                .decoder
-                .inner
-                .index
-                .lookup_at(&req.video_id, req.tier, rec_idx)
+            if let Some(loc) =
+                self.decoder
+                    .inner
+                    .control_index()?
+                    .lookup_at(&req.video_id, req.tier, rec_idx)
             {
                 let fpr = if req.tier <= 1 {
                     1
@@ -932,7 +932,7 @@ impl LogicalScheduler {
                         physical_object_length: length,
                         physical_requests: 1,
                         physical_fetched_bytes: bytes.len() as u64,
-                        bytes,
+                        bytes: bytes.into(),
                         started_ns: range_started,
                         first_byte_ns: completed_ns,
                         completed_ns,
@@ -1062,7 +1062,7 @@ mod tests {
                     physical_object_length: length,
                     physical_requests: 1,
                     physical_fetched_bytes: bytes.len() as u64,
-                    bytes,
+                    bytes: bytes.into(),
                     started_ns: range_started,
                     first_byte_ns: started.elapsed().as_nanos() as u64,
                     completed_ns: started.elapsed().as_nanos() as u64,
@@ -1084,7 +1084,7 @@ mod tests {
         if reader.is_none() {
             return;
         }
-        let gop = reader.unwrap().index.infer_gop_size();
+        let gop = reader.unwrap().control_index().unwrap().infer_gop_size();
         assert_eq!(gop, 8, "IdrOnly chunk has GOP8 frame_idx deltas");
     }
 
@@ -1094,7 +1094,11 @@ mod tests {
         if reader.is_none() {
             return;
         }
-        let stride = reader.unwrap().index.infer_tier1_stride(8);
+        let stride = reader
+            .unwrap()
+            .control_index()
+            .unwrap()
+            .infer_tier1_stride(8);
         assert_eq!(stride, 4, "tier1_stride should be 4");
     }
 
@@ -1158,7 +1162,8 @@ mod tests {
         let mut decoder = LogicalBatchDecoder::new(reader.unwrap(), "test.chunk".into()).unwrap();
         let video_id = decoder
             .inner
-            .index
+            .control_index()
+            .unwrap()
             .video_entries()
             .keys()
             .next()
@@ -1186,7 +1191,8 @@ mod tests {
         let path = Path::new(&path_value);
         let first_reader = chunk::ChunkReader::open(path).unwrap();
         let video_ids: Vec<_> = first_reader
-            .index
+            .control_index()
+            .unwrap()
             .video_entries()
             .keys()
             .take(8)

@@ -21,6 +21,7 @@ fn valid_config() -> SessionConfig {
         runtime_feedback: RuntimeFeedbackConfig::default(),
         max_callers: 8,
         max_pending_calls: 32,
+        max_inflight_bytes: 256 << 20,
         max_inflight_windows: 2,
         admission_quiet: Duration::from_micros(250),
         max_merge_gap_bytes: Some(16 * 1024),
@@ -50,6 +51,10 @@ fn rust_session_contract_is_public_and_backend_neutral() {
 
 #[test]
 fn session_rejects_resources_that_cannot_be_enforced() {
+    let mut config = valid_config();
+    config.max_inflight_bytes = 0;
+    assert!(config.validate().is_err());
+
     let mut config = valid_config();
     config.cursor_decoder_threads = 9;
     assert!(config.validate().is_err());

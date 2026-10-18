@@ -66,6 +66,9 @@ large experiment when a focused regression test answers the question.
 ## Repository scope
 
 Keep core code, focused tests, small examples, and user documentation here.
+Do not add dated repair reports, session summaries, audit reports, experiment
+plans, or delivery checklists to this repository. Document lasting behavior in
+the API, architecture, or setup guides; keep task state in local Trellis files.
 Keep baseline ports, paper sources, datasets, deployment-specific configuration,
 large results, and experiment status reports in the artifact or experiment
 workspace. Never commit credentials, private endpoints, machine-specific paths,

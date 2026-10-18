@@ -526,7 +526,7 @@ impl NormalizedBatchExecutor {
                 video_id: descriptor.video_id,
                 gop_id: descriptor.anchor_group_id,
                 target_record_id,
-                record_ids: closure_ids,
+                record_ids: closure_ids.into(),
             });
         }
         let mut regions = Vec::with_capacity(group_records.len());

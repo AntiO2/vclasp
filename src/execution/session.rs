@@ -1,3 +1,4 @@
+pub use crate::decoder::profile::{DecodeJobEvent, DecodeProfile, StageTotals};
 pub use crate::hierarchical_layout::HierarchicalCostModel as CostModel;
 #[cfg(feature = "experiment-controls")]
 use crate::hierarchical_scheduler::DecodeTraceEvent;
@@ -7,7 +8,8 @@ use crate::hierarchical_scheduler::HierarchicalAction;
 use crate::hierarchical_scheduler::RangeTraceEvent;
 pub use crate::hierarchical_scheduler::{
     HierarchicalBatchStats as ExecutionStats, HierarchicalIncrementalWindow as WindowOutput,
-    HierarchicalOutput as FrameOutput, LogicalTarget as Target, ResidentStateBudget,
+    HierarchicalOutput as FrameOutput, IncrementalExecutionMetrics, LogicalTarget as Target,
+    ResidentStateBudget,
 };
 pub use crate::runtime_feedback::RuntimeFeedbackConfig;
 use crate::{
@@ -23,9 +25,9 @@ use crate::{
 use memmap2::Mmap;
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
 #[cfg(feature = "experiment-controls")]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -40,6 +42,7 @@ pub type WindowResult = Result<WindowOutput, String>;
 /// bounded future work without creating one thread per outstanding batch.
 pub struct PendingBatch {
     receiver: Receiver<BatchResult>,
+    _permit: Option<Arc<AdmissionPermit>>,
 }
 
 impl PendingBatch {
@@ -52,6 +55,70 @@ impl PendingBatch {
 
 pub struct PendingWindow {
     receiver: Receiver<WindowResult>,
+    _permit: Option<Arc<AdmissionPermit>>,
+}
+
+struct AdmissionBudget {
+    capacity: usize,
+    outstanding: Mutex<usize>,
+    changed: Condvar,
+    peak: AtomicU64,
+    wait_ns: AtomicU64,
+}
+
+struct AdmissionPermit(Arc<AdmissionBudget>);
+
+impl AdmissionBudget {
+    fn acquire(self: &Arc<Self>) -> Arc<AdmissionPermit> {
+        let started = Instant::now();
+        let mut outstanding = self
+            .outstanding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while *outstanding == self.capacity {
+            outstanding = self
+                .changed
+                .wait(outstanding)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *outstanding += 1;
+        self.peak.fetch_max(*outstanding as u64, Ordering::Relaxed);
+        self.wait_ns
+            .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Arc::new(AdmissionPermit(Arc::clone(self)))
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        let mut outstanding = self
+            .0
+            .outstanding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *outstanding -= 1;
+        self.0.changed.notify_one();
+    }
+}
+
+struct AdmittedSender<T> {
+    sender: SyncSender<T>,
+    _permit: Option<Arc<AdmissionPermit>>,
+}
+
+impl<T> AdmittedSender<T> {
+    fn send(&self, value: T) -> Result<(), mpsc::SendError<T>> {
+        self.sender.send(value)
+    }
+}
+
+impl<T> From<SyncSender<T>> for AdmittedSender<T> {
+    fn from(sender: SyncSender<T>) -> Self {
+        Self {
+            sender,
+            _permit: None,
+        }
+    }
 }
 
 impl PendingWindow {
@@ -339,6 +406,15 @@ impl VClaspPipeline {
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionMetrics {
+    pub pending_peak_calls: u64,
+    pub pending_admission_wait_ns: u64,
+    pub pending_calls: u64,
+    pub pending_call_capacity: u64,
+    pub transient_buffer_capacity_bytes: u64,
+    pub transient_buffer_reserved_bytes: u64,
+    pub transient_buffer_peak_bytes: u64,
+    pub transient_buffer_wait_ns: u64,
+    pub incremental: IncrementalExecutionMetrics,
     pub completed_windows: u64,
     pub resident_path_windows: u64,
     pub stateless_path_windows: u64,
@@ -360,6 +436,8 @@ pub struct SessionMetrics {
     pub plan_ns: u64,
     pub fetch_ns: u64,
     pub assemble_ns: u64,
+    /// Maximum for one incremental window, not a sum across concurrent lanes.
+    pub incremental_range_buffer_peak_bytes: u64,
     pub decode_ns: u64,
     pub range_ttfb_ns_sum: u64,
     pub range_service_ns_sum: u64,
@@ -521,6 +599,10 @@ impl SessionMetrics {
         self.plan_ns += stats.plan_ns;
         self.fetch_ns += stats.fetch_ns;
         self.assemble_ns += stats.assemble_ns;
+        self.incremental.accumulate(&stats.incremental);
+        self.incremental_range_buffer_peak_bytes = self
+            .incremental_range_buffer_peak_bytes
+            .max(stats.incremental_range_buffer_peak_bytes);
         self.decode_ns += stats.decode_ns;
         self.range_ttfb_ns_sum += stats.range_ttfb_ns_sum;
         self.range_service_ns_sum += stats.range_service_ns_sum;
@@ -537,9 +619,12 @@ pub struct SessionConfig {
     pub cost_model: CostModel,
     pub runtime_feedback: RuntimeFeedbackConfig,
     pub max_callers: usize,
-    /// Maximum logical API calls waiting for admission. This is process-wide
-    /// backpressure, not a worker count.
+    /// Maximum admitted API calls, including execution and unconsumed results.
+    /// This is process-wide backpressure, not a worker count.
     pub max_pending_calls: usize,
+    /// Shared transient payload/packet/RGB reservation, excluding persistent
+    /// caches, codec-private DPBs and outputs already transferred to callers.
+    pub max_inflight_bytes: usize,
     /// Maximum immutable execution windows that may overlap. This bounds
     /// pipeline state; it is independent of workload names or access modes.
     pub max_inflight_windows: usize,
@@ -567,6 +652,9 @@ impl SessionConfig {
         }
         if self.max_inflight_windows == 0 {
             return Err("in-flight window capacity must be positive".to_string());
+        }
+        if self.max_inflight_bytes == 0 {
+            return Err("max_inflight_bytes must be positive".into());
         }
         if self.admission_quiet > Duration::from_secs(1) {
             return Err("session admission quiet window must not exceed one second".to_string());
@@ -619,25 +707,26 @@ pub struct AIStoreConfig {
 }
 
 struct ChunkMetadata {
-    catalog: HierarchicalCatalog,
+    catalog: Arc<HierarchicalCatalog>,
     codec_config: Vec<u8>,
     payload_start: usize,
+    rgb_frame_bytes: usize,
 }
 
 enum Command {
     Execute {
         targets: Vec<Target>,
-        response: SyncSender<BatchResult>,
+        response: AdmittedSender<BatchResult>,
     },
     #[cfg(feature = "experiment-controls")]
     ExecuteForced {
         targets: Vec<Target>,
         action: HierarchicalAction,
-        response: SyncSender<BatchResult>,
+        response: AdmittedSender<BatchResult>,
     },
     ExecuteWindow {
         batches: Vec<Vec<Target>>,
-        response: SyncSender<WindowResult>,
+        response: AdmittedSender<WindowResult>,
     },
     Barrier {
         response: SyncSender<Result<(), String>>,
@@ -651,9 +740,13 @@ enum Command {
 /// The owned executor is the single authority for the catalog, cost feedback,
 /// encoded AUs, live decoder/DPB state, and global execution budgets.
 struct SessionInner {
+    resident_snapshots: Vec<Arc<Mutex<std::collections::HashMap<String, u64>>>>,
+    stage_profiling: Vec<Arc<crate::decoder::profile::CodecProfiler>>,
     sender: SyncSender<Command>,
     thread: Mutex<Option<JoinHandle<()>>>,
     metrics: Arc<Mutex<SessionMetrics>>,
+    admission: Arc<AdmissionBudget>,
+    transient: Option<Arc<crate::byte_budget::ByteBudget>>,
     #[cfg(feature = "experiment-controls")]
     execution_trace: Arc<ExecutionTraceState>,
     #[cfg(feature = "experiment-controls")]
@@ -668,6 +761,42 @@ pub struct VClaspSession {
 }
 
 impl VClaspSession {
+    /// Per-lane residency at construction or the last completed execution.
+    /// Snapshots do not inspect mutable codec/cache state while a lane is active.
+    pub fn resident_state_snapshot(&self) -> Vec<std::collections::HashMap<String, u64>> {
+        self.inner
+            .resident_snapshots
+            .iter()
+            .map(|snapshot| {
+                snapshot
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+            })
+            .collect()
+    }
+    /// Enable optional per-codec-call wall/thread-CPU accounting for future jobs.
+    /// Call after synchronize() when comparing two observation modes.
+    pub fn set_stage_profiling(&self, enabled: bool) {
+        for flag in &self.inner.stage_profiling {
+            flag.set_enabled(enabled);
+        }
+    }
+
+    /// Drain bounded codec-job events. Job IDs are scoped to the lane index.
+    pub fn drain_decode_job_trace(
+        &self,
+    ) -> (Vec<(usize, crate::decoder::profile::DecodeJobEvent)>, u64) {
+        let mut events = Vec::new();
+        let mut dropped = 0;
+        for (lane, profiler) in self.inner.stage_profiling.iter().enumerate() {
+            let (jobs, lost) = profiler.drain();
+            events.extend(jobs.into_iter().map(|job| (lane, job)));
+            dropped += lost;
+        }
+        (events, dropped)
+    }
+
     pub(crate) fn new(
         executors: Vec<HierarchicalBatchExecutor>,
         max_callers: usize,
@@ -686,6 +815,15 @@ impl VClaspSession {
         if executors.is_empty() {
             return Err("VClasp session requires at least one execution lane".to_string());
         }
+        let transient = executors[0].transient_budget_handle();
+        let resident_snapshots = executors
+            .iter()
+            .map(|executor| executor.resident_snapshot_handle())
+            .collect();
+        let stage_profiling = executors
+            .iter()
+            .map(|executor| executor.stage_profiling_handle())
+            .collect();
         #[cfg(feature = "experiment-controls")]
         let execution_trace = Arc::new(ExecutionTraceState::new());
         #[cfg(feature = "experiment-controls")]
@@ -735,9 +873,19 @@ impl VClaspSession {
         });
         Ok(Self {
             inner: Arc::new(SessionInner {
+                resident_snapshots,
+                stage_profiling,
                 sender,
                 thread: Mutex::new(Some(thread)),
                 metrics,
+                transient,
+                admission: Arc::new(AdmissionBudget {
+                    capacity: max_pending_calls,
+                    outstanding: Mutex::new(0),
+                    changed: Condvar::new(),
+                    peak: AtomicU64::new(0),
+                    wait_ns: AtomicU64::new(0),
+                }),
                 #[cfg(feature = "experiment-controls")]
                 execution_trace,
                 #[cfg(feature = "experiment-controls")]
@@ -756,7 +904,12 @@ impl VClaspSession {
         // SAFETY: the backend owns this read-only mapping and callers must keep
         // registered chunks immutable for the session lifetime.
         let mmap = unsafe { Mmap::map(&reader.file) }.map_err(|error| error.to_string())?;
-        let backend = LocalBackend::new(mmap, metadata.payload_start);
+        let backend = LocalBackend::with_payload_bounds(
+            mmap,
+            metadata.payload_start,
+            reader.layout.payload_end,
+        )
+        .map_err(|error| error.to_string())?;
         Self::from_parts(metadata, Box::new(backend), config)
     }
 
@@ -848,7 +1001,8 @@ impl VClaspSession {
         config: SessionConfig,
     ) -> Result<Self, String> {
         let layout = Arc::new(metadata.catalog.to_layout_index()?);
-        let catalog = Arc::new(metadata.catalog);
+        let catalog = metadata.catalog;
+        let memory = crate::byte_budget::ByteBudget::new(config.max_inflight_bytes)?;
         let decode_budget = DecodeBudget::new(config.global_decode_threads);
         let total_decoder_slots = config.global_decode_threads / config.decoder_threads;
         let lane_count = config
@@ -861,7 +1015,6 @@ impl VClaspSession {
             total_decoder_slots,
             config.decoder_threads,
         );
-        let next_decoder_slot = Arc::new(AtomicUsize::new(0));
         let mut executors = Vec::with_capacity(lane_count);
         let mut shared_feedback = None;
         for lane in 0..lane_count {
@@ -889,7 +1042,6 @@ impl VClaspSession {
             .with_shared_decode_resources(
                 Arc::clone(&decoder_slots),
                 Arc::clone(&decode_budget),
-                Arc::clone(&next_decoder_slot),
                 config.cursor_decoder_threads,
             )?;
             if let Some(feedback) = &shared_feedback {
@@ -899,7 +1051,9 @@ impl VClaspSession {
                     executor.with_runtime_feedback_config(config.runtime_feedback.clone())?;
                 shared_feedback = Some(executor.runtime_feedback_handle());
             }
-            executors.push(executor);
+            executors.push(
+                executor.with_transient_budget(Arc::clone(&memory), metadata.rgb_frame_bytes),
+            );
         }
         Self::new(
             executors,
@@ -918,11 +1072,19 @@ impl VClaspSession {
             return Err("VClasp batch requires at least one target".to_string());
         }
         let (response, receiver) = mpsc::sync_channel(1);
+        let permit = self.inner.admission.acquire();
+        let response = AdmittedSender {
+            sender: response,
+            _permit: Some(Arc::clone(&permit)),
+        };
         self.inner
             .sender
             .send(Command::Execute { targets, response })
             .map_err(|_| "VClasp session coordinator stopped".to_string())?;
-        Ok(PendingBatch { receiver })
+        Ok(PendingBatch {
+            receiver,
+            _permit: Some(permit),
+        })
     }
 
     pub fn execute_window(&self, batches: Vec<Vec<Target>>) -> WindowResult {
@@ -934,11 +1096,19 @@ impl VClaspSession {
             return Err("VClasp request window requires non-empty batches".to_string());
         }
         let (response, receiver) = mpsc::sync_channel(1);
+        let permit = self.inner.admission.acquire();
+        let response = AdmittedSender {
+            sender: response,
+            _permit: Some(Arc::clone(&permit)),
+        };
         self.inner
             .sender
             .send(Command::ExecuteWindow { batches, response })
             .map_err(|_| "VClasp session coordinator stopped".to_string())?;
-        Ok(PendingWindow { receiver })
+        Ok(PendingWindow {
+            receiver,
+            _permit: Some(permit),
+        })
     }
 
     /// Wait for previously admitted work to finish, including window accounting.
@@ -955,11 +1125,29 @@ impl VClaspSession {
     }
 
     pub fn metrics_snapshot(&self) -> SessionMetrics {
-        self.inner
+        let mut metrics = self
+            .inner
             .metrics
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .clone();
+        metrics.pending_calls = *self
+            .inner
+            .admission
+            .outstanding
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) as u64;
+        metrics.pending_call_capacity = self.inner.admission.capacity as u64;
+        metrics.pending_peak_calls = self.inner.admission.peak.load(Ordering::Relaxed);
+        metrics.pending_admission_wait_ns = self.inner.admission.wait_ns.load(Ordering::Relaxed);
+        if let Some(budget) = &self.inner.transient {
+            let (capacity, used, peak, wait) = budget.snapshot();
+            metrics.transient_buffer_capacity_bytes = capacity as u64;
+            metrics.transient_buffer_reserved_bytes = used as u64;
+            metrics.transient_buffer_peak_bytes = peak as u64;
+            metrics.transient_buffer_wait_ns = wait;
+        }
+        metrics
     }
 
     #[cfg(feature = "experiment-controls")]
@@ -1010,6 +1198,11 @@ impl VClaspSession {
         action: HierarchicalAction,
     ) -> BatchResult {
         let (response, receiver) = mpsc::sync_channel(1);
+        let permit = self.inner.admission.acquire();
+        let response = AdmittedSender {
+            sender: response,
+            _permit: Some(permit),
+        };
         self.inner
             .sender
             .send(Command::ExecuteForced {
@@ -1025,13 +1218,16 @@ impl VClaspSession {
 }
 
 fn read_chunk_metadata(reader: &mut ChunkReader) -> Result<ChunkMetadata, String> {
-    let catalog = HierarchicalCatalog::from_parquet(&reader.mmap[reader.layout.index_start..])
-        .map_err(|error| error.to_string())?;
+    let catalog = reader.catalog()?;
     let codec_config = reader.read_sps_pps().map_err(|error| error.to_string())?;
     Ok(ChunkMetadata {
         catalog,
         codec_config,
         payload_start: reader.layout.payload_start,
+        rgb_frame_bytes: usize::from(reader.header.codec_config.width)
+            .checked_mul(usize::from(reader.header.codec_config.height))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or("RGB frame size overflow")?,
     })
 }
 
@@ -1072,11 +1268,11 @@ fn elapsed_ns(started: Instant) -> u64 {
 enum SessionSubmission {
     Batch {
         targets: Vec<Target>,
-        response: SyncSender<BatchResult>,
+        response: AdmittedSender<BatchResult>,
     },
     Window {
         batches: Vec<Vec<Target>>,
-        response: SyncSender<WindowResult>,
+        response: AdmittedSender<WindowResult>,
     },
 }
 
@@ -1246,8 +1442,11 @@ fn collect_admission_cohort(
     deferred: &mut VecDeque<Command>,
 ) -> Vec<SessionSubmission> {
     let mut submissions = vec![first_submission];
+    let collection_started = Instant::now();
     while submissions.len() < max_callers {
-        match receiver.recv_timeout(admission_quiet) {
+        // One budget for the cohort, not a fresh delay for each arriving caller.
+        let remaining = admission_quiet.saturating_sub(collection_started.elapsed());
+        match receiver.recv_timeout(remaining) {
             Ok(Command::Execute { targets, response }) => {
                 submissions.push(SessionSubmission::Batch { targets, response });
             }
@@ -1306,7 +1505,7 @@ enum LaneCommand {
     Forced {
         targets: Vec<Target>,
         action: HierarchicalAction,
-        response: SyncSender<BatchResult>,
+        response: AdmittedSender<BatchResult>,
     },
     Barrier {
         response: SyncSender<()>,
@@ -1554,6 +1753,60 @@ fn attribute_joint_stats(global: &ExecutionStats, logical_counts: &[usize]) -> V
 #[cfg(test)]
 mod tests {
     #[test]
+    fn admission_permit_survives_consumer_cancellation_until_execution_finishes() {
+        let budget = std::sync::Arc::new(super::AdmissionBudget {
+            capacity: 1,
+            outstanding: std::sync::Mutex::new(0),
+            changed: std::sync::Condvar::new(),
+            peak: std::sync::atomic::AtomicU64::new(0),
+            wait_ns: std::sync::atomic::AtomicU64::new(0),
+        });
+        let consumer = budget.acquire();
+        let executing = std::sync::Arc::clone(&consumer);
+        let waiter_budget = std::sync::Arc::clone(&budget);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _permit = waiter_budget.acquire();
+            sender.send(()).unwrap();
+        });
+        drop(consumer);
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(20))
+            .is_err());
+        drop(executing);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        waiter.join().unwrap();
+        assert_eq!(*budget.outstanding.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn completed_but_unconsumed_response_still_holds_admission() {
+        let budget = std::sync::Arc::new(super::AdmissionBudget {
+            capacity: 1,
+            outstanding: std::sync::Mutex::new(0),
+            changed: std::sync::Condvar::new(),
+            peak: std::sync::atomic::AtomicU64::new(0),
+            wait_ns: std::sync::atomic::AtomicU64::new(0),
+        });
+        let permit = budget.acquire();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let pending = super::PendingBatch {
+            receiver,
+            _permit: Some(std::sync::Arc::clone(&permit)),
+        };
+        let response = super::AdmittedSender {
+            sender,
+            _permit: Some(permit),
+        };
+        response.send(Err("completed".into())).unwrap();
+        drop(response);
+        assert_eq!(*budget.outstanding.lock().unwrap(), 1);
+        assert!(pending.wait().is_err());
+        assert_eq!(*budget.outstanding.lock().unwrap(), 0);
+    }
+    #[test]
     fn session_counts_observed_window_paths_without_inference_from_hits() {
         let mut metrics = super::SessionMetrics::default();
         for mode in [
@@ -1666,6 +1919,34 @@ mod tests {
     }
 
     #[test]
+    fn zero_collection_budget_drains_ready_requests_without_waiting_for_capacity() {
+        let (sender, receiver) = mpsc::channel();
+        for _ in 0..2 {
+            let (response, _) = mpsc::sync_channel(1);
+            sender
+                .send(Command::Execute {
+                    targets: Vec::new(),
+                    response: response.into(),
+                })
+                .unwrap();
+        }
+        let (response, _) = mpsc::sync_channel(1);
+        let mut deferred = std::collections::VecDeque::new();
+        let submissions = collect_admission_cohort(
+            SessionSubmission::Batch {
+                targets: Vec::new(),
+                response: response.into(),
+            },
+            &receiver,
+            8,
+            Duration::ZERO,
+            &mut deferred,
+        );
+        assert_eq!(submissions.len(), 3);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
     fn admission_cohort_does_not_cross_a_barrier() {
         let (sender, receiver) = mpsc::channel();
         let (response, _) = mpsc::sync_channel(1);
@@ -1674,7 +1955,7 @@ mod tests {
         sender
             .send(Command::Execute {
                 targets: Vec::new(),
-                response,
+                response: response.into(),
             })
             .unwrap();
         let (response, _) = mpsc::sync_channel(1);
@@ -1682,7 +1963,7 @@ mod tests {
         let submissions = collect_admission_cohort(
             SessionSubmission::Batch {
                 targets: Vec::new(),
-                response,
+                response: response.into(),
             },
             &receiver,
             8,
@@ -1813,7 +2094,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((targets[0].sample_id, response));
-            Ok(PendingBatch { receiver })
+            Ok(PendingBatch {
+                receiver,
+                _permit: None,
+            })
         }
     }
 
@@ -1921,7 +2205,7 @@ mod tests {
                 vec![target(1, "video-a"), target(2, "video-a")],
                 vec![target(3, "video-a")],
             ],
-            response,
+            response: response.into(),
         }];
         assert_eq!(common_stream_key(&submissions).as_deref(), Some("video-a"));
         assert_eq!(
@@ -1935,7 +2219,7 @@ mod tests {
         let (response, _) = mpsc::sync_channel(1);
         let submissions = vec![SessionSubmission::Batch {
             targets: vec![target(1, "video-a"), target(2, "video-b")],
-            response,
+            response: response.into(),
         }];
         assert_eq!(common_stream_key(&submissions), None);
     }
@@ -1981,11 +2265,11 @@ mod tests {
         let submissions = vec![
             SessionSubmission::Batch {
                 targets: Vec::new(),
-                response: batch_response,
+                response: batch_response.into(),
             },
             SessionSubmission::Window {
                 batches: vec![Vec::new(), Vec::new()],
-                response: window_response,
+                response: window_response.into(),
             },
         ];
         let stats = ExecutionStats {
@@ -2038,11 +2322,11 @@ mod tests {
         let submissions = vec![
             SessionSubmission::Batch {
                 targets: Vec::new(),
-                response: owner_response,
+                response: owner_response.into(),
             },
             SessionSubmission::Batch {
                 targets: Vec::new(),
-                response: early_response,
+                response: early_response.into(),
             },
         ];
 

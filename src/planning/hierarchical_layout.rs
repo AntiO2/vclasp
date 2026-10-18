@@ -23,7 +23,7 @@ pub struct TargetClosure {
     /// Sufficient records in decoder submission order. These IDs must come
     /// from encoder or bitstream ground truth; this module never infers codec
     /// dependencies from frame positions.
-    pub record_ids: Vec<u64>,
+    pub record_ids: std::sync::Arc<[u64]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,16 +54,16 @@ pub enum RegionDecodeMode {
 #[derive(Debug, Clone)]
 pub struct HierarchicalCostModel {
     pub request_latency_ns: f64,
+    /// Aggregate transfer bandwidth shared by concurrent reads, not per-GET bandwidth.
     pub bandwidth_bytes_per_ns: f64,
     pub io_concurrency: usize,
     /// Optional calibrated fixed overhead for a wave containing 1..N Range
     /// GETs. Values exclude transfer time and must be monotone. An empty
-    /// vector retains the legacy max-per-range screening model.
+    /// vector uses one fixed startup cost per request wave.
     pub wave_request_overhead_ns: Vec<f64>,
     /// Outcome-free uncertainty band for plan selection. Candidates inside
-    /// the band are tie-broken by request count, fetched bytes, and decode
-    /// work. This is robust to latency-model noise and also lowers object-store
-    /// request cost without consulting evaluation outcomes.
+    /// the band prefer fewer fetched bytes, then less decode work and fewer
+    /// requests. Extra transfer requires a predicted gain outside the band.
     pub selection_tolerance_ns: f64,
     pub decode_fixed_ns: f64,
     pub decode_access_unit_ns: f64,
@@ -126,19 +126,11 @@ impl HierarchicalCostModel {
                 })
                 .sum();
         }
-        let mut service = ranges
-            .iter()
-            .map(|range| {
-                self.request_latency_ns + range.length as f64 / self.bandwidth_bytes_per_ns
-            })
-            .collect::<Vec<_>>();
-        // This is a screening model, not a queueing model. Longest operations
-        // are grouped together to avoid making the estimate depend on hash order.
-        service.sort_by(|left, right| right.total_cmp(left));
-        service
-            .chunks(self.io_concurrency)
-            .map(|wave| wave.iter().copied().fold(0.0, f64::max))
-            .sum()
+        // Concurrent GETs share the transfer budget. Charging only the largest
+        // range underestimates bytes and invents bandwidth as concurrency grows.
+        let waves = ranges.len().div_ceil(self.io_concurrency);
+        let bytes = ranges.iter().map(|range| range.length as f64).sum::<f64>();
+        waves as f64 * self.request_latency_ns + bytes / self.bandwidth_bytes_per_ns
     }
 
     fn empirical_io_ns(&self, range_count: usize, fetched_bytes: u64) -> f64 {
@@ -366,14 +358,12 @@ impl HierarchicalLayoutIndex {
             .iter()
             .copied()
             .filter(|candidate| candidate.4 <= minimum + model.selection_tolerance_ns)
-            // Selection tolerance may trade a small predicted latency increase
-            // for fewer requests, but it must never make the calibrated choice
-            // worse than the registered Fixed 16 KiB reference in model space.
+            // Remain no worse than the Fixed 16 KiB reference in model space.
             .filter(|candidate| candidate.4 <= fixed.4)
             .min_by(|left, right| {
-                left.1
-                    .cmp(&right.1)
-                    .then_with(|| left.2.cmp(&right.2))
+                left.2
+                    .cmp(&right.2)
+                    .then_with(|| left.1.cmp(&right.1))
                     .then_with(|| left.4.total_cmp(&right.4))
             })
             .expect("empirical sparse planner has candidates");
@@ -496,7 +486,7 @@ impl HierarchicalLayoutIndex {
                 return Err(format!("closure {} has no GOP region", closure.sample_id));
             }
             let mut previous_decode_ordinal = None;
-            for record_id in &closure.record_ids {
+            for record_id in closure.record_ids.iter() {
                 let record = records_by_id.get(record_id).ok_or_else(|| {
                     format!(
                         "closure {} references unknown record {record_id}",
@@ -616,7 +606,7 @@ impl HierarchicalLayoutIndex {
         let mut sparse_ids = HashSet::new();
         let mut sparse_records = Vec::new();
         for closure in &closures {
-            for record_id in &closure.record_ids {
+            for record_id in closure.record_ids.iter() {
                 if sparse_ids.insert(*record_id) && !resident_record_ids.contains(record_id) {
                     let record = &self.records[record_id];
                     sparse_records.push(RecordRange {
@@ -669,7 +659,7 @@ impl HierarchicalLayoutIndex {
                     break;
                 }
                 let ranges =
-                    planner::plan_byte_ranges(&sparse_records, threshold, max_range_bytes)?;
+                    planner::plan_ordered_byte_ranges(&ordered_sparse, threshold, max_range_bytes)?;
                 let signature = ranges
                     .iter()
                     .map(|range| (range.offset, range.length))
@@ -695,8 +685,11 @@ impl HierarchicalLayoutIndex {
             let fixed_threshold = max_merge_gap_bytes
                 .map(|maximum| maximum.min(FIXED_GAP_REFERENCE_BYTES))
                 .unwrap_or(FIXED_GAP_REFERENCE_BYTES);
-            let fixed_ranges =
-                planner::plan_byte_ranges(&sparse_records, Some(fixed_threshold), max_range_bytes)?;
+            let fixed_ranges = planner::plan_ordered_byte_ranges(
+                &ordered_sparse,
+                Some(fixed_threshold),
+                max_range_bytes,
+            )?;
             // Preserve an explicitly labelled Fixed 16 KiB reference even
             // when another enumerated threshold has the same physical ranges.
             alternatives.push(model.estimate(HierarchicalPlanCandidate {
@@ -767,14 +760,13 @@ impl HierarchicalLayoutIndex {
             })
             .filter(|candidate| candidate.total_ns <= fixed_total_ns)
             .min_by(|left, right| {
-                left.ranges
-                    .len()
-                    .cmp(&right.ranges.len())
-                    .then_with(|| left.fetched_bytes.cmp(&right.fetched_bytes))
+                left.fetched_bytes
+                    .cmp(&right.fetched_bytes)
                     .then_with(|| {
                         left.access_units_submitted
                             .cmp(&right.access_units_submitted)
                     })
+                    .then_with(|| left.ranges.len().cmp(&right.ranges.len()))
                     .then_with(|| left.total_ns.total_cmp(&right.total_ns))
             })
             .expect("hierarchical planner always has an alternative")
@@ -1057,14 +1049,14 @@ mod tests {
                 video_id: 1,
                 gop_id: 0,
                 target_record_id: 3,
-                record_ids: vec![0, 2, 3],
+                record_ids: vec![0, 2, 3].into(),
             },
             TargetClosure {
                 sample_id: 11,
                 video_id: 1,
                 gop_id: 0,
                 target_record_id: 7,
-                record_ids: vec![0, 4, 6, 7],
+                record_ids: vec![0, 4, 6, 7].into(),
             },
         ];
         let regions = vec![GopRegion {
@@ -1218,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn uncertainty_band_prefers_fewer_object_store_requests() {
+    fn uncertainty_band_does_not_buy_fewer_requests_with_extra_bytes() {
         let model = HierarchicalCostModel {
             request_latency_ns: 0.0,
             bandwidth_bytes_per_ns: 1.0,
@@ -1232,8 +1224,65 @@ mod tests {
             fetch_decode_overlap: 0.0,
         };
         let decision = index().choose_plan(&[10], None, None, &model).unwrap();
-        assert_eq!(decision.selected.ranges.len(), 2);
-        assert_eq!(decision.selected.fetched_bytes, 6 * 1024);
+        assert_eq!(decision.selected.ranges.len(), 3);
+        assert_eq!(decision.selected.fetched_bytes, 3 * 1024);
+    }
+
+    #[test]
+    fn bootstrap_parallel_reads_share_one_bandwidth_budget() {
+        let model = HierarchicalCostModel {
+            request_latency_ns: 100.0,
+            bandwidth_bytes_per_ns: 2.0,
+            io_concurrency: 4,
+            wave_request_overhead_ns: Vec::new(),
+            selection_tolerance_ns: 0.0,
+            decode_fixed_ns: 0.0,
+            decode_access_unit_ns: 0.0,
+            fetch_decode_overlap: 0.0,
+        };
+        let ranges = vec![
+            RangePlan {
+                offset: 0,
+                length: 20,
+                records: Vec::new()
+            };
+            4
+        ];
+        assert_eq!(model.io_ns(&ranges), 140.0);
+        assert_eq!(model.io_ns(&ranges[..1]), 110.0);
+        assert_eq!(model.io_ns(&[]), 0.0);
+        let mut two_waves = ranges;
+        two_waves.push(RangePlan {
+            offset: 100,
+            length: 20,
+            records: Vec::new(),
+        });
+        assert_eq!(model.io_ns(&two_waves), 250.0);
+    }
+
+    #[test]
+    fn uncertain_selection_is_byte_conservative_in_both_candidate_paths() {
+        for calibrated in [false, true] {
+            for max_range in [None, Some(4 * 1024)] {
+                let model = HierarchicalCostModel {
+                    request_latency_ns: 10_000.0,
+                    bandwidth_bytes_per_ns: 1.0,
+                    io_concurrency: 8,
+                    wave_request_overhead_ns: if calibrated {
+                        vec![10_000.0; 8]
+                    } else {
+                        Vec::new()
+                    },
+                    selection_tolerance_ns: 1_000_000.0,
+                    decode_fixed_ns: 0.0,
+                    decode_access_unit_ns: 0.0,
+                    fetch_decode_overlap: 0.0,
+                };
+                let decision = index().choose_plan(&[10], None, max_range, &model).unwrap();
+                assert_eq!(decision.selected.fetched_bytes, 3 * 1024);
+                assert_eq!(decision.selected.access_units_submitted, 3);
+            }
+        }
     }
 
     #[test]
@@ -1326,7 +1375,7 @@ mod tests {
                 video_id: 1,
                 gop_id: 0,
                 target_record_id: 0,
-                record_ids: vec![0, 1],
+                record_ids: vec![0, 1].into(),
             }],
             vec![GopRegion {
                 video_id: 1,

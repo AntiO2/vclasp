@@ -11,6 +11,58 @@ use std::ptr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+#[path = "profile.rs"]
+pub mod profile;
+use profile::{Stage, StageScope};
+
+trait ObservedDecoder {
+    fn send_packet_profiled(&mut self, packet: &ffmpeg::Packet) -> Result<(), ffmpeg::Error>;
+    fn receive_frame_profiled(
+        &mut self,
+        frame: &mut ffmpeg::util::frame::video::Video,
+    ) -> Result<(), ffmpeg::Error>;
+    fn flush_profiled(&mut self);
+    fn send_eof_profiled(&mut self) -> Result<(), ffmpeg::Error>;
+}
+
+impl ObservedDecoder for ffmpeg::codec::decoder::Video {
+    fn send_packet_profiled(&mut self, packet: &ffmpeg::Packet) -> Result<(), ffmpeg::Error> {
+        let _stage = StageScope::new(Stage::CodecSend, 0);
+        let result = self.send_packet(packet);
+        if result.is_ok() {
+            profile::accepted_packet();
+        }
+        result
+    }
+
+    fn receive_frame_profiled(
+        &mut self,
+        frame: &mut ffmpeg::util::frame::video::Video,
+    ) -> Result<(), ffmpeg::Error> {
+        let _stage = StageScope::new(Stage::CodecReceive, 0);
+        let result = self.receive_frame(frame);
+        if result.is_ok() {
+            profile::received_frame();
+        }
+        result
+    }
+
+    fn flush_profiled(&mut self) {
+        let _stage = StageScope::new(Stage::CodecFlush, 0);
+        self.flush();
+    }
+
+    fn send_eof_profiled(&mut self) -> Result<(), ffmpeg::Error> {
+        let _stage = StageScope::new(Stage::CodecSend, 0);
+        self.send_eof()
+    }
+}
+
+fn profiled_packet_copy(data: &[u8]) -> ffmpeg::Packet {
+    let _stage = StageScope::new(Stage::PacketCopy, data.len());
+    ffmpeg::Packet::copy(data)
+}
+
 /// Configuration for the FFmpeg decoder.
 ///
 /// `num_threads` controls how many threads FFmpeg uses for H.264 decoding.
@@ -87,6 +139,7 @@ impl DecoderPool {
         &mut self,
         sps_pps: &[u8],
     ) -> Result<&mut ffmpeg::codec::decoder::Video, Box<dyn std::error::Error>> {
+        let setup = StageScope::new(Stage::DecoderSetup, 0);
         let key = hash_sps_pps(sps_pps);
         if !self.decoders.contains_key(&key) {
             while self.decoders.len() >= self.capacity {
@@ -98,7 +151,9 @@ impl DecoderPool {
         }
         self.touch(key);
         let decoder = self.decoders.get_mut(&key).unwrap();
-        decoder.flush();
+        drop(setup);
+        decoder.flush_profiled();
+        profile::set_context_address(unsafe { decoder.as_ptr() } as u64);
         Ok(decoder)
     }
 }
@@ -222,7 +277,9 @@ fn create_decoder(
         kind: ffmpeg::codec::threading::Type::Frame,
         count: config.num_threads,
     });
-    Ok(ctx.decoder().open_as(codec)?.video()?)
+    let decoder = ctx.decoder().open_as(codec)?.video()?;
+    profile::decoder_opened();
+    Ok(decoder)
 }
 
 #[derive(Clone)]
@@ -395,10 +452,10 @@ pub fn decode_mp4_selected_rgb24(
         if packet_stream.index() != stream_index {
             continue;
         }
-        decoder.send_packet(&packet)?;
+        decoder.send_packet_profiled(&packet)?;
         loop {
             let mut decoded = ffmpeg::util::frame::video::Video::empty();
-            if decoder.receive_frame(&mut decoded).is_err() {
+            if decoder.receive_frame_profiled(&mut decoded).is_err() {
                 break;
             }
             store_selected(
@@ -415,10 +472,10 @@ pub fn decode_mp4_selected_rgb24(
         }
     }
     if selected.len() != requested.len() {
-        decoder.send_eof()?;
+        decoder.send_eof_profiled()?;
         loop {
             let mut decoded = ffmpeg::util::frame::video::Video::empty();
-            if decoder.receive_frame(&mut decoded).is_err() {
+            if decoder.receive_frame_profiled(&mut decoded).is_err() {
                 break;
             }
             store_selected(
@@ -501,7 +558,7 @@ impl PrefixCursor {
     fn drain(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let mut frame = ffmpeg::util::frame::video::Video::empty();
-            if self.decoder.receive_frame(&mut frame).is_err() {
+            if self.decoder.receive_frame_profiled(&mut frame).is_err() {
                 break;
             }
             let mut converted = Vec::with_capacity(1);
@@ -559,15 +616,15 @@ impl PrefixCursor {
                 } else {
                     access_units[index].clone()
                 };
-                let packet = ffmpeg::Packet::copy(&packet_data);
+                let packet = profiled_packet_copy(&packet_data);
                 loop {
-                    match self.decoder.send_packet(&packet) {
+                    match self.decoder.send_packet_profiled(&packet) {
                         Ok(()) => break,
                         Err(_) => {
                             let before = self.next_output;
                             self.drain()?;
                             if self.next_output == before {
-                                self.decoder.send_packet(&packet)?;
+                                self.decoder.send_packet_profiled(&packet)?;
                                 break;
                             }
                         }
@@ -576,7 +633,7 @@ impl PrefixCursor {
                 self.next_packet += 1;
                 self.drain()?;
             } else if !self.ended {
-                self.decoder.send_eof()?;
+                self.decoder.send_eof_profiled()?;
                 self.ended = true;
                 self.drain()?;
             } else {
@@ -618,9 +675,9 @@ impl PrefixCursor {
 ///
 /// Unlike `PrefixCursor`, this cursor does not retain the encoded GOP. The
 /// caller appends newly fetched access units in decode order and may release
-/// those bytes immediately after this call. Frames emitted ahead of their
-/// request remain pending only for this live GOP cursor; they are not admitted
-/// to the shared decoded-frame cache.
+/// those bytes immediately after this call. Only outputs requested by the
+/// current extension are converted to RGB. Codec references remain in the DPB;
+/// an already emitted, unrequested output requires replay if requested later.
 pub struct MonotonicGopCursor {
     decoder: ffmpeg::codec::decoder::Video,
     decoder_threads: usize,
@@ -633,6 +690,7 @@ pub struct MonotonicGopCursor {
 
 impl MonotonicGopCursor {
     pub fn new(config: DecoderConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let _setup = StageScope::new(Stage::DecoderSetup, 0);
         ffmpeg::init()?;
         Ok(Self {
             decoder: create_decoder(&config)?,
@@ -664,14 +722,20 @@ impl MonotonicGopCursor {
         })
     }
 
-    fn drain_requested(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn drain_requested(
+        &mut self,
+        requested: &std::collections::HashSet<usize>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let mut frame = ffmpeg::util::frame::video::Video::empty();
-            if self.decoder.receive_frame(&mut frame).is_err() {
+            if self.decoder.receive_frame_profiled(&mut frame).is_err() {
                 break;
             }
             let output_ordinal = self.next_output_ordinal;
             self.next_output_ordinal += 1;
+            if !requested.contains(&output_ordinal) {
+                continue;
+            }
             let mut converted = Vec::with_capacity(1);
             let mut scaler = self.scaler.take().map(|scaler| scaler.0);
             let result = store_one(&mut scaler, &frame, &mut converted);
@@ -695,6 +759,7 @@ impl MonotonicGopCursor {
         target_output_ordinals: &[usize],
         end_of_stream: bool,
     ) -> Result<Vec<DecodedRgbFrame>, Box<dyn std::error::Error>> {
+        profile::set_context_address(unsafe { self.decoder.as_ptr() } as u64);
         if self.ended
             && target_output_ordinals
                 .iter()
@@ -712,6 +777,12 @@ impl MonotonicGopCursor {
         if !self.can_serve(target_output_ordinals) {
             return Err("monotonic GOP cursor cannot serve a backward target".into());
         }
+        let requested = target_output_ordinals
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        self.pending
+            .retain(|ordinal, _| requested.contains(ordinal));
         for access_unit in access_units {
             let packet_data = if self.next_decode_ordinal == 0 {
                 let mut data = Vec::with_capacity(sps_pps.len() + access_unit.len());
@@ -721,15 +792,15 @@ impl MonotonicGopCursor {
             } else {
                 access_unit.clone()
             };
-            let packet = ffmpeg::Packet::copy(&packet_data);
+            let packet = profiled_packet_copy(&packet_data);
             loop {
-                match self.decoder.send_packet(&packet) {
+                match self.decoder.send_packet_profiled(&packet) {
                     Ok(()) => break,
                     Err(_) => {
                         let before = self.next_output_ordinal;
-                        self.drain_requested()?;
+                        self.drain_requested(&requested)?;
                         if self.next_output_ordinal == before {
-                            self.decoder.send_packet(&packet)?;
+                            self.decoder.send_packet_profiled(&packet)?;
                             break;
                         }
                     }
@@ -741,22 +812,32 @@ impl MonotonicGopCursor {
         // overlap reference-frame work. Draining after every successful send
         // serializes the decoder and defeats num_threads > 1; EAGAIN handling
         // above still provides backpressure when the packet queue is full.
-        self.drain_requested()?;
+        self.drain_requested(&requested)?;
 
         if target_output_ordinals
             .iter()
             .any(|ordinal| !self.pending.contains_key(ordinal))
             && end_of_stream
         {
-            self.decoder.send_eof()?;
+            self.decoder.send_eof_profiled()?;
             self.ended = true;
-            self.drain_requested()?;
+            self.drain_requested(&requested)?;
         }
 
+        let mut consumers = target_output_ordinals.iter().fold(
+            std::collections::HashMap::<usize, usize>::new(),
+            |mut counts, ordinal| {
+                *counts.entry(*ordinal).or_default() += 1;
+                counts
+            },
+        );
         target_output_ordinals
             .iter()
             .map(|ordinal| {
-                self.pending.remove(ordinal).ok_or_else(|| {
+                let remaining = consumers.get_mut(ordinal).expect("target counted");
+                *remaining -= 1;
+                let frame = if *remaining == 0 { self.pending.remove(ordinal) } else { self.pending.get(ordinal).cloned() };
+                frame.ok_or_else(|| {
                     format!(
                         "GOP extension ended before requested output ordinal {ordinal}; next decode/output ordinals are {}/{}",
                         self.next_decode_ordinal, self.next_output_ordinal
@@ -800,12 +881,12 @@ pub fn decode_h264_annex_b_rgb24(
 
     let decoder = pool.get_or_create(sps_pps)?;
 
-    let packet = ffmpeg::Packet::copy(data);
-    decoder.send_packet(&packet)?;
-    decoder.send_eof()?;
+    let packet = profiled_packet_copy(data);
+    decoder.send_packet_profiled(&packet)?;
+    decoder.send_eof_profiled()?;
 
     let mut decoded = ffmpeg::util::frame::video::Video::empty();
-    decoder.receive_frame(&mut decoded)?;
+    decoder.receive_frame_profiled(&mut decoded)?;
 
     let mut scaler = ffmpeg::software::scaling::context::Context::get(
         decoded.format(),
@@ -839,12 +920,12 @@ pub fn decode_h264_annex_b_rgb24_batch(
         let mut data = Vec::from(sps_pps);
         data.extend_from_slice(record);
 
-        let packet = ffmpeg::Packet::copy(&data);
-        decoder.send_packet(&packet)?;
-        decoder.send_eof()?;
+        let packet = profiled_packet_copy(&data);
+        decoder.send_packet_profiled(&packet)?;
+        decoder.send_eof_profiled()?;
 
         let mut decoded = ffmpeg::util::frame::video::Video::empty();
-        decoder.receive_frame(&mut decoded)?;
+        decoder.receive_frame_profiled(&mut decoded)?;
 
         let scaler = scaler.get_or_insert_with(|| {
             ffmpeg::software::scaling::context::Context::get(
@@ -905,18 +986,18 @@ pub fn decode_gop_rgb24(
     let mut frames: Vec<DecodedRgbFrame> = Vec::new();
 
     for pkt_data in &packets {
-        let pkt = ffmpeg::Packet::copy(pkt_data);
+        let pkt = profiled_packet_copy(pkt_data);
         // Send packet — if decoder is full (EAGAIN), drain a frame and retry
         loop {
-            match decoder.send_packet(&pkt) {
+            match decoder.send_packet_profiled(&pkt) {
                 Ok(()) => break,
                 Err(_) => {
                     let mut f = ffmpeg::util::frame::video::Video::empty();
-                    if decoder.receive_frame(&mut f).is_ok() {
+                    if decoder.receive_frame_profiled(&mut f).is_ok() {
                         store_one(&mut scaler, &f, &mut frames)?;
                     } else {
                         // Real error—propagate by retrying (will produce meaningful error)
-                        decoder.send_packet(&pkt)?;
+                        decoder.send_packet_profiled(&pkt)?;
                     }
                 }
             }
@@ -924,9 +1005,9 @@ pub fn decode_gop_rgb24(
     }
 
     // Flush remaining buffered frames
-    decoder.send_eof()?;
+    decoder.send_eof_profiled()?;
     let mut f = ffmpeg::util::frame::video::Video::empty();
-    while decoder.receive_frame(&mut f).is_ok() {
+    while decoder.receive_frame_profiled(&mut f).is_ok() {
         store_one(&mut scaler, &f, &mut frames)?;
         f = ffmpeg::util::frame::video::Video::empty();
     }
@@ -973,30 +1054,30 @@ pub fn decode_gop_rgb24_batch(
             .collect();
 
         for pkt_data in &packets {
-            let pkt = ffmpeg::Packet::copy(pkt_data);
+            let pkt = profiled_packet_copy(pkt_data);
             loop {
-                match decoder.send_packet(&pkt) {
+                match decoder.send_packet_profiled(&pkt) {
                     Ok(()) => break,
                     Err(_) => {
                         let mut f = ffmpeg::util::frame::video::Video::empty();
-                        if decoder.receive_frame(&mut f).is_ok() {
+                        if decoder.receive_frame_profiled(&mut f).is_ok() {
                             store_one(&mut scaler, &f, &mut frames)?;
                         } else {
-                            decoder.send_packet(&pkt)?;
+                            decoder.send_packet_profiled(&pkt)?;
                         }
                     }
                 }
             }
         }
 
-        decoder.send_eof()?;
+        decoder.send_eof_profiled()?;
         let mut f = ffmpeg::util::frame::video::Video::empty();
-        while decoder.receive_frame(&mut f).is_ok() {
+        while decoder.receive_frame_profiled(&mut f).is_ok() {
             store_one(&mut scaler, &f, &mut frames)?;
             f = ffmpeg::util::frame::video::Video::empty();
         }
 
-        decoder.flush();
+        decoder.flush_profiled();
     }
 
     if frames.is_empty() {
@@ -1036,17 +1117,17 @@ pub fn decode_gop_targets_rgb24_batch(
             } else {
                 access_unit.clone()
             };
-            let packet = ffmpeg::Packet::copy(&packet_data);
+            let packet = profiled_packet_copy(&packet_data);
             loop {
-                match decoder.send_packet(&packet) {
+                match decoder.send_packet_profiled(&packet) {
                     Ok(()) => break,
                     Err(_) => {
                         let mut frame = ffmpeg::util::frame::video::Video::empty();
-                        if decoder.receive_frame(&mut frame).is_ok() {
+                        if decoder.receive_frame_profiled(&mut frame).is_ok() {
                             decoded_count += 1;
                             last_frame = Some(frame);
                         } else {
-                            decoder.send_packet(&packet)?;
+                            decoder.send_packet_profiled(&packet)?;
                             break;
                         }
                     }
@@ -1054,10 +1135,10 @@ pub fn decode_gop_targets_rgb24_batch(
             }
         }
 
-        decoder.send_eof()?;
+        decoder.send_eof_profiled()?;
         loop {
             let mut frame = ffmpeg::util::frame::video::Video::empty();
-            if decoder.receive_frame(&mut frame).is_err() {
+            if decoder.receive_frame_profiled(&mut frame).is_err() {
                 break;
             }
             decoded_count += 1;
@@ -1072,7 +1153,7 @@ pub fn decode_gop_targets_rgb24_batch(
         }
         let target = last_frame.ok_or("closed record decoded no target frame")?;
         store_one(&mut scaler, &target, &mut targets)?;
-        decoder.flush();
+        decoder.flush_profiled();
     }
     Ok(targets)
 }
@@ -1108,6 +1189,23 @@ fn decode_gop_selected_rgb24_impl(
     ordinals: &[usize],
     require_truncated_prefix: bool,
 ) -> Result<Vec<DecodedRgbFrame>, Box<dyn std::error::Error>> {
+    let access_units = split_annex_b_access_units(record);
+    decode_access_units_selected_rgb24(
+        sps_pps,
+        &access_units,
+        pool,
+        ordinals,
+        require_truncated_prefix,
+    )
+}
+
+pub(crate) fn decode_access_units_selected_rgb24<B: AsRef<[u8]>>(
+    sps_pps: &[u8],
+    access_units: &[B],
+    pool: &mut DecoderPool,
+    ordinals: &[usize],
+    require_truncated_prefix: bool,
+) -> Result<Vec<DecodedRgbFrame>, Box<dyn std::error::Error>> {
     if ordinals.is_empty() {
         return Ok(Vec::new());
     }
@@ -1119,27 +1217,29 @@ fn decode_gop_selected_rgb24_impl(
 
     ffmpeg::init()?;
     let decoder = pool.get_or_create(sps_pps)?;
-    let access_units = split_annex_b_access_units(record);
     let mut scaler: Option<ffmpeg::software::scaling::context::Context> = None;
     let mut selected = HashMap::<usize, DecodedRgbFrame>::new();
     let mut decoded_count = 0usize;
 
     for (index, access_unit) in access_units.iter().enumerate() {
+        let access_unit = access_unit.as_ref();
+        let first_packet;
         let packet_data = if index == 0 {
             let mut data = Vec::with_capacity(sps_pps.len() + access_unit.len());
             data.extend_from_slice(sps_pps);
             data.extend_from_slice(access_unit);
-            data
+            first_packet = data;
+            first_packet.as_slice()
         } else {
-            access_unit.clone()
+            access_unit
         };
-        let packet = ffmpeg::Packet::copy(&packet_data);
+        let packet = profiled_packet_copy(packet_data);
         loop {
-            match decoder.send_packet(&packet) {
+            match decoder.send_packet_profiled(&packet) {
                 Ok(()) => break,
                 Err(_) => {
                     let mut frame = ffmpeg::util::frame::video::Video::empty();
-                    if decoder.receive_frame(&mut frame).is_ok() {
+                    if decoder.receive_frame_profiled(&mut frame).is_ok() {
                         store_selected(
                             &mut scaler,
                             &frame,
@@ -1149,7 +1249,7 @@ fn decode_gop_selected_rgb24_impl(
                         )?;
                         decoded_count += 1;
                     } else {
-                        decoder.send_packet(&packet)?;
+                        decoder.send_packet_profiled(&packet)?;
                         break;
                     }
                 }
@@ -1157,10 +1257,10 @@ fn decode_gop_selected_rgb24_impl(
         }
     }
 
-    decoder.send_eof()?;
+    decoder.send_eof_profiled()?;
     loop {
         let mut frame = ffmpeg::util::frame::video::Video::empty();
-        if decoder.receive_frame(&mut frame).is_err() {
+        if decoder.receive_frame_profiled(&mut frame).is_err() {
             break;
         }
         store_selected(
@@ -1172,7 +1272,7 @@ fn decode_gop_selected_rgb24_impl(
         )?;
         decoded_count += 1;
     }
-    decoder.flush();
+    decoder.flush_profiled();
 
     if require_truncated_prefix && decoded_count != max_ordinal + 1 {
         return Err(format!(
@@ -1260,16 +1360,16 @@ pub fn decode_mixed_closed_targets_continuous_rgb24(
             } else {
                 access_unit.clone()
             };
-            let packet = ffmpeg::Packet::copy(&packet_data);
+            let packet = profiled_packet_copy(&packet_data);
             loop {
-                match decoder.send_packet(&packet) {
+                match decoder.send_packet_profiled(&packet) {
                     Ok(()) => break,
                     Err(_) => {
                         let mut frame = ffmpeg::util::frame::video::Video::empty();
-                        if decoder.receive_frame(&mut frame).is_ok() {
+                        if decoder.receive_frame_profiled(&mut frame).is_ok() {
                             record_frames.push(frame);
                         } else {
-                            decoder.send_packet(&packet)?;
+                            decoder.send_packet_profiled(&packet)?;
                             break;
                         }
                     }
@@ -1277,7 +1377,7 @@ pub fn decode_mixed_closed_targets_continuous_rgb24(
             }
             loop {
                 let mut frame = ffmpeg::util::frame::video::Video::empty();
-                if decoder.receive_frame(&mut frame).is_err() {
+                if decoder.receive_frame_profiled(&mut frame).is_err() {
                     break;
                 }
                 record_frames.push(frame);
@@ -1297,12 +1397,12 @@ pub fn decode_mixed_closed_targets_continuous_rgb24(
         store_one(&mut scaler, target, &mut targets)?;
     }
 
-    decoder.send_eof()?;
+    decoder.send_eof_profiled()?;
     let mut trailing = ffmpeg::util::frame::video::Video::empty();
-    if decoder.receive_frame(&mut trailing).is_ok() {
+    if decoder.receive_frame_profiled(&mut trailing).is_ok() {
         return Err("continuous decode left an unexpected trailing frame".into());
     }
-    decoder.flush();
+    decoder.flush_profiled();
     Ok(targets)
 }
 
@@ -1379,8 +1479,17 @@ fn store_one(
         .expect("failed to create YUV→RGB24 scaler")
     });
     let mut rgb = ffmpeg::util::frame::video::Video::empty();
-    s.run(decoded, &mut rgb)?;
-    frames.push(frame_to_rgb24(&rgb));
+    {
+        let _stage = StageScope::new(Stage::RgbConvert, 0);
+        s.run(decoded, &mut rgb)?;
+    }
+    {
+        let _stage = StageScope::new(
+            Stage::RgbCopy,
+            rgb.width() as usize * rgb.height() as usize * 3,
+        );
+        frames.push(frame_to_rgb24(&rgb));
+    }
     Ok(())
 }
 
@@ -1607,6 +1716,30 @@ mod tests {
         assert!(cursor.decode_extension(&[], 0, &[], &[4], true).is_err());
     }
 
+    #[test]
+    fn live_cursor_keeps_no_unrequested_rgb_and_restores_duplicates() {
+        let mut encoder = X264Encoder::new(32, 32, 23, 16, false);
+        let mut encoded = Vec::new();
+        for index in 0..8 {
+            let frame = vec![32 + index * 8; 32 * 32 * 3 / 2];
+            encoded.extend(encoder.encode_frame(&frame, index == 0));
+        }
+        encoded.extend(encoder.flush());
+        let (config, record, _) = extract_closed_record_parts(&encoded).unwrap();
+        let units = split_annex_b_access_units(&record);
+        let mut cursor = MonotonicGopCursor::new(DecoderConfig { num_threads: 1 }).unwrap();
+        let frames = cursor
+            .decode_extension(&config, 0, &units, &[7, 7], true)
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].data, frames[1].data);
+        assert!(cursor.pending.is_empty());
+        assert!(!cursor.can_serve(&[0]));
+        let mut pool = DecoderPool::new(DecoderConfig { num_threads: 1 });
+        let reference = decode_full_gop_selected_rgb24(&config, &record, &mut pool, &[7]).unwrap();
+        assert_eq!(frames[0].data, reference[0].data);
+    }
+
     use super::*;
     use crate::chunk::ChunkReader;
     use crate::encoder::X264Encoder;
@@ -1702,20 +1835,20 @@ mod tests {
                     } else {
                         au.to_vec()
                     };
-                    let pkt = ffmpeg::Packet::copy(&pkt_data);
+                    let pkt = profiled_packet_copy(&pkt_data);
                     loop {
-                        match dec.send_packet(&pkt) {
+                        match dec.send_packet_profiled(&pkt) {
                             Ok(()) => break,
                             Err(_) => {
                                 let mut f = ffmpeg::util::frame::video::Video::empty();
-                                let _ = dec.receive_frame(&mut f);
+                                let _ = dec.receive_frame_profiled(&mut f);
                             }
                         }
                     }
                 }
-                let _ = dec.send_eof();
+                let _ = dec.send_eof_profiled();
                 let mut f = ffmpeg::util::frame::video::Video::empty();
-                while dec.receive_frame(&mut f).is_ok() {
+                while dec.receive_frame_profiled(&mut f).is_ok() {
                     // YUV frame received, do NOT convert to RGB
                     f = ffmpeg::util::frame::video::Video::empty();
                 }
@@ -1737,11 +1870,11 @@ mod tests {
             d.extend_from_slice(&nals[0]);
             d
         };
-        let pkt = ffmpeg::Packet::copy(&pkt_data);
-        dec.send_packet(&pkt).unwrap();
-        dec.send_eof().unwrap();
+        let pkt = profiled_packet_copy(&pkt_data);
+        dec.send_packet_profiled(&pkt).unwrap();
+        dec.send_eof_profiled().unwrap();
         let mut yuv = ffmpeg::util::frame::video::Video::empty();
-        dec.receive_frame(&mut yuv).unwrap();
+        dec.receive_frame_profiled(&mut yuv).unwrap();
         dec.flush();
 
         let mut scaler = ffmpeg::software::scaling::context::Context::get(

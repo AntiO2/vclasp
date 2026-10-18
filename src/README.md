@@ -10,6 +10,7 @@ preserving the caller's output order. Start with
 | Directory | Responsibility | Main entry points |
 | --- | --- | --- |
 | `format/` | Chunk headers, embedded index, and physical record metadata | [`chunk.rs`](format/chunk.rs), [`index.rs`](format/index.rs) |
+| `bindings/` | Python chunk and session adapters | [`chunk.rs`](bindings/chunk.rs), [`session.rs`](bindings/session.rs) |
 | `ingest/` | Controlled encoding, AU discovery, dependency construction, and chunk writing | [`hierarchical_ingest.rs`](ingest/hierarchical_ingest.rs) |
 | `planning/` | Closure resolution, range candidates, cost comparison, and runtime feedback | [`hierarchical_layout.rs`](planning/hierarchical_layout.rs), [`planner.rs`](planning/planner.rs), [`runtime_feedback.rs`](planning/runtime_feedback.rs) |
 | `execution/` | Shared session, bounded admission, fetch/decode scheduling, state reuse, and ordered delivery | [`session.rs`](execution/session.rs), [`hierarchical_scheduler.rs`](execution/hierarchical_scheduler.rs), [`resident_cache.rs`](execution/resident_cache.rs) |
@@ -38,10 +39,18 @@ Physical byte order, decode order, and output order are distinct. A layout
 change must update offsets without changing dependency semantics or silently
 submitting extra records to the decoder.
 
-The session owns reusable state and shared budgets. Independent callers should
+The session owns reusable state and shared budgets. The current catalog lives
+in `format/catalog.rs`; stateless decoder workers live in
+`execution/decode_pool.rs` and transient byte reservations in
+`execution/byte_budget.rs`. Independent callers should
 share a session when they need one global I/O and decode budget. Pipeline
 submission applies backpressure; ordered consumption does not require physical
 execution to finish in submission order.
+
+Incremental execution tracks assembly consumers for each fetched range and
+releases the raw bytes after the last consumer. Decoder jobs own their encoded
+inputs; encoded caches and live decoder state have separate lifetimes. The
+completion queue applies backpressure independently of logical output order.
 
 ## Build features
 
